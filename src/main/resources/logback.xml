@@ -4,7 +4,7 @@
   说明：
     1. 控制台输出带彩色高亮；
     2. 按大小滚动写文件，同时做全量归档 + ERROR 单独归档；
-    3. MCP 工具访问日志使用独立 logger（org.example.sporthealth.tool-access）；
+    3. MCP 工具访问日志使用独立 logger（org.example.sporthealth.config.ToolAccessLogAspect）；
     4. 可通过 JVM 参数 / 环境变量覆盖，例如：
        -DLOG_PATH=/var/log/tender-service
        -DLOG_LEVEL_ROOT=debug
@@ -82,7 +82,7 @@
     <logger name="org.example" level="${LOG_LEVEL_APP:-DEBUG}"/>
 
     <!-- MCP 工具访问日志：每次调用一行（工具名 / 入参 / status / 耗时），不需要时设为 OFF -->
-    <logger name="org.example.sporthealth.tool-access" level="${LOG_LEVEL_TOOL_ACCESS:-INFO}"/>
+    <logger name="org.example.sporthealth.config.ToolAccessLogAspect" level="${LOG_LEVEL_TOOL_ACCESS:-INFO}"/>
 
     <!-- ==================== 根配置 ==================== -->
     <root level="${LOG_LEVEL_ROOT:-INFO}">

@@ -5,12 +5,11 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Pattern;
 
+import lombok.extern.slf4j.Slf4j;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
 import org.aspectj.lang.reflect.MethodSignature;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.ai.mcp.annotation.McpTool;
 import org.springframework.stereotype.Component;
 
@@ -26,15 +25,14 @@ import tools.jackson.databind.ObjectMapper;
  *
  * <p>按注解切面，不限定包：任何 bean 上标注 {@link McpTool} 的方法都会记录，
  * 新增工具不需要在方法里再写日志。
+ *
+ * <p>日志走类名 logger（Lombok {@code @Slf4j}），级别由 logback.xml 里同名 logger 的
+ * {@code LOG_LEVEL_TOOL_ACCESS} 控制，不需要访问日志时设为 OFF。
  */
 @Aspect
 @Component
+@Slf4j
 public class ToolAccessLogAspect {
-
-    /** 独立 logger：只想调访问日志级别时改这一处即可。 */
-    public static final String ACCESS_LOGGER = "org.example.sporthealth.tool-access";
-
-    private static final Logger ACCESS_LOG = LoggerFactory.getLogger(ACCESS_LOGGER);
 
     /** 入参 JSON 的日志上限，避免超大列表把日志冲垮。 */
     private static final int MAX_ARGUMENT_LENGTH = 512;
@@ -55,15 +53,15 @@ public class ToolAccessLogAspect {
     public Object logToolCall(ProceedingJoinPoint joinPoint, McpTool tool) throws Throwable {
         String callId = "call-" + CALL_SEQUENCE.incrementAndGet();
         String arguments = arguments(joinPoint);
-        ACCESS_LOG.info("phase=START tool={} callId={} args={}", tool.name(), callId, arguments);
+        log.info("phase=START tool={} callId={} args={}", tool.name(), callId, arguments);
         long startedAt = System.nanoTime();
         try {
             Object result = joinPoint.proceed();
-            ACCESS_LOG.info("phase=END tool={} callId={} status={} durationMs={}",
+            log.info("phase=END tool={} callId={} status={} durationMs={}",
                     tool.name(), callId, status(result), elapsedMillis(startedAt));
             return result;
         } catch (Throwable error) {
-            ACCESS_LOG.error("phase=END tool={} callId={} status=ERROR durationMs={} error={}: {}",
+            log.error("phase=END tool={} callId={} status=ERROR durationMs={} error={}: {}",
                     tool.name(), callId, elapsedMillis(startedAt),
                     error.getClass().getSimpleName(), error.getMessage(), error);
             throw error;
@@ -92,7 +90,13 @@ public class ToolAccessLogAspect {
         }
     }
 
-    /** 工具返回体统一是 Map，把里面的 status 提到日志里，便于直接统计成功/无数据/未找到。 */
+    /**
+     * 工具返回体统一是 Map（{@code SportHealthTools} 的方法签名已固定为 {@code Map<String, Object>}），
+     * 把里面的 status 提到日志里，便于直接统计成功/无数据/未找到。
+     *
+     * <p>{@code joinPoint.proceed()} 只能拿到 {@code Object}，所以仍需 instanceof 兜底：
+     * 切的是所有标注 {@code @McpTool} 的方法，不保证返回体一定带 status。
+     */
     private static String status(Object result) {
         if (result instanceof Map<?, ?> body && body.get("status") != null) {
             return String.valueOf(body.get("status"));

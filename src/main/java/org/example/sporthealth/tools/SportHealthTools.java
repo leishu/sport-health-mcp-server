@@ -39,15 +39,14 @@ import org.springframework.ai.mcp.annotation.McpTool;
 import org.springframework.ai.mcp.annotation.McpToolParam;
 import org.springframework.stereotype.Component;
 
-import tools.jackson.databind.ObjectMapper;
-
 /**
  * 暴露给 MCP 客户端的工具集合，数据全部来自本地导出的华为运动健康 TCX 文件。
  *
  * <p>通用约定：
  * <ul>
  *   <li>日期参数统一为 {@code yyyy-MM-dd}；不传时默认覆盖数据集自身的完整区间。</li>
- *   <li>所有返回值都会先转成 JSON 友好结构，避免 {@code java.time} 类型被序列化成时间戳。</li>
+ *   <li>所有工具方法统一返回 {@code Map<String, Object>}，字段由 MCP 层直接序列化成 JSON；
+ *       Jackson 3 默认把 {@code java.time} 序列化成 ISO-8601 字符串，日期字段不会是时间戳数组。</li>
  *   <li>返回体通过 {@code status} 区分结果：{@code OK}、{@code NO_DATA}（区间内无记录或缺少所需数据）、
  *       {@code NO_GPS}（没有可用轨迹）、{@code NOT_FOUND}（id 不存在）、
  *       {@code AMBIGUOUS}（id 匹配到多条）。</li>
@@ -70,16 +69,13 @@ public class SportHealthTools {
     private final RunAnalyticsService analytics;
     private final HealthDataRepository repository;
     private final HealthDataProperties properties;
-    private final ObjectMapper objectMapper;
 
     public SportHealthTools(RunAnalyticsService analytics,
                             HealthDataRepository repository,
-                            HealthDataProperties properties,
-                            ObjectMapper objectMapper) {
+                            HealthDataProperties properties) {
         this.analytics = analytics;
         this.repository = repository;
         this.properties = properties;
-        this.objectMapper = objectMapper;
     }
 
     /** 区间内的记录列表，新的在前，支持过滤、排序与分页。 */
@@ -87,7 +83,7 @@ public class SportHealthTools {
             description = "按日期区间列出跑步记录，返回每次跑步的距离、时长、配速、爬升与轨迹点数。"
                     + "支持按运动类型、距离、配速、星期过滤，并按距离/时长/配速/爬升排序。"
                     + "不传日期时默认返回数据集中全部记录。用于回答“我最近跑了哪些”“有哪些长距离跑”。")
-    public Object listRuns(
+    public Map<String, Object> listRuns(
             @McpToolParam(description = "开始日期，格式 yyyy-MM-dd，默认取数据最早一天", required = false) String startDate,
             @McpToolParam(description = "结束日期，格式 yyyy-MM-dd，默认取数据最新一天", required = false) String endDate,
             @McpToolParam(description = "运动类型，例如 户外跑步；不传表示不过滤", required = false) String sport,
@@ -118,14 +114,14 @@ public class SportHealthTools {
         result.put("limit", page.limit());
         result.put("hasMore", page.hasMore());
         result.put("runs", page.items().stream().map(this::toRunRow).toList());
-        return json(result);
+        return result;
     }
 
     /** 单次详情；{@code includeTrack=true} 时才按需加载轨迹并分页返回。 */
     @McpTool(name = "get_run_detail",
             description = "查看某一次跑步的完整详情，包含起止时间、总时长、距离、平均配速、平均速度、累计爬升与下降、"
                     + "海拔范围、起终点坐标；可选按页返回 GPS 轨迹点。runId 先用 list_runs 获取。")
-    public Object getRunDetail(
+    public Map<String, Object> getRunDetail(
             @McpToolParam(description = "跑步记录 id，例如 20261025户外跑步") String runId,
             @McpToolParam(description = "是否返回轨迹点，默认 false", required = false) Boolean includeTrack,
             @McpToolParam(description = "轨迹分页偏移，默认 0", required = false) Integer trackOffset,
@@ -149,14 +145,14 @@ public class SportHealthTools {
         if (detail.route() != null) {
             result.put("route", toRoutePage(detail.route()));
         }
-        return json(result);
+        return result;
     }
 
     /** 只取轨迹点，适合分析路线或绘制地图；轨迹按需解析后缓存。 */
     @McpTool(name = "get_run_route",
             description = "分页读取某次跑步的 GPS 轨迹点（时间、纬度、经度、海拔），用于分析路线、配速变化或绘制轨迹。"
                     + "支持 format=geojson 直接返回 LineString，或用 maxPoints 降采样控制返回体积，避免一次拉取上千个点。")
-    public Object getRunRoute(
+    public Map<String, Object> getRunRoute(
             @McpToolParam(description = "跑步记录 id") String runId,
             @McpToolParam(description = "分页偏移，默认 0；使用 maxPoints 时忽略", required = false) Integer offset,
             @McpToolParam(description = "返回条数，默认 200，最多 5000；使用 maxPoints 时忽略", required = false) Integer limit,
@@ -198,7 +194,7 @@ public class SportHealthTools {
             result.put("date", run.date());
             result.put("pointCount", coordinates.size());
             result.put("geometry", geometry);
-            return json(result);
+            return result;
         }
 
         Page<TrackPoint> page;
@@ -213,14 +209,14 @@ public class SportHealthTools {
         result.put("runId", run.id());
         result.put("date", run.date());
         result.putAll(toRoutePage(page));
-        return json(result);
+        return result;
     }
 
     /** 区间汇总；整体配速由总距离与总时长计算。 */
     @McpTool(name = "get_running_summary",
             description = "统计一个日期区间的跑步总量：次数、总公里数、总时长、总爬升、平均每次距离与配速、"
                     + "最快配速与最长距离对应的记录。不传日期时统计全部数据。用于回答“这个月跑了多少”“最近一周跑量”。")
-    public Object getRunningSummary(
+    public Map<String, Object> getRunningSummary(
             @McpToolParam(description = "开始日期，格式 yyyy-MM-dd", required = false) String startDate,
             @McpToolParam(description = "结束日期，格式 yyyy-MM-dd", required = false) String endDate) {
         DateRange range = analytics.resolveRange(startDate, endDate);
@@ -232,14 +228,14 @@ public class SportHealthTools {
         result.put("status", "OK");
         result.put("summary", summary);
         result.put("text", summaryText(summary));
-        return json(result);
+        return result;
     }
 
     /** 按天 / 周 / 月聚合，只返回有记录的周期。 */
     @McpTool(name = "get_daily_running",
             description = "按天、周或月拆分跑步数据：每个周期跑了多少次、距离、时长、配速与爬升。"
                     + "groupBy=day（默认）看训练频率，week/month 看周跑量或月跑量。只返回有记录的周期。")
-    public Object getDailyRunning(
+    public Map<String, Object> getDailyRunning(
             @McpToolParam(description = "开始日期，格式 yyyy-MM-dd", required = false) String startDate,
             @McpToolParam(description = "结束日期，格式 yyyy-MM-dd", required = false) String endDate,
             @McpToolParam(description = "分组粒度：day（默认）、week、month", required = false) String groupBy) {
@@ -260,7 +256,7 @@ public class SportHealthTools {
             result.put("days", days);
             result.put("recordedDays", days.size());
         }
-        return json(result);
+        return result;
     }
 
     /** 个人最佳，可按类别只取一项。 */
@@ -268,7 +264,7 @@ public class SportHealthTools {
             description = "查询区间内的个人最佳：最长距离、最快配速、最长时长、最大爬升各对应一次跑步记录，"
                     + "以及区间内最快的 1 公里 / 5 公里（基于 GPS 轨迹，逐条解析轨迹）。"
                     + "category 可只取其中一项。用于回答“我最好成绩是多少”“我 1 公里最快多少”。")
-    public Object getPersonalBests(
+    public Map<String, Object> getPersonalBests(
             @McpToolParam(description = "开始日期，格式 yyyy-MM-dd", required = false) String startDate,
             @McpToolParam(description = "结束日期，格式 yyyy-MM-dd", required = false) String endDate,
             @McpToolParam(description = "类别：all（默认）、distance、pace、duration、climb、best1k、best5k",
@@ -325,14 +321,14 @@ public class SportHealthTools {
         if (wantsEfforts && !hasEffort) {
             result.put("message", "区间内没有可用 GPS 轨迹，或单次距离不足 1 公里，无法计算 1 公里 / 5 公里最佳");
         }
-        return json(result);
+        return result;
     }
 
     /** 两次对比，结论直接回读给用户；任一 id 多义时返回 AMBIGUOUS。 */
     @McpTool(name = "compare_runs",
             description = "对比两次跑步的距离、时长与配速差异，并给出一句话结论（谁更快、快多少）。"
                     + "includeSplits=true 时附带每公里分段，便于看配速分布。两次记录 id 都用 list_runs 获取。")
-    public Object compareRuns(
+    public Map<String, Object> compareRuns(
             @McpToolParam(description = "基准跑步记录 id") String baseRunId,
             @McpToolParam(description = "对比跑步记录 id") String otherRunId,
             @McpToolParam(description = "是否附带两次的每公里分段，默认 false", required = false) Boolean includeSplits) {
@@ -367,7 +363,7 @@ public class SportHealthTools {
             splits.put("other", analytics.splits(other, 1000d).splits());
             result.put("splits", splits);
         }
-        return json(result);
+        return result;
     }
 
     /** 每公里（或自定义距离）分段配速。 */
@@ -375,7 +371,7 @@ public class SportHealthTools {
             description = "把一次跑步按固定距离（默认 1 公里）切分，返回每段距离、用时、配速、爬升，"
                     + "以及最快/最慢分段、前后半程配速、是否负分段、配速稳定性。"
                     + "用于回答“每公里配速多少”“有没有跑崩”“后半程更快吗”。")
-    public Object getRunSplits(
+    public Map<String, Object> getRunSplits(
             @McpToolParam(description = "跑步记录 id") String runId,
             @McpToolParam(description = "分段距离（公里），默认 1", required = false) Double splitKm) {
         RunLookup lookup = analytics.lookup(runId);
@@ -394,14 +390,14 @@ public class SportHealthTools {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "OK");
         result.putAll(splitsMap(splits));
-        return json(result);
+        return result;
     }
 
     /** 一次跑步内 1K / 5K 等目标距离的最佳用时。 */
     @McpTool(name = "get_best_efforts",
             description = "计算一次跑步内指定目标距离（默认 1 公里、5 公里）的最佳用时与折算配速，"
                     + "例如“这 10 公里里最快的 5 公里是多少”。超过本次轨迹距离的目标会列在 unavailableTargetsMeters。")
-    public Object getBestEfforts(
+    public Map<String, Object> getBestEfforts(
             @McpToolParam(description = "跑步记录 id") String runId,
             @McpToolParam(description = "目标距离列表（公里），默认 [1, 5]；例如 [1,5,10]", required = false) List<Double> distancesKm) {
         RunLookup lookup = analytics.lookup(runId);
@@ -434,14 +430,14 @@ public class SportHealthTools {
             result.put("message", "所有目标距离都超过本次轨迹距离 " + efforts.gpsDistanceKm()
                     + " 公里，可改小 distances 或先用 list_runs 确认距离");
         }
-        return json(result);
+        return result;
     }
 
     /** 周 / 月训练趋势。 */
     @McpTool(name = "get_training_trend",
             description = "按周或按月生成连续周期趋势：每个周期的次数、距离、时长、平均配速、爬升，"
                     + "以及与上一周期的跑量百分比变化和配速差。用于回答“这周比上周多跑了多少”“最近配速在变快吗”。")
-    public Object getTrainingTrend(
+    public Map<String, Object> getTrainingTrend(
             @McpToolParam(description = "周期粒度：week（默认）或 month", required = false) String period,
             @McpToolParam(description = "返回多少个周期，默认 4，最多 52", required = false) Integer count,
             @McpToolParam(description = "结束日期，格式 yyyy-MM-dd，默认取数据最后一天所属周期", required = false) String endDate) {
@@ -453,14 +449,14 @@ public class SportHealthTools {
         result.put("count", trend.count());
         result.put("periods", trend.periods());
         result.put("text", trend.text());
-        return json(result);
+        return result;
     }
 
     /** 连续打卡与训练频率。 */
     @McpTool(name = "get_consistency",
             description = "统计区间内的打卡连续性：有记录天数、占比、当前连续天数、最长连续天数、平均间隔，"
                     + "并返回每天的距离用于日历热力图。当前连续以最后一次记录为锚点，历史数据不会因为“今天没跑”变成 0。")
-    public Object getConsistency(
+    public Map<String, Object> getConsistency(
             @McpToolParam(description = "开始日期，格式 yyyy-MM-dd", required = false) String startDate,
             @McpToolParam(description = "结束日期，格式 yyyy-MM-dd", required = false) String endDate) {
         DateRange range = analytics.resolveRange(startDate, endDate);
@@ -480,14 +476,14 @@ public class SportHealthTools {
         result.put("lastActiveDate", consistency.lastActiveDate());
         result.put("days", consistency.days());
         result.put("text", consistency.text());
-        return json(result);
+        return result;
     }
 
     /** 海拔剖面。 */
     @McpTool(name = "get_elevation_profile",
             description = "按距离分桶返回海拔剖面：每段的平均/最低/最高海拔、累计爬升与下降、平均坡度，"
                     + "并汇总全程爬升。smoothingMeters 用于过滤 GPS 高程抖动。用于回答“爬升集中在哪”“坡陡不陡”。")
-    public Object getElevationProfile(
+    public Map<String, Object> getElevationProfile(
             @McpToolParam(description = "跑步记录 id") String runId,
             @McpToolParam(description = "每个桶的距离（米），默认 100，最小 10", required = false) Double bucketMeters,
             @McpToolParam(description = "爬升平滑阈值（米），默认 1，0 表示不平滑", required = false) Double smoothingMeters) {
@@ -519,14 +515,14 @@ public class SportHealthTools {
         result.put("minAltitudeMeters", profile.minAltitudeMeters());
         result.put("maxAltitudeMeters", profile.maxAltitudeMeters());
         result.put("buckets", profile.buckets());
-        return json(result);
+        return result;
     }
 
     /** 中途停顿检测。 */
     @McpTool(name = "get_stop_points",
             description = "检测跑步过程中的停顿（等红灯、补水、休息）：返回每次停顿的开始/结束时间、时长与位置，"
                     + "以及停顿总时长。判定条件是相邻轨迹点间隔达到阈值且位移很小。")
-    public Object getStopPoints(
+    public Map<String, Object> getStopPoints(
             @McpToolParam(description = "跑步记录 id") String runId,
             @McpToolParam(description = "最短停顿秒数，默认 30", required = false) Double minStopSeconds,
             @McpToolParam(description = "停顿期间允许的最大位移（米），默认 30", required = false) Double maxDisplacementMeters) {
@@ -553,7 +549,7 @@ public class SportHealthTools {
         result.put("totalStopSeconds", stops.totalStopSeconds());
         result.put("totalStopText", stops.totalStopText());
         result.put("stops", stops.stops());
-        return json(result);
+        return result;
     }
 
     /** 数据源自检入口：文件、条数、日期范围、来源、RouteType、解析告警与数据质量。 */
@@ -561,7 +557,7 @@ public class SportHealthTools {
             description = "查看当前数据源状态：数据目录、已加载的 TCX 文件、跑步记录总数、覆盖日期范围、"
                     + "累计距离、解析告警分类以及数据质量检查（0 距离、缺配速/坐标/海拔、重复 Activity Id、"
                     + "配速离群、重复时间戳）。数据看起来不对时先调用它排查；重复时间戳需要解析全部轨迹，首次调用稍慢。")
-    public Object describeDataSource() {
+    public Map<String, Object> describeDataSource() {
         RunDataset dataset = repository.dataset();
         List<RunActivity> activities = dataset.activities();
         Map<String, Object> result = new LinkedHashMap<>();
@@ -586,13 +582,13 @@ public class SportHealthTools {
                     .filter(text -> text != null).distinct().toList());
         }
         result.put("quality", quality(dataset));
-        return json(result);
+        return result;
     }
 
     /** 重新扫描并重建快照，旧轨迹缓存随之丢弃。 */
     @McpTool(name = "reload_data",
             description = "重新扫描数据目录并解析全部 TCX 文件。导出新数据到目录后调用它即可刷新，无需重启服务。")
-    public Object reloadData() {
+    public Map<String, Object> reloadData() {
         repository.reload();
         RunDataset dataset = repository.dataset();
         Map<String, Object> result = new LinkedHashMap<>();
@@ -601,7 +597,7 @@ public class SportHealthTools {
                 + dataset.runCount() + " 条跑步记录");
         result.put("runCount", dataset.runCount());
         result.put("warnings", dataset.warnings());
-        return json(result);
+        return result;
     }
 
     private Map<String, Object> splitsMap(RunSplits splits) {
@@ -856,7 +852,7 @@ public class SportHealthTools {
         };
     }
 
-    private Object noData(DateRange range, String detail) {
+    private Map<String, Object> noData(DateRange range, String detail) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "NO_DATA");
         result.put("message", "区间 " + range.text() + " 内没有匹配的跑步记录。"
@@ -866,10 +862,10 @@ public class SportHealthTools {
         }
         result.put("from", range.from());
         result.put("to", range.to());
-        return json(result);
+        return result;
     }
 
-    private Object noData(RunActivity run, String detail) {
+    private Map<String, Object> noData(RunActivity run, String detail) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "NO_DATA");
         result.put("message", "记录 " + run.id() + " 缺少所需数据。");
@@ -877,10 +873,10 @@ public class SportHealthTools {
             result.put("detail", detail);
         }
         result.put("runId", run.id());
-        return json(result);
+        return result;
     }
 
-    private Object noData(String runId, String detail) {
+    private Map<String, Object> noData(String runId, String detail) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "NO_DATA");
         result.put("message", "记录 " + runId + " 缺少所需数据。");
@@ -888,10 +884,10 @@ public class SportHealthTools {
             result.put("detail", detail);
         }
         result.put("runId", runId);
-        return json(result);
+        return result;
     }
 
-    private Object noGps(String runId, String detail) {
+    private Map<String, Object> noGps(String runId, String detail) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "NO_GPS");
         result.put("message", "记录 " + runId + " 没有可用的 GPS 轨迹，无法完成该分析。");
@@ -899,27 +895,23 @@ public class SportHealthTools {
             result.put("detail", detail);
         }
         result.put("runId", runId);
-        return json(result);
+        return result;
     }
 
-    private Object notFound(String runId) {
+    private Map<String, Object> notFound(String runId) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "NOT_FOUND");
         result.put("message", "没有找到跑步记录 " + runId + "，请先用 list_runs 获取可用的 id");
-        return json(result);
+        return result;
     }
 
-    private Object ambiguous(String runId, RunLookup lookup) {
+    private Map<String, Object> ambiguous(String runId, RunLookup lookup) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "AMBIGUOUS");
         result.put("message", "记录 id \"" + runId + "\" 匹配到 " + lookup.candidates().size()
                 + " 条记录，请改用更完整的 id");
         result.put("candidates", lookup.candidateIds());
-        return json(result);
-    }
-
-    private Object json(Object value) {
-        return objectMapper.convertValue(value, Object.class);
+        return result;
     }
 
     private int pageSize(Integer limit) {

@@ -284,8 +284,8 @@ sport:
 所有标注 `@McpTool` 的工具方法都由 `config/ToolAccessLogAspect` 统一记录，每次调用前后各一条：
 
 ```
-2026-11-03 15:54:46.069 INFO  [boundedElastic-1] [-] [org.example.sporthealth.tool-access] - phase=START tool=list_runs callId=call-1 args={"startDate":"2026-10-01",...,"limit":2}
-2026-11-03 15:54:46.148 INFO  [boundedElastic-1] [-] [org.example.sporthealth.tool-access] - phase=END tool=list_runs callId=call-1 status=OK durationMs=79
+2026-11-03 15:54:46.069 INFO  [boundedElastic-1] [-] [o.e.s.config.ToolAccessLogAspect] - phase=START tool=list_runs callId=call-1 args={"startDate":"2026-10-01",...,"limit":2}
+2026-11-03 15:54:46.148 INFO  [boundedElastic-1] [-] [o.e.s.config.ToolAccessLogAspect] - phase=END tool=list_runs callId=call-1 status=OK durationMs=79
 ```
 
 | 字段 | 含义 |
@@ -297,7 +297,7 @@ sport:
 | `status` | 仅 `END`：返回体里的 `status`：`OK` / `NO_DATA` / `NOT_FOUND` / `NO_GPS` / `AMBIGUOUS`；抛异常时为 `ERROR` |
 | `durationMs` | 仅 `END`：工具方法执行耗时（毫秒），不含日志自身开销 |
 
-- 使用独立 logger `org.example.sporthealth.tool-access`，默认 `INFO`，与其它日志一样写入控制台和 `logs/tender-service.log`。
+- 使用独立 logger `org.example.sporthealth.config.ToolAccessLogAspect`（即切面类名，日志里按 `%logger{36}` 缩写为 `o.e.s.config.ToolAccessLogAspect`），默认 `INFO`，与其它日志一样写入控制台和 `logs/tender-service.log`。
 - 调整级别 / 关闭：`-DLOG_LEVEL_TOOL_ACCESS=DEBUG`、`-DLOG_LEVEL_TOOL_ACCESS=OFF`。
 - 异常时 `phase=END` 按 `ERROR` 记录并附完整堆栈（同时写入 `logs/tender-service-error.log`），异常原样抛给客户端，返回内容不受影响。
 - 按注解切面、不限定包，新增工具只要标注 `@McpTool` 就自动纳入，无需在工具方法里埋点。
@@ -307,7 +307,7 @@ sport:
 ## 架构
 
 ```
-tools/SportHealthTools          # 15 个 @McpTool，负责参数校验与 JSON 友好输出
+tools/SportHealthTools          # 15 个 @McpTool，负责参数校验与统一的 Map<String, Object> 返回结构
         │
 service/RunAnalyticsService     # 区间汇总、按天拆分、个人最佳、对比、分段、最佳努力、海拔、停顿、趋势、id 解析
         │
@@ -321,6 +321,7 @@ support/TrackPath               # 轨迹几何索引：累计距离 ↔ 时间 �
 
 - **启动阶段**：只解析摘要，轨迹不入内存。
 - **首次请求轨迹**：按记录 id 找到来源文件，重新解析并缓存；`reload_data` 后缓存随旧快照一起丢弃。
+- **返回体**：工具方法统一返回 `Map<String, Object>`（`status` + 业务字段），不再做多余的 `convertValue` 预转换，直接交给 MCP 层的 Jackson 3 序列化；`LocalDate` / `LocalDateTime` / `Instant` 输出 ISO-8601 字符串。
 - **传输层**：WebFlux（Reactor Netty）+ Streamable-HTTP，端点 `POST /mcp`。
 
 技术栈：Java 21、Spring Boot 4.1.2、Spring AI 2.0.2（Jackson 3、MCP Java SDK 2.1.0）、Reactor Netty。
