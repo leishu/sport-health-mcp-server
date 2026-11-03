@@ -1,0 +1,35 @@
+server:
+  # MCP 端点固定为 POST /mcp；对外暴露时建议放在网关或 Spring Security 后面
+  port: 8080
+
+spring:
+  application:
+    name: sport-health-mcp-server
+  ai:
+    mcp:
+      server:
+        name: sport-health-mcp-server
+        version: 1.0.0
+        # SYNC：工具方法是同步阻塞的，由 MCP 层负责调度
+        type: SYNC
+        # STREAMABLE：Streamable-HTTP，端点 POST /mcp（SSE 在 Spring AI 2.x 已废弃）
+        protocol: STREAMABLE
+
+sport:
+  health:
+    # TCX 目录：支持 classpath: 前缀，也支持本地绝对路径（如 /home/leishu/health-export）
+    # 只会扫描该目录下的 *.tcx，其它文件会被忽略
+    data-dir: classpath:health-data
+    # TCX 内时间为 UTC，换算成本地日期用的时区（影响 date 字段与按天聚合）
+    zone-id: Asia/Shanghai
+    # 列表接口未显式传 limit 时的默认条数
+    default-page-size: 20
+    # 列表接口允许的最大条数；小于 default-page-size 时会被提升到相同值
+    max-page-size: 200
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # 只暴露健康检查与基础信息，避免把内部指标暴露到 MCP 端口
+        include: health,info

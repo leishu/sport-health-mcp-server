@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  tender-service 日志配置
+  说明：
+    1. 控制台输出带彩色高亮；
+    2. 按大小滚动写文件，同时做全量归档 + ERROR 单独归档；
+    3. MCP 工具访问日志使用独立 logger（org.example.sporthealth.tool-access）；
+    4. 可通过 JVM 参数 / 环境变量覆盖，例如：
+       -DLOG_PATH=/var/log/tender-service
+       -DLOG_LEVEL_ROOT=debug
+       -DLOG_LEVEL_TOOL_ACCESS=off
+-->
+<configuration scan="true" scanPeriod="60 seconds">
+
+    <!-- ==================== 属性定义 ==================== -->
+    <property name="LOG_PATH" value="${LOG_PATH:-logs}"/>
+    <property name="LOG_FILE_NAME" value="${LOG_FILE_NAME:-tender-service}"/>
+    <property name="LOG_PATTERN"
+              value="%date{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] [%X{traceId:-}] [%logger{36}] - %msg%n"/>
+    <property name="MAX_FILE_SIZE" value="${MAX_FILE_SIZE:-50MB}"/>
+    <property name="MAX_HISTORY" value="${MAX_HISTORY:-30}"/>
+    <property name="TOTAL_SIZE_CAP" value="${TOTAL_SIZE_CAP:-2GB}"/>
+    <property name="LOG_CHARSET" value="${LOG_CHARSET:-UTF-8}"/>
+
+    <!-- ==================== 控制台输出 ==================== -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>
+                %date{yyyy-MM-dd HH:mm:ss.SSS} %highlight(%-5level) [%boldBlue(%thread)] [%cyan(%X{traceId:-})] [%yellow(%logger{36})] - %msg%n
+            </pattern>
+            <charset>${LOG_CHARSET}</charset>
+        </encoder>
+    </appender>
+
+    <!-- ==================== 全量日志滚动文件 ==================== -->
+    <appender name="ROLLING_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_PATH}/${LOG_FILE_NAME}.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_PATH}/%d{yyyy-MM-dd}/${LOG_FILE_NAME}.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <maxFileSize>${MAX_FILE_SIZE}</maxFileSize>
+            <maxHistory>${MAX_HISTORY}</maxHistory>
+            <totalSizeCap>${TOTAL_SIZE_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${LOG_PATTERN}</pattern>
+            <charset>${LOG_CHARSET}</charset>
+        </encoder>
+    </appender>
+
+    <!-- ==================== ERROR 单独归档 ==================== -->
+    <appender name="ROLLING_ERROR_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+            <level>ERROR</level>
+        </filter>
+        <file>${LOG_PATH}/${LOG_FILE_NAME}-error.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_PATH}/%d{yyyy-MM-dd}/${LOG_FILE_NAME}-error.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <maxFileSize>${MAX_FILE_SIZE}</maxFileSize>
+            <maxHistory>${MAX_HISTORY}</maxHistory>
+            <totalSizeCap>${TOTAL_SIZE_CAP}</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>${LOG_PATTERN}</pattern>
+            <charset>${LOG_CHARSET}</charset>
+        </encoder>
+    </appender>
+
+    <!-- ==================== 第三方日志降噪 ==================== -->
+    <logger name="org.springframework" level="INFO"/>
+    <logger name="org.apache" level="WARN"/>
+    <logger name="com.zaxxer.hikari" level="WARN"/>
+    <logger name="com.mysql" level="WARN"/>
+    <logger name="io.netty" level="WARN"/>
+    <logger name="reactor" level="INFO"/>
+    <logger name="org.mybatis" level="INFO"/>
+    <logger name="com.baomidou.mybatisplus" level="INFO"/>
+
+    <!-- MyBatis mapper 关闭 DEBUG，避免打印 SQL 语句 -->
+    <logger name="org.example.mapper" level="INFO"/>
+
+    <!-- 项目自己的包按根级别输出 -->
+    <logger name="org.example" level="${LOG_LEVEL_APP:-DEBUG}"/>
+
+    <!-- MCP 工具访问日志：每次调用一行（工具名 / 入参 / status / 耗时），不需要时设为 OFF -->
+    <logger name="org.example.sporthealth.tool-access" level="${LOG_LEVEL_TOOL_ACCESS:-INFO}"/>
+
+    <!-- ==================== 根配置 ==================== -->
+    <root level="${LOG_LEVEL_ROOT:-INFO}">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="ROLLING_FILE"/>
+        <appender-ref ref="ROLLING_ERROR_FILE"/>
+    </root>
+
+</configuration>
