@@ -43,5 +43,7 @@ build/
 
 ### 运行时数据（健康数据不进版本库） ###
 /data/
+# 开发期默认的 classpath 数据目录，里面是个人 TCX，不能提交
+/src/main/resources/health-data/*.tcx
 .Trash-*/
 .workbuddy/

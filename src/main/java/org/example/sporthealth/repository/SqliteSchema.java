@@ -15,11 +15,13 @@ import org.springframework.stereotype.Component;
 /**
  * SQLite 表结构与版本迁移。
  *
- * <p>只维护两张表：
+ * <p>只维护四张表：
  * <ul>
  *   <li>{@code run_activity}：一次运动的全部摘要字段，外加来源文件、内容哈希与导入时间；</li>
  *   <li>{@code track_point}：轨迹点，主键 {@code (run_id, seq)}，{@code WITHOUT ROWID} 节省空间，
- *       一个活动的轨迹行在物理上连续存放。</li>
+ *       一个活动的轨迹行在物理上连续存放；</li>
+ *   <li>{@code source_file}：TCX 来源文件指纹，增量同步的比对基准；</li>
+ *   <li>{@code run_weather}：起跑与结束两个时刻的天气，一行对应一次跑步，由 open-meteo 回填。</li>
  * </ul>
  *
  * <p>版本号写在 {@code PRAGMA user_version}：0 表示空库，直接建表；未来加心率、步频等列时
@@ -34,7 +36,7 @@ import org.springframework.stereotype.Component;
 public class SqliteSchema {
 
     /** 当前结构版本，改动 {@link #MIGRATIONS} 时同步递增。 */
-    static final int SCHEMA_VERSION = 2;
+    static final int SCHEMA_VERSION = 3;
 
     /** 索引 {@code i} 对应从版本 {@code i} 升级到 {@code i + 1} 的脚本。 */
     private static final List<String> MIGRATIONS = List.of("""
@@ -92,6 +94,39 @@ public class SqliteSchema {
             """
             ALTER TABLE source_file ADD COLUMN status TEXT NOT NULL DEFAULT 'OK';
             ALTER TABLE source_file ADD COLUMN error_message TEXT;
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS run_weather (
+                run_id                  TEXT PRIMARY KEY,
+                start_obs_time_utc      TEXT,
+                end_obs_time_utc        TEXT,
+                start_latitude          REAL,
+                start_longitude         REAL,
+                end_latitude            REAL,
+                end_longitude           REAL,
+                start_temperature_c     REAL,
+                start_apparent_c        REAL,
+                start_humidity_percent  REAL,
+                start_precipitation_mm  REAL,
+                start_wind_speed_kmh    REAL,
+                start_wind_direction    INTEGER,
+                start_weather_code      INTEGER,
+                end_temperature_c       REAL,
+                end_apparent_c          REAL,
+                end_humidity_percent    REAL,
+                end_precipitation_mm    REAL,
+                end_wind_speed_kmh      REAL,
+                end_wind_direction      INTEGER,
+                end_weather_code        INTEGER,
+                provider                TEXT NOT NULL DEFAULT 'open-meteo',
+                fetched_at              TEXT NOT NULL,
+                fetched_epoch_millis    INTEGER NOT NULL,
+                status                  TEXT NOT NULL,
+                error_message           TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_run_weather_status
+                ON run_weather (status, fetched_epoch_millis);
             """);
 
     private final JdbcClient jdbc;
@@ -147,13 +182,18 @@ public class SqliteSchema {
     /**
      * 执行一条 DDL。SQLite 的 {@code ADD COLUMN} 没有 {@code IF NOT EXISTS}，
      * 上一次迁移在第 N 条失败后重跑会撞上「列已存在」，这种错误必须视为成功。
+     *
+     * <p>{@code table ... already exists} 同理：v3 迁移里 {@code CREATE TABLE} 出现在
+     * {@code ALTER TABLE} 之前，万一在两者之间失败，重跑时建表语句已经成功过。
+     * 若不放行，升级会卡在「表已存在」上，只能删库重建——那是不可接受的数据损失。
      */
     private static void execute(Statement statement, String sql) throws SQLException {
         try {
             statement.executeUpdate(sql);
         } catch (SQLException e) {
-            if (e.getMessage() != null && e.getMessage().contains("duplicate column name")) {
-                log.debug("列已存在，跳过: {}", sql);
+            String message = e.getMessage() == null ? "" : e.getMessage();
+            if (message.contains("duplicate column name") || message.contains("already exists")) {
+                log.debug("结构已存在，跳过: {}", sql);
                 return;
             }
             throw e;

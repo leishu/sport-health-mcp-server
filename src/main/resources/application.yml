@@ -35,6 +35,26 @@ sport:
     # 列表接口允许的最大条数；小于 default-page-size 时会被提升到相同值
     max-page-size: 200
 
+  # open-meteo 天气回填：为每条跑步记录补上起跑与结束时刻的天气，写入 run_weather 表
+  weather:
+    # 关掉后导入流程完全不碰网络；数据已经回填过的记录不受影响
+    enabled: true
+    # 预报端点覆盖「今天往前 recent-window-days 天」，数据完整、含实况
+    forecast-base-url: https://api.open-meteo.com/v1/forecast
+    # 更早的历史走存档端点（ERA5 再分析），有数天延迟
+    archive-base-url: https://archive-api.open-meteo.com/v1/archive
+    # 超过这个天数的记录改用 archive；92 是 forecast 端点 past 数据的上限
+    recent-window-days: 92
+    # 把 forecast 窗口最老的 lag 天交给 archive，避开 forecast 92 天上限边缘；
+    # 应远小于 recent-window-days（默认 5 对 92 是安全的）
+    archive-lag-days: 5
+    # 单次请求超时
+    timeout: 10s
+    # 抓取失败的记录多久后重试；OK 与 UNAVAILABLE（接口无此数据）永不重试
+    retry-failed-after-days: 7
+    # 单次同步最多回填多少条，防止首次全量导入一次打光配额（非商业用途 10000 次/天）
+    max-runs-per-sync: 50
+
 management:
   endpoints:
     web:

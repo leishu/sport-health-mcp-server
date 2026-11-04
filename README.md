@@ -218,7 +218,7 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | --- | --- | --- |
 | `describe_data_source` | — | 数据目录、已加载文件、记录数、日期范围、来源、RouteType、解析告警分类、`storage`（库路径与本次同步统计），以及 quality 块（0 距离、缺配速/坐标/海拔、重复 Activity Id、配速离群、重复时间戳） |
 | `list_runs` | `startDate?` `endDate?` `sport?` `min/maxDistanceKm?` `min/maxPaceSecondsPerKm?` `weekday?` `sortBy?` `offset?` `limit?` | 区间内的记录（新的在前，分页），含距离/时长/配速/爬升 |
-| `get_run_detail` | `runId` `includeTrack?` `trackOffset?` `trackLimit?` | 单次完整详情：起止时间、时长、距离、平均配速/速度、爬升与下降、海拔范围、起终点坐标，可选附带轨迹分页 |
+| `get_run_detail` | `runId` `includeTrack?` `trackOffset?` `trackLimit?` | 单次完整详情：起止时间、时长、距离、平均配速/速度、爬升与下降、海拔范围、起终点坐标、该次跑步的天气 `weather`（起跑/结束时刻的气温、体感、湿度、降水、风向风速、天气现象），可选附带轨迹分页 |
 | `get_run_route` | `runId` `offset?` `limit?` `format?` `maxPoints?` | 轨迹点分页（时间/纬度/经度/海拔，海拔保留 2 位小数），可输出 GeoJSON；`maxPoints` 降采样后会忽略 `offset`/`limit` |
 | `get_running_summary` | `startDate?` `endDate?` | 次数、总距离、总时长、总爬升、平均配速、最快/最长记录 |
 | `get_daily_running` | `startDate?` `endDate?` `groupBy?` | 按天/周/月拆分，只含有记录的周期，`day` 时额外返回每天一条 |
@@ -281,6 +281,15 @@ sport:
     zone-id: Asia/Shanghai            # TCX 内 UTC 时间换算所用时区
     default-page-size: 20             # 列表默认条数
     max-page-size: 200                # 列表最大条数（小于默认值时自动提升）
+  weather:
+    enabled: true                     # 关闭后完全不碰网络，run_weather 不留行
+    forecast-base-url: https://api.open-meteo.com/v1/forecast
+    archive-base-url: https://archive-api.open-meteo.com/v1/archive
+    recent-window-days: 92            # forecast 端点覆盖范围，更早的走 archive
+    archive-lag-days: 5               # forecast 窗口最老的 lag 天交给 archive（应远小于窗口）
+    timeout: 10s                      # 单次 HTTP 超时
+    retry-failed-after-days: 7        # FAILED 记录的冷却时间
+    max-runs-per-sync: 50             # 单轮最多补多少条，防止首次全量导入打光配额
 ```
 
 指向真实导出目录：
@@ -301,17 +310,19 @@ sport:
 
 TCX 文件只在**内容变化**时被解析一次，结果写进 SQLite；之后所有查询都走库和内存快照。
 
-### 三张表
+### 四张表
 
 | 表 | 内容 |
 | --- | --- |
 | `run_activity` | 一次运动一行：摘要字段（时间、距离、配速、爬升、起终点坐标…）+ `source_file` + `content_hash` + `imported_at` |
 | `track_point` | 轨迹点，主键 `(run_id, seq)`，`WITHOUT ROWID`，一个活动的点物理连续 |
 | `source_file` | 来源文件指纹：`size`、`modified_millis`、`content_hash`，增量同步的比对基准 |
+| `run_weather` | 每次跑步的起跑 / 结束两个时刻的天气，主键 `run_id`，由 open-meteo 回填 |
 
-表结构版本记在 `PRAGMA user_version`（当前为 2）。以后加心率、步频等列时，
+表结构版本记在 `PRAGMA user_version`（当前为 3）。以后加心率、步频等列时，
 往 `SqliteSchema.MIGRATIONS` 追加一段脚本并把 `SCHEMA_VERSION` 加一即可，不需要 Flyway；
-版本 1 的旧库会在启动时自动补上 `source_file.status` / `error_message` 两列，不需要删库重建。
+版本 1 的旧库会在启动时自动补上 `source_file.status` / `error_message` 两列，版本 2 的会补建 `run_weather`，
+不需要删库重建。
 
 ### 增量规则
 
@@ -339,6 +350,93 @@ sqlite3 data/sport-health.db "SELECT id, run_date, round(distance_meters/1000.0,
 sqlite3 data/sport-health.db "SELECT COUNT(*), round(SUM(distance_meters)/1000.0,1) FROM run_activity WHERE run_date LIKE '2026-11%';"
 sqlite3 data/sport-health.db "SELECT source_file, size, modified_millis, substr(content_hash,1,12) FROM source_file;"
 ```
+
+### 天气回填（open-meteo）
+
+每次同步（首次加载、`reload_data`）在**跑步数据全部写完之后**补一轮天气：取起跑和结束两个时刻的气温、体感温度、
+相对湿度、降水量、风速、风向、天气代码，写进 `run_weather`。
+
+**为什么只补缺失的**：`OK` 和 `UNAVAILABLE` 都是终态，只有「没有行」和「`FAILED` 且超过冷却期」才会被选中。
+所以同步可以反复调，不会重复消耗配额。
+
+| 状态 | 含义 | 是否重试 |
+| --- | --- | --- |
+| `OK` | 至少一个时刻取到了有效数据 | 否 |
+| `UNAVAILABLE` | 接口正常，但覆盖不到这个时段（太早的历史、没有 GPS 坐标） | 否，终态 |
+| `FAILED` | 网络、限流、5xx、响应无法解析 | 是，`retry-failed-after-days` 天后 |
+
+**端点分流**：距今 `recent-window-days`（92 天）内走 `forecast`，更早的走 `archive`。
+这不是随意选的——archive 端点对最近几天的数据会返回 **200 但 24 个值全为 null**，只能靠 forecast 补。
+`archive-lag-days` 做的是另一件事：把 forecast 窗口**最老的** `lag` 天（默认 5 天）改交给 archive，
+避开 forecast 92 天上限的边缘。它应远小于 `recent-window-days`；配成不小于窗口时按 0 处理。
+
+> 已知边界：如果自定义的 `recent-window-days` 本身小于 archive 约 5 天的延迟，
+> 窗口外最近的日期会落进 archive 的盲区，可能记为 `UNAVAILABLE`。保持默认 92 天即可。
+
+**一天一次请求**：同一 UTC 日期上的所有坐标（多条记录的起终点、跨天记录的另一半）合并进一次请求，
+响应按坐标分发回各条记录。配额是「日期数」量级而不是「记录数」；缓存键是「日期 + 坐标」，
+点对点跑步起点在北京、终点在上海时，终点用终点坐标，不会复用起点的天气。
+
+**连续失败提前收尾**：端点黑洞（丢包不回 RST）时每次请求都要等满超时，连续 3 次可重试失败后本轮直接返回，
+未处理的记录**不落行**，下次同步会重新选中：
+
+```
+天气回填本轮提前结束：接口连续失败，8 条留待下次同步
+```
+
+**取数精度**：按小时取整天的逐小时数据，然后在起跑 / 结束时刻做线性插值。风速、气温等连续量直接插值；
+**风向按最短弧插值**（350° 与 10° 的中点取 0° 而不是 180°）；`weather_code` 是枚举，取最近的整点不插值。
+结束后超过最后一个整点 23:00 的记录，容差 1 小时内取 23:00 的值，不向外推。
+
+**在查询里读天气**：`get_run_detail` 的 `weather` 块给出**这次跑步**起跑与结束两个时刻的天气，
+不必再自己写 SQL：
+
+```json
+"weather": {
+  "status": "OK",
+  "provider": "open-meteo",
+  "fetchedAt": "2026-11-04T02:11:07Z",
+  "start": {
+    "observedAt": "2026-10-24T22:00:00Z",
+    "temperatureC": 8.0, "apparentTemperatureC": 6.2,
+    "humidityPercent": 72.0, "precipitationMm": 0.2,
+    "windSpeedKmh": 12.0, "windDirectionDegrees": 315.0, "windDirection": "西北",
+    "weatherCode": 61, "condition": "小雨"
+  },
+  "end": { "...": "同上，跑完时刻" }
+}
+```
+
+口径：`observedAt` 是参与插值的**整点**，不是跑步时刻本身；任一指标缺值一律 `null`，不会当成 0 度；
+某个时刻整份快照都没有时该时刻直接是 `null`。`status` 除 `OK` 外还有三种：`UNAVAILABLE`（缺坐标、
+超出存档覆盖范围）与 `FAILED`（抓取失败待重试）会带上 `errorMessage` 说明原因；还没回填过则是
+`MISSING`，提示调用一次 `reload_data` 即可补齐。
+
+**孤儿行清理**：`run_weather` 没有外键，记录被重导删除时天气行会留在表里。导入时删「本次解析后
+消失的 id」，以及「id 没变但起跑时刻 / 时长 / 起终点坐标变了」的记录——前者是记录没了，
+后者如同名文件被换成另一次跑步，旧天气不能再算到新记录头上。仅距离、爬升等不影响天气查询的字段
+变化时会保留已回填的天气（不白花配额）；每轮回填开始前再扫一遍全表兜底。
+覆盖率统计一律 `JOIN run_activity`，所以历史遗留的孤儿行也不会让数字超过 100%。
+
+**失败绝不影响跑步数据**：HTTP 调用刻意放在导入事务之外（连接池只有 1 个连接，网络卡顿会占死整个服务），
+且异常在 `TcxIncrementalImporter.appendWeather` 里被吞成一条汇总 warning：
+
+```
+天气回填失败 12 条（open-meteo 返回 503：），将在下次同步重试
+```
+
+查看覆盖率：
+
+```bash
+sqlite3 data/sport-health.db "SELECT status, COUNT(*) FROM run_weather GROUP BY status;"
+sqlite3 data/sport-health.db "SELECT run_id, status, round(start_temperature_c,1), round(start_apparent_c,1), start_wind_direction, start_weather_code FROM run_weather LIMIT 5;"
+```
+
+`describe_data_source` 的 `storage.weather` 也直接给出 `ok` / `unavailable` / `failed` / `missing`
+和 `coveragePercent`，不必自己写 SQL。
+
+> 非商业用途下 open-meteo 无需 API Key（限 10000 次/天）。`max-runs-per-sync` 默认 50，
+> 首次全量导入几千条历史时会分多轮慢慢补齐，不会一次打光配额。
 
 ### 备份与迁移
 
@@ -400,6 +498,13 @@ repository/TcxIncrementalImporter  # 增量同步的唯一写入口：比指纹�
         ├── SqliteSchema           # 建表与 PRAGMA user_version 版本迁移
         └── importer/TcxParser     # TCX → RunActivity + TrackPoint，纯解析无 Spring 依赖
 
+weather/WeatherBackfill         # 导入结束后补一轮天气：挑待补、按 UTC 日期分批、落状态
+        ├── OpenMeteoClient        # forecast / archive 两个端点，多坐标合并成一次请求
+        ├── WeatherInterpolator    # 整点序列 → 任意时刻（连续量线性、风向最短弧、天气代码取最近）
+        ├── WindDirections         # 风向角度 → 8 方位中文（风的来向）
+        ├── WeatherCodes           # WMO 天气代码 → 中文（未知代码原样透出）
+        └── repository/RunWeatherStore  # run_weather 表：SELECT 待补 / UPSERT / 按记录读回 / 覆盖率 / 清孤儿行
+
 importer/SourceFileScanner      # 扫描 *.tcx，产出带 size/mtime 的 SourceFile
 importer/ContentHash            # SHA-256 指纹
 
@@ -431,7 +536,7 @@ SQLite（`spring-boot-starter-jdbc` + `org.xerial:sqlite-jdbc`，无 ORM）。
 JAVA_HOME=/path/to/jdk-21 mvn test
 ```
 
-共 **58** 个用例（原有 42 + 持久化 14 + 资源形态 2）：
+共 **109** 个用例（原有 42 + 持久化 19 + 资源形态 2 + 天气 42 + 工具层天气 4）：
 
 - **真实数据**：测试固定读 `src/test/resources/tcx-dataset` 里的 5 个 TCX，而不是
   `src/main/resources/health-data`。生产目录会随导入继续增长（例如新加的骑行文件），
@@ -455,6 +560,28 @@ JAVA_HOME=/path/to/jdk-21 mvn test
   - 版本 1 的旧库能原地升级到版本 2（补 `status` / `error_message` 两列），不需要删库。
 - **资源形态**（`SourceFileScannerTest`）：同一份扫描逻辑在普通目录与 fat jar 内条目下都能
   拿到文件名、哈希与可读流；jar 形态拿不到 `mtime` 时退化为按内容哈希判断变更。
+- **天气回填**（`WeatherBackfillTest`，真实 SQLite + MockWebServer 桩接口）：
+  起终点落在同一天时只发一次请求、同一天两条记录共用一个响应、终点快照取终点坐标而不是起点坐标、
+  跨 UTC 零点时分别请求两天且结束快照来自次日、全 null 响应落 `UNAVAILABLE` 而不是 `OK`、
+  **网络故障不影响跑步数据与轨迹**、`FAILED` 在冷却期内不重发而冷却后重试、
+  跨天记录一天 400、另一天 503 时仍落 `FAILED` 而不是永久放弃、
+  连续失败达到 3 次后提前收尾且剩余记录不落行、
+  重复同步不重复请求也不重复插入、缺坐标直接标 `UNAVAILABLE` 且不发请求、
+  关闭开关后不碰网络也不留行、覆盖率统计。
+- **天气与查询接口**（`SportHealthToolsWeatherTest`，真实 SQLite）：`get_run_detail` 的 `weather`
+  块带上起跑时刻的中文描述与 8 方位风向、结束时刻缺值输出 `null`；还没回填时是 `MISSING` 并带提示；
+  `UNAVAILABLE` 行把 `errorMessage` 透出来；内存仓储（无天气表）下详情与 `storage.weather` 都省略。
+- **天气行生命周期**（`JdbcHealthDataRepositoryTest`）：文件里删掉一个 Activity 后它的天气行一起删除、
+  仅距离变化时保留已回填的天气、同名文件起跑时刻变化时旧天气作废、
+  历史遗留的孤儿行在同步时被清理、`stats` 不把孤儿行算进覆盖率或 `lastFetchedAt`。
+- **插值与客户端**（`WeatherInterpolatorTest` / `OpenMeteoClientTest`）：
+  线性插值、风向最短弧（350°→10° 取 0°）、`weather_code` 取最近整点、
+  序列首尾边界、时间轴里出现无法解析的格子时整行压缩而不是 NPE、
+  多坐标合并请求后按入参顺序对齐、429/5xx/404 标记可重试而 400 标记不可重试、
+  缺字段保持 null 而不是填 0。
+- **端点分流边界**（`WeatherBackfillEndpointTest`）：窗口内走 forecast、窗口外走 archive、
+  `archive-lag-days` 把 forecast 窗口最老的几天交给 archive、延迟为 0 时保留原始窗口、
+  延迟配得比窗口还大时按 0 处理、基准日期取自传入的 `now` 而非系统时钟。
 
 ---
 
@@ -473,6 +600,10 @@ JAVA_HOME=/path/to/jdk-21 mvn test
 | 启动报 `数据库结构版本 N 高于程序支持的 1` | 库文件被更新版本的程序写过，升级程序或换一个 `db-path` |
 | 改了 TCX 内容但结果没变 | 文件 `size`/`mtime` 都没变（例如原地覆盖但时间戳被保留）。touch 一下文件或删库重导 |
 | `warnings` 里有「数据目录 … 下没有找到 *.tcx 文件」 | `data-dir` 写错；相对路径会按进程工作目录解析 |
+| `warnings` 里有「天气回填失败 N 条」 | 网络不通、被限流或 5xx。跑步数据不受影响，`retry-failed-after-days` 天后同步会自动重试 |
+| `warnings` 里有「天气回填本轮提前结束」 | 接口连续 3 次可重试失败后主动收尾，避免一次同步被拖到几分钟。这些记录没落行，下次同步自动重试 |
+| 天气一直是 `UNAVAILABLE` | 该时段超出数据源覆盖范围（太早的历史），或是室内跑步没有 GPS 坐标。属终态，不会重试 |
+| 天气温度和体感差很多 | 正常。`start_apparent_c` 是体感温度，风速大、湿度高时与气温差异明显 |
 | 想彻底重建 | 停服务，删 `db-path` 指向的文件（含 `-wal`/`-shm`），重启后自动全量导入 |
 
 ---

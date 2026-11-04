@@ -28,15 +28,20 @@ import org.example.sporthealth.domain.RunFilter;
 import org.example.sporthealth.domain.RunLookup;
 import org.example.sporthealth.domain.RunSplits;
 import org.example.sporthealth.domain.RunSummary;
+import org.example.sporthealth.domain.RunWeather;
 import org.example.sporthealth.domain.StopPoints;
 import org.example.sporthealth.domain.TrackPoint;
 import org.example.sporthealth.domain.TrainingTrend;
+import org.example.sporthealth.domain.WeatherSnapshot;
 import org.example.sporthealth.repository.HealthDataRepository;
 import org.example.sporthealth.repository.JdbcHealthDataRepository;
 import org.example.sporthealth.repository.RunRows;
+import org.example.sporthealth.repository.RunWeatherStore;
 import org.example.sporthealth.service.RunAnalyticsService;
 import org.example.sporthealth.support.DateRange;
 import org.example.sporthealth.support.PaceFormat;
+import org.example.sporthealth.weather.WeatherCodes;
+import org.example.sporthealth.weather.WindDirections;
 import org.springframework.ai.mcp.annotation.McpTool;
 import org.springframework.ai.mcp.annotation.McpToolParam;
 import org.springframework.stereotype.Component;
@@ -71,13 +76,17 @@ public class SportHealthTools {
     private final RunAnalyticsService analytics;
     private final HealthDataRepository repository;
     private final HealthDataProperties properties;
+    /** 可选：非 JDBC 仓储（单测里的内存实现）没有 {@code run_weather} 表，此时为 null。 */
+    private final RunWeatherStore weatherStore;
 
     public SportHealthTools(RunAnalyticsService analytics,
                             HealthDataRepository repository,
-                            HealthDataProperties properties) {
+                            HealthDataProperties properties,
+                            RunWeatherStore weatherStore) {
         this.analytics = analytics;
         this.repository = repository;
         this.properties = properties;
+        this.weatherStore = weatherStore;
     }
 
     /** 区间内的记录列表，新的在前，支持过滤、排序与分页。 */
@@ -122,7 +131,9 @@ public class SportHealthTools {
     /** 单次详情；{@code includeTrack=true} 时才按需加载轨迹并分页返回。 */
     @McpTool(name = "get_run_detail",
             description = "查看某一次跑步的完整详情，包含起止时间、总时长、距离、平均配速、平均速度、累计爬升与下降、"
-                    + "海拔范围、起终点坐标；可选按页返回 GPS 轨迹点。runId 先用 list_runs 获取。")
+                    + "海拔范围、起终点坐标，以及这次跑步起跑与结束时刻的天气（气温、体感温度、湿度、降水量、"
+                    + "风向风速、天气现象）；可选按页返回 GPS 轨迹点。runId 先用 list_runs 获取。"
+                    + "用于回答“这次跑步的天气怎么样”“那天多少度”。")
     public Map<String, Object> getRunDetail(
             @McpToolParam(description = "跑步记录 id，例如 20261025户外跑步") String runId,
             @McpToolParam(description = "是否返回轨迹点，默认 false", required = false) Boolean includeTrack,
@@ -144,6 +155,10 @@ public class SportHealthTools {
         result.put("activity", run);
         result.put("paceText", detail.paceText());
         result.put("speedText", detail.speedText());
+        Object weather = weatherDetail(run.id());
+        if (weather != null) {
+            result.put("weather", weather);
+        }
         if (detail.route() != null) {
             result.put("route", toRoutePage(detail.route()));
         }
@@ -216,8 +231,9 @@ public class SportHealthTools {
 
     /** 区间汇总；整体配速由总距离与总时长计算。 */
     @McpTool(name = "get_running_summary",
-            description = "统计一个日期区间的跑步总量：次数、总公里数、总时长、总爬升、平均每次距离与配速、"
-                    + "最快配速与最长距离对应的记录。不传日期时统计全部数据。用于回答“这个月跑了多少”“最近一周跑量”。")
+            description = "统计一个日期区间的跑步总量：次数、总公里数、总时长、总爬升、平均每次距离与配速，"
+                    + "以及最快配速与最长距离对应的记录。不传日期时统计全部数据。"
+                    + "用于回答“这个月跑了多少”“最近一周跑量多少”。")
     public Map<String, Object> getRunningSummary(
             @McpToolParam(description = "开始日期，格式 yyyy-MM-dd", required = false) String startDate,
             @McpToolParam(description = "结束日期，格式 yyyy-MM-dd", required = false) String endDate) {
@@ -231,6 +247,69 @@ public class SportHealthTools {
         result.put("summary", summary);
         result.put("text", summaryText(summary));
         return result;
+    }
+
+    /**
+     * 单次跑步的天气：把 {@code run_weather} 的起跑/结束两个时刻摊平成可直接阅读的字段。
+     *
+     * <p>{@code weatherStore} 是可选的：非 JDBC 仓储（单测里的内存实现）没有天气表，
+     * 构造时传 {@code null}，此时整个字段不出现。
+     *
+     * <p>没有对应行说明还没回填过，返回 {@code status = MISSING} 并提示同步一次；
+     * 查询异常只降级为带 {@code error} 的块，不把天气问题变成整个工具的失败。
+     */
+    private Object weatherDetail(String runId) {
+        if (weatherStore == null) {
+            return null;
+        }
+        try {
+            return weatherStore.find(runId).<Object>map(this::weatherBlock).orElseGet(() -> {
+                Map<String, Object> missing = new LinkedHashMap<>();
+                missing.put("status", "MISSING");
+                missing.put("message", "这条记录还没有回填天气，调用 reload_data 同步一次后即可补齐");
+                return missing;
+            });
+        } catch (RuntimeException e) {
+            log.warn("读取记录 {} 的天气失败", runId, e);
+            return Map.of("error", String.valueOf(e.getMessage()));
+        }
+    }
+
+    private Map<String, Object> weatherBlock(RunWeather weather) {
+        Map<String, Object> block = new LinkedHashMap<>();
+        block.put("status", weather.status().name());
+        if (weather.errorMessage() != null) {
+            block.put("errorMessage", weather.errorMessage());
+        }
+        block.put("provider", weather.provider());
+        block.put("fetchedAt", weather.fetchedAt());
+        block.put("start", weatherPoint(weather.start()));
+        block.put("end", weatherPoint(weather.end()));
+        return block;
+    }
+
+    /** 一个时刻的天气；{@code null} 快照输出 {@code null}，不能用空了字段的对象冒充「0 度」 */
+    private Map<String, Object> weatherPoint(WeatherSnapshot snapshot) {
+        if (snapshot == null) {
+            return null;
+        }
+        Map<String, Object> point = new LinkedHashMap<>();
+        point.put("observedAt", snapshot.observedAtUtc());
+        point.put("temperatureC", round(snapshot.temperatureC(), 1));
+        point.put("apparentTemperatureC", round(snapshot.apparentTemperatureC(), 1));
+        point.put("humidityPercent", round(snapshot.humidityPercent(), 1));
+        // 降水量常在 0.1～2 mm 之间（前一小时累计），只留 1 位小数会把毛毛雨抹成 0
+        point.put("precipitationMm", round(snapshot.precipitationMm(), 2));
+        point.put("windSpeedKmh", round(snapshot.windSpeedKmh(), 1));
+        point.put("windDirectionDegrees", snapshot.windDirectionDegrees());
+        point.put("windDirection", WindDirections.text(snapshot.windDirectionDegrees()));
+        point.put("weatherCode", snapshot.weatherCode());
+        point.put("condition", WeatherCodes.describe(snapshot.weatherCode()));
+        return point;
+    }
+
+    private static Double round(Double value, int scale) {
+        return value == null ? null : PaceFormat.round(value, scale);
     }
 
     /** 按天 / 周 / 月聚合，只返回有记录的周期。 */
@@ -624,7 +703,44 @@ public class SportHealthTools {
         storage.put("unchangedFiles", sync.unchanged());
         storage.put("syncedAt", sync.syncedAt());
         storage.put("missingSourceFiles", sync.missingSourceFiles());
+        Map<String, Object> weather = weatherInfo();
+        if (weather != null) {
+            storage.put("weather", weather);
+        }
         return storage;
+    }
+
+    /**
+     * 天气回填的覆盖率。
+     *
+     * <p>只作为 {@code describe_data_source} 的一个字段暴露，不单独提供工具：
+     * 天气是跑步记录的补充属性，坏了要能看见，但不需要独立入口。
+     * 端点不可达时回填会静默降级为 FAILED，这里的数字是唯一的发现途径。
+     *
+     * <p>{@code weatherStore} 是可选的：非 JDBC 仓储（单测里的内存实现）没有天气表，
+     * 构造时传 {@code null}，此时整个字段不出现，而不是输出一堆 0。
+     */
+    private Map<String, Object> weatherInfo() {
+        if (weatherStore == null) {
+            return null;
+        }
+        try {
+            RunWeatherStore.Stats stats = weatherStore.stats();
+            Map<String, Object> weather = new LinkedHashMap<>();
+            weather.put("totalRuns", stats.totalRuns());
+            weather.put("ok", stats.ok());
+            weather.put("unavailable", stats.unavailable());
+            weather.put("failed", stats.failed());
+            weather.put("missing", stats.missing());
+            weather.put("lastFetchedAt", stats.lastFetchedAt());
+            weather.put("coveragePercent", stats.totalRuns() == 0
+                    ? null
+                    : PaceFormat.round(stats.ok() * 100d / stats.totalRuns(), 1));
+            return weather;
+        } catch (RuntimeException e) {
+            log.warn("读取天气统计失败", e);
+            return Map.of("error", String.valueOf(e.getMessage()));
+        }
     }
 
     private Map<String, Object> splitsMap(RunSplits splits) {
