@@ -301,6 +301,10 @@ sport:
     zone-id: Asia/Shanghai            # TCX 内 UTC 时间换算所用时区
     default-page-size: 20             # 列表默认条数
     max-page-size: 200                # 列表最大条数（小于默认值时自动提升）
+    auto-sync:
+      enabled: true                   # 关闭后只有首次访问或手动 reload_data 才同步
+      interval: 5m                    # 两次同步的间隔（上一次结束后计时），支持 30s / 5m / PT10M
+      initial-delay: 30s              # 启动后第一次同步的延迟
   weather:
     enabled: true                     # 关闭后完全不碰网络，run_weather 不留行
     forecast-base-url: https://api.open-meteo.com/v1/forecast
@@ -346,7 +350,7 @@ TCX 文件只在**内容变化**时被解析一次，结果写进 SQLite；之�
 
 ### 增量规则
 
-启动（首次访问）与 `reload_data` 都会执行同一套同步：
+首次访问、手动 `reload_data` 与后台自动同步都会执行同一套同步：
 
 | 情况 | 行为 |
 | --- | --- |
@@ -363,6 +367,30 @@ TCX 文件只在**内容变化**时被解析一次，结果写进 SQLite；之�
 写入以文件为单位放在一个事务里，中途失败整体回滚，不会出现「摘要写进去、轨迹没写完」的半截记录。
 `mtime` 取整到秒，规避 ext4 与 FAT 的时间戳精度差异。
 
+### 自动同步
+
+默认每 **5 分钟**在后台执行一次增量同步，启动后延迟 30 秒开始。自动同步复用
+`HealthDataRepository.reload()`，与手动 `reload_data` 走完全相同的路径：扫描 TCX 目录 →
+按指纹只解析变化的文件 → 重建内存快照 → 导入结束后补一轮天气。没有新文件时只做一次目录扫描，
+不会重复解析，也不会重复请求天气。
+
+```yaml
+sport:
+  health:
+    auto-sync:
+      enabled: true
+      interval: 5m
+      initial-delay: 30s
+```
+
+- **fixed-delay**：以上一次同步结束为起点计时，而不是固定频率；上一轮包含天气 HTTP 调用时
+  不会出现两轮重叠。同步方法本身在仓储里也加了锁，后台任务与手动 `reload_data` 互斥。
+- **失败不退出**：单次同步抛异常只记录日志，保留上一份快照，下一次触发继续重试。
+- **启动即用**：即使没有 MCP 请求，第一次延迟后也会主动装载数据；有请求时仍可按需触发首次装载。
+- **关闭**：`enabled: false` 后调度器不注册任务，只保留首次访问与手动 `reload_data`。
+  不想让服务在后台访问 open-meteo 时，可以同时设置 `sport.weather.enabled: false`。
+- 多实例部署时每个实例都会各自同步自己的 SQLite；本项目的定位是单机服务，不处理跨实例协调。
+
 ### 怎么查
 
 ```bash
@@ -373,7 +401,7 @@ sqlite3 data/sport-health.db "SELECT source_file, size, modified_millis, substr(
 
 ### 天气回填（open-meteo）
 
-每次同步（首次加载、`reload_data`）在**跑步数据全部写完之后**补一轮天气：取起跑和结束两个时刻的气温、体感温度、
+每次同步（首次加载、`reload_data` 或后台自动同步）在**跑步数据全部写完之后**补一轮天气：取起跑和结束两个时刻的气温、体感温度、
 相对湿度、降水量、风速、风向、天气代码，写进 `run_weather`。
 
 **为什么只补缺失的**：`OK` 和 `UNAVAILABLE` 都是终态，只有「没有行」和「`FAILED` 且超过冷却期」才会被选中。
@@ -512,6 +540,8 @@ JPA 在 WebFlux 上要配 R2DBC 才不阻塞，对只有两张表的场景属于
 tools/SportHealthTools          # 20 个 @McpTool，负责参数校验与统一的 Map<String, Object> 返回结构
         │
 service/RunAnalyticsService     # 区间汇总、按天拆分、个人最佳、对比、分段/GAP、最佳努力、海拔、停顿、趋势、比赛预测、ACWR、训练分类、id 解析
+service/AutoSyncScheduler       # 后台自动同步执行器：调用 reload()，失败只记日志、保留上一份快照
+config/AutoSyncConfiguration    # 注册 fixed-delay 任务；enabled=false 时不注册
         │
 repository/HealthDataRepository # 抽象：dataset() / route() / reload()
         └── JdbcHealthDataRepository   # 从 SQLite 装载快照、轨迹直查库（@Primary）
@@ -565,7 +595,7 @@ SQLite（`spring-boot-starter-jdbc` + `org.xerial:sqlite-jdbc`，无 ORM）。
 JAVA_HOME=/path/to/jdk-21 mvn test
 ```
 
-共 **126** 个用例（原有 42 + 持久化 19 + 资源形态 2 + 天气 42 + 工具层天气 4 + P0 分析 17）：
+共 **133** 个用例（原有 42 + 持久化 19 + 资源形态 2 + 天气 42 + 工具层天气 4 + P0 分析 17 + 自动同步 7）：
 
 - **真实数据**：测试固定读 `src/test/resources/tcx-dataset` 里的 5 个 TCX，而不是
   `src/main/resources/health-data`。生产目录会随导入继续增长（例如新加的骑行文件），
@@ -608,6 +638,10 @@ JAVA_HOME=/path/to/jdk-21 mvn test
   ACWR 在只有 10 天数据时标 `LOW` 置信度并给出高风险提示；逐公里 GAP 与净海拔/坡度字段；
   长距离跑识别与训练类型构成；工具层 5 个新工具的返回结构与 `NO_DATA` 语义；
   真实 SQLite 下种 5 条天气行后温度/湿度/风速/干湿分组、加权配速与相关系数。
+- **自动同步**（`AutoSyncSchedulerTest` / `AutoSyncPropertiesTest` / `AutoSyncConfigurationTest`）：
+  执行器确实走仓储的 `reload()` 并读取新快照、同步失败只记日志不抛给调度线程；
+  配置默认开启、Duration 格式绑定、非正间隔回落到默认值、`enabled=false` 可关闭；
+  开启时注册一个 fixed-delay 任务且间隔/首次延迟与配置一致，关闭时不注册任务。
 - **插值与客户端**（`WeatherInterpolatorTest` / `OpenMeteoClientTest`）：
   线性插值、风向最短弧（350°→10° 取 0°）、`weather_code` 取最近整点、
   序列首尾边界、时间轴里出现无法解析的格子时整行压缩而不是 NPE、
@@ -633,6 +667,7 @@ JAVA_HOME=/path/to/jdk-21 mvn test
 | 手写 HTTP 返回 400 / 406 | 缺少 `initialize`、`Mcp-Session-Id`，或 `Accept` 少了 `text/event-stream` |
 | 启动报 `数据库结构版本 N 高于程序支持的 1` | 库文件被更新版本的程序写过，升级程序或换一个 `db-path` |
 | 改了 TCX 内容但结果没变 | 文件 `size`/`mtime` 都没变（例如原地覆盖但时间戳被保留）。touch 一下文件或删库重导 |
+| 自动同步没有生效 | 检查 `sport.health.auto-sync.enabled` 是否被设为 `false`；启动日志应有「自动同步已启用」。`interval` 为非正数时会回落到默认 5 分钟 |
 | `warnings` 里有「数据目录 … 下没有找到 *.tcx 文件」 | `data-dir` 写错；相对路径会按进程工作目录解析 |
 | `warnings` 里有「天气回填失败 N 条」 | 网络不通、被限流或 5xx。跑步数据不受影响，`retry-failed-after-days` 天后同步会自动重试 |
 | `warnings` 里有「天气回填本轮提前结束」 | 接口连续 3 次可重试失败后主动收尾，避免一次同步被拖到几分钟。这些记录没落行，下次同步自动重试 |

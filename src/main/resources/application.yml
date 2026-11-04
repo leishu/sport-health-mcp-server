@@ -35,6 +35,15 @@ sport:
     # 列表接口允许的最大条数；小于 default-page-size 时会被提升到相同值
     max-page-size: 200
 
+    # 后台自动同步：与手动 reload_data 走同一套增量导入 + 天气回填
+    auto-sync:
+      # 关掉后只有首次访问或手动 reload_data 才同步
+      enabled: true
+      # 两次同步的间隔（上一次结束后开始计时）；支持 30s / 5m / PT10M
+      interval: 5m
+      # 应用启动后第一次同步的延迟，避免和启动阶段抢资源
+      initial-delay: 30s
+
   # open-meteo 天气回填：为每条跑步记录补上起跑与结束时刻的天气，写入 run_weather 表
   weather:
     # 关掉后导入流程完全不碰网络；数据已经回填过的记录不受影响
