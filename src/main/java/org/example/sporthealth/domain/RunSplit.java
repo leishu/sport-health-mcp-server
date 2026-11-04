@@ -11,6 +11,10 @@ package org.example.sporthealth.domain;
  * @param paceSecondsPerKm      本段配速（秒/公里），时长为 0 时为 null
  * @param paceText              配速文本，例如 5'45"/km
  * @param elevationGainMeters   本段累计爬升（米），无海拔数据时为 null
+ * @param netElevationMeters    本段净海拔变化（米），无海拔数据时为 null；正数表示上坡
+ * @param gradePercent          本段平均坡度（%），无海拔数据时为 null
+ * @param gradeAdjustedPaceSecondsPerKm 坡度修正配速（秒/公里），无海拔数据时为 null
+ * @param gradeAdjustedPaceText 坡度修正配速文本
  * @param partial               是否为最后一段不满整段的余量
  */
 public record RunSplit(
@@ -22,5 +26,9 @@ public record RunSplit(
         Double paceSecondsPerKm,
         String paceText,
         Double elevationGainMeters,
+        Double netElevationMeters,
+        Double gradePercent,
+        Double gradeAdjustedPaceSecondsPerKm,
+        String gradeAdjustedPaceText,
         boolean partial) {
 }

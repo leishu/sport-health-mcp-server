@@ -20,7 +20,9 @@ import org.example.sporthealth.domain.Page;
 import org.example.sporthealth.domain.PeriodSummary;
 import org.example.sporthealth.domain.PersonalBestEffort;
 import org.example.sporthealth.domain.PersonalBests;
+import org.example.sporthealth.domain.RacePrediction;
 import org.example.sporthealth.domain.RunActivity;
+import org.example.sporthealth.domain.RunClassification;
 import org.example.sporthealth.domain.RunComparison;
 import org.example.sporthealth.domain.RunDataset;
 import org.example.sporthealth.domain.RunDetail;
@@ -31,7 +33,10 @@ import org.example.sporthealth.domain.RunSummary;
 import org.example.sporthealth.domain.RunWeather;
 import org.example.sporthealth.domain.StopPoints;
 import org.example.sporthealth.domain.TrackPoint;
+import org.example.sporthealth.domain.TrainingLoad;
+import org.example.sporthealth.domain.TrainingMix;
 import org.example.sporthealth.domain.TrainingTrend;
+import org.example.sporthealth.domain.WeatherImpact;
 import org.example.sporthealth.domain.WeatherSnapshot;
 import org.example.sporthealth.repository.HealthDataRepository;
 import org.example.sporthealth.repository.JdbcHealthDataRepository;
@@ -40,6 +45,7 @@ import org.example.sporthealth.repository.RunWeatherStore;
 import org.example.sporthealth.service.RunAnalyticsService;
 import org.example.sporthealth.support.DateRange;
 import org.example.sporthealth.support.PaceFormat;
+import org.example.sporthealth.support.WeatherImpactAnalyzer;
 import org.example.sporthealth.weather.WeatherCodes;
 import org.example.sporthealth.weather.WindDirections;
 import org.springframework.ai.mcp.annotation.McpTool;
@@ -405,6 +411,34 @@ public class SportHealthTools {
         return result;
     }
 
+    /**
+     * 比赛成绩预测：用区间内的最佳努力做 Riegel 外推。
+     * 目标距离本身有实测成绩时直接返回实测值，并标记 {@code source=ACTUAL}。
+     */
+    @McpTool(name = "predict_race_time",
+            description = "根据区间内的最佳努力预测比赛成绩（Riegel 公式）。不传 distanceKm 时输出 5K、10K、"
+                    + "半马、全马四档；传 distanceKm 时只预测该距离。每条预测都带参考距离、参考记录与置信度，"
+                    + "参考成绩越接近目标距离越可靠。用于回答“我现在的水平全马能跑多少”“目标 10K 该按什么配速跑”。")
+    public Map<String, Object> predictRaceTime(
+            @McpToolParam(description = "开始日期，格式 yyyy-MM-dd，默认取数据最早一天", required = false) String startDate,
+            @McpToolParam(description = "结束日期，格式 yyyy-MM-dd，默认取数据最新一天", required = false) String endDate,
+            @McpToolParam(description = "目标距离（公里）；不传则输出 5K/10K/半马/全马", required = false) Double distanceKm) {
+        DateRange range = analytics.resolveRange(startDate, endDate);
+        RacePrediction prediction = analytics.predictRace(range, distanceKm);
+        if (prediction.predictions().isEmpty()) {
+            return noData(range, prediction.text());
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "OK");
+        result.put("range", range.text());
+        result.put("method", prediction.method());
+        result.put("exponent", prediction.exponent());
+        result.put("references", prediction.references());
+        result.put("predictions", prediction.predictions());
+        result.put("text", prediction.text());
+        return result;
+    }
+
     /** 两次对比，结论直接回读给用户；任一 id 多义时返回 AMBIGUOUS。 */
     @McpTool(name = "compare_runs",
             description = "对比两次跑步的距离、时长与配速差异，并给出一句话结论（谁更快、快多少）。"
@@ -449,9 +483,10 @@ public class SportHealthTools {
 
     /** 每公里（或自定义距离）分段配速。 */
     @McpTool(name = "get_run_splits",
-            description = "把一次跑步按固定距离（默认 1 公里）切分，返回每段距离、用时、配速、爬升，"
-                    + "以及最快/最慢分段、前后半程配速、是否负分段、配速稳定性。"
-                    + "用于回答“每公里配速多少”“有没有跑崩”“后半程更快吗”。")
+            description = "把一次跑步按固定距离（默认 1 公里）切分，返回每段距离、用时、配速、爬升、净海拔变化、"
+                    + "平均坡度与坡度修正配速（GAP），以及最快/最慢分段、前后半程配速、是否负分段、配速稳定性。"
+                    + "GAP 把上坡折算成等效平路配速，便于山路和平路横向比较。"
+                    + "用于回答“每公里配速多少”“有没有跑崩”“后半程更快吗”“山路实际强度多大”。")
     public Map<String, Object> getRunSplits(
             @McpToolParam(description = "跑步记录 id") String runId,
             @McpToolParam(description = "分段距离（公里），默认 1", required = false) Double splitKm) {
@@ -530,6 +565,106 @@ public class SportHealthTools {
         result.put("count", trend.count());
         result.put("periods", trend.periods());
         result.put("text", trend.text());
+        return result;
+    }
+
+    /**
+     * 训练负荷与 ACWR：回答“最近加量是不是太快”“有没有伤病风险”。
+     */
+    @McpTool(name = "get_training_load",
+            description = "计算训练负荷与伤病风险：最近 7 天急性负荷、28 天慢性负荷、ACWR（急性/慢性周均）、"
+                    + "周跑量增幅、连续训练天数、休息日与训练单调性，并给出调整建议。"
+                    + "metric 可选 distance（默认，公里）或 duration（分钟）。数据覆盖不足时会明确标注置信度，"
+                    + "不会用几天的数据给出确定结论。")
+    public Map<String, Object> getTrainingLoad(
+            @McpToolParam(description = "评估截止日期，格式 yyyy-MM-dd，默认取数据最后一天", required = false) String endDate,
+            @McpToolParam(description = "负荷口径：distance（默认，公里）或 duration（分钟）", required = false) String metric) {
+        DateRange range = analytics.resolveRange(null, endDate);
+        TrainingLoad load = analytics.trainingLoad(range.to(), metric);
+        if (load.chronic().runCount() == 0) {
+            return noData(new DateRange(load.anchorDate().minusDays(27), load.anchorDate()), null);
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "OK");
+        result.put("anchorDate", load.anchorDate());
+        result.put("metric", load.metric());
+        result.put("acute", load.acute());
+        result.put("chronic", load.chronic());
+        result.put("chronicWeeklyAverage", load.chronicWeeklyAverage());
+        result.put("acwr", load.acwr());
+        result.put("chronicCoverageDays", load.chronicCoverageDays());
+        result.put("dataSufficient", load.dataSufficient());
+        result.put("confidence", load.confidence());
+        result.put("riskLevel", load.riskLevel());
+        result.put("weeklyRampPercent", load.weeklyRampPercent());
+        result.put("consecutiveTrainingDays", load.consecutiveTrainingDays());
+        result.put("restDaysLast7", load.restDaysLast7());
+        result.put("monotony", load.monotony());
+        result.put("strain", load.strain());
+        result.put("recommendation", load.recommendation());
+        result.put("text", load.text());
+        return result;
+    }
+
+    /**
+     * 单次跑步的训练类型识别。
+     */
+    @McpTool(name = "classify_run",
+            description = "识别一次跑步的训练类型：轻松跑、长距离跑、节奏跑、间歇/变速跑、比赛/测试跑或恢复跑。"
+                    + "没有心率数据，分类基于距离、时长、配速相对个人中位数以及分段配速波动，"
+                    + "返回判定依据与置信度。用于回答“这次算轻松跑还是节奏跑”。")
+    public Map<String, Object> classifyRun(
+            @McpToolParam(description = "跑步记录 id，例如 20261025户外跑步") String runId) {
+        RunLookup lookup = analytics.lookup(runId);
+        if (lookup.isAmbiguous()) {
+            return ambiguous(runId, lookup);
+        }
+        if (!lookup.isFound()) {
+            return notFound(runId);
+        }
+        RunClassification classification = analytics.classify(lookup.run());
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "OK");
+        result.put("runId", classification.runId());
+        result.put("date", classification.date());
+        result.put("type", classification.type());
+        result.put("typeText", classification.typeText());
+        result.put("confidence", classification.confidence());
+        result.put("reasons", classification.reasons());
+        result.put("distanceKm", classification.distanceKm());
+        result.put("paceSecondsPerKm", classification.paceSecondsPerKm());
+        result.put("paceText", classification.paceText());
+        result.put("baselinePaceSecondsPerKm", classification.baselinePaceSecondsPerKm());
+        result.put("baselinePaceText", classification.baselinePaceText());
+        result.put("paceStdDevSeconds", classification.paceStdDevSeconds());
+        result.put("gradeAdjustedPaceSecondsPerKm", classification.gradeAdjustedPaceSecondsPerKm());
+        result.put("gradeAdjustedPaceText", classification.gradeAdjustedPaceText());
+        result.put("text", classification.text());
+        return result;
+    }
+
+    /**
+     * 区间内的训练类型构成：看训练结构是否均衡，而不是只看总跑量。
+     */
+    @McpTool(name = "get_training_mix",
+            description = "统计一个日期区间内的训练类型构成：轻松跑、长距离、节奏跑、间歇/变速、比赛/恢复各占多少次、"
+                    + "多少公里与百分比，并逐条列出分类结果。逐条分类会按需解析轨迹，首次调用稍慢。"
+                    + "用于回答“我的训练是不是全是轻松跑”“长距离占比够不够”。")
+    public Map<String, Object> getTrainingMix(
+            @McpToolParam(description = "开始日期，格式 yyyy-MM-dd，默认取数据最早一天", required = false) String startDate,
+            @McpToolParam(description = "结束日期，格式 yyyy-MM-dd，默认取数据最新一天", required = false) String endDate) {
+        DateRange range = analytics.resolveRange(startDate, endDate);
+        TrainingMix mix = analytics.trainingMix(range);
+        if (mix.totalRuns() == 0) {
+            return noData(range, null);
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "OK");
+        result.put("range", range.text());
+        result.put("totalRuns", mix.totalRuns());
+        result.put("types", mix.types());
+        result.put("runs", mix.runs());
+        result.put("text", mix.text());
         return result;
     }
 
@@ -630,6 +765,60 @@ public class SportHealthTools {
         result.put("totalStopSeconds", stops.totalStopSeconds());
         result.put("totalStopText", stops.totalStopText());
         result.put("stops", stops.stops());
+        return result;
+    }
+
+    /**
+     * 天气影响分析：把已有 {@code run_weather} 数据按温度/湿度/风速/降水分组，比较配速差异。
+     * 不触发天气抓取，只读已经回填的行；没有天气数据时提示先同步。
+     */
+    @McpTool(name = "get_weather_impact",
+            description = "分析天气对配速的影响：按起跑气温、湿度、风速、有无降水分组，返回每组的次数、"
+                    + "加权平均配速、相对整体基线的快慢秒数，以及气温与配速的相关系数。"
+                    + "只使用已经回填的天气数据，不会联网；没有天气时先调用 reload_data。"
+                    + "用于回答“我热天是不是掉速”“下雨天跑得慢多少”。")
+    public Map<String, Object> getWeatherImpact(
+            @McpToolParam(description = "开始日期，格式 yyyy-MM-dd，默认取数据最早一天", required = false) String startDate,
+            @McpToolParam(description = "结束日期，格式 yyyy-MM-dd，默认取数据最新一天", required = false) String endDate,
+            @McpToolParam(description = "只看至少这么长距离的跑步（公里），默认 0", required = false) Double minDistanceKm) {
+        DateRange range = analytics.resolveRange(startDate, endDate);
+        if (weatherStore == null) {
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("status", "NO_DATA");
+            result.put("message", "当前仓储没有天气表，无法分析天气影响；请先调用 reload_data 同步数据。");
+            result.put("range", range.text());
+            return result;
+        }
+        double minDistance = minDistanceKm != null && minDistanceKm > 0 ? minDistanceKm : 0d;
+        WeatherImpact impact;
+        try {
+            impact = WeatherImpactAnalyzer.analyze(range, analytics.runs(range),
+                    weatherStore.findAll(), minDistance);
+        } catch (RuntimeException e) {
+            log.warn("天气影响分析失败", e);
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("status", "NO_DATA");
+            result.put("message", "读取天气数据失败：" + e.getMessage());
+            result.put("range", range.text());
+            return result;
+        }
+        if (impact.sampleSize() == 0) {
+            return noData(range, impact.text());
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "OK");
+        result.put("range", range.text());
+        result.put("totalRuns", impact.totalRuns());
+        result.put("sampleSize", impact.sampleSize());
+        result.put("baselinePaceSecondsPerKm", impact.baselinePaceSecondsPerKm());
+        result.put("baselinePaceText", impact.baselinePaceText());
+        result.put("temperatureBuckets", impact.temperatureBuckets());
+        result.put("humidityBuckets", impact.humidityBuckets());
+        result.put("windBuckets", impact.windBuckets());
+        result.put("dry", impact.dry());
+        result.put("wet", impact.wet());
+        result.put("temperaturePaceCorrelation", impact.temperaturePaceCorrelation());
+        result.put("text", impact.text());
         return result;
     }
 
@@ -753,6 +942,8 @@ public class SportHealthTools {
         result.put("movingDurationText", splits.movingDurationText());
         result.put("avgPaceSecondsPerKm", splits.avgPaceSecondsPerKm());
         result.put("avgPaceText", splits.avgPaceText());
+        result.put("avgGradeAdjustedPaceSecondsPerKm", splits.avgGradeAdjustedPaceSecondsPerKm());
+        result.put("avgGradeAdjustedPaceText", splits.avgGradeAdjustedPaceText());
         result.put("fastest", splits.fastest());
         result.put("slowest", splits.slowest());
         result.put("firstHalfPaceSecondsPerKm", splits.firstHalfPaceSecondsPerKm());

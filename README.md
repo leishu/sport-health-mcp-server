@@ -1,6 +1,6 @@
 # sport-health-mcp-server
 
-基于 Spring AI 的华为运动健康 **TCX** 数据 MCP 服务。把导出的跑步记录变成 15 个可调用的 MCP 工具，让 Claude Code / Cursor 等客户端可以直接回答：
+基于 Spring AI 的华为运动健康 **TCX** 数据 MCP 服务。把导出的跑步记录变成 20 个可调用的 MCP 工具，让 Claude Code / Cursor 等客户端可以直接回答：
 
 - 「我最近跑了哪些？」
 - 「这个月一共跑了多少公里？」
@@ -11,6 +11,11 @@
 - 「这周比上周多跑了多少？」
 - 「这次中途停了几次？」
 - 「把 11-01 的轨迹按 200 个点分页给我。」
+- 「我现在的水平全马能跑多少？」
+- 「最近加量是不是太快，有没有伤病风险？」
+- 「这次算轻松跑、节奏跑还是长距离？」
+- 「山路实际强度相当于平路什么配速？」
+- 「热天我是不是掉速，下雨慢多少？」
 
 > 数据源只读取 `*.tcx`。目录里的其它文件不会被扫描或解析。
 >
@@ -43,7 +48,7 @@ JAVA_HOME=/path/to/jdk-21 java -jar target/sport-health-mcp-server-1.0.0.jar
 
 ```
 SQLite 数据库文件: /home/you/sport-health-mcp-server/data/sport-health.db
-Registered tools: 15
+Registered tools: 20
 Netty started on port 8080 (http)
 ```
 
@@ -224,12 +229,17 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `get_daily_running` | `startDate?` `endDate?` `groupBy?` | 按天/周/月拆分，只含有记录的周期，`day` 时额外返回每天一条 |
 | `get_personal_bests` | `startDate?` `endDate?` `category?` | `category`：`all`（默认）/`distance`/`pace`/`duration`/`climb`/`best1k`/`best5k`；后两项为区间内最快的 1 公里、5 公里（需解析轨迹） |
 | `compare_runs` | `baseRunId` `otherRunId` `includeSplits?` | 距离/时长/配速差异 + 一句话结论，可选附带两次的分段 |
-| `get_run_splits` | `runId` `splitKm?` | 沿轨迹按固定距离（默认 1 公里）分段：配速、用时、本段爬升、最快/最慢段、前后半程对比、负分段、配速标准差，并返回 `gpsDistanceKm` |
+| `get_run_splits` | `runId` `splitKm?` | 沿轨迹按固定距离（默认 1 公里）分段：配速、用时、本段爬升、净海拔变化、平均坡度、坡度修正配速（GAP）、最快/最慢段、前后半程对比、负分段、配速标准差，并返回 `gpsDistanceKm` 与全程 GAP 汇总 |
 | `get_best_efforts` | `runId` `distancesKm?` | 单次跑步内 1K/5K 等目标距离的最佳用时与折算配速（默认 `[1,5]`），附 `gpsDistanceKm`，超出本次距离的目标列入 `unavailableTargetsMeters` |
 | `get_training_trend` | `period?` `count?` `endDate?` | 连续周/月趋势（`count` 默认 4、最多 52），含跑量与配速相对上一周期的变化 |
 | `get_consistency` | `startDate?` `endDate?` | 打卡天数占比、当前/最长连续天数、平均间隔、日历热力数据；当前连续以最后一次记录为锚点 |
 | `get_elevation_profile` | `runId` `bucketMeters?` `smoothingMeters?` | 按距离分桶的海拔剖面（默认 100 米一桶、最小 10；平滑默认 1 米、0 表示不平滑），含累计爬升下降与坡度 |
 | `get_stop_points` | `runId` `minStopSeconds?` `maxDisplacementMeters?` | 检测停顿（默认 30 秒、30 米）：相邻轨迹点间隔≥阈值且位移≤阈值，返回时长、位置与总停顿 |
+| `predict_race_time` | `startDate?` `endDate?` `distanceKm?` | 用区间内 1K/5K/10K/半马/全马最佳努力做 Riegel 外推（`T2 = T1 × (D2/D1)^1.06`）。不传 `distanceKm` 时输出 5K/10K/半马/全马；有实测距离时标记 `source=ACTUAL`，外推标记 `RIEGEL`，并给出参考记录与 `HIGH/MEDIUM/LOW` 置信度 |
+| `get_training_load` | `endDate?` `metric?` | 训练负荷与 ACWR：7 天急性、28 天慢性、`ACWR = 急性 / (慢性/4)`、周跑量增幅、连续训练天数、休息日、单调性与 Strain，并给出调整建议。`metric` 可选 `distance`（默认，公里）或 `duration`（分钟）；数据覆盖不足时明确标注置信度 |
+| `classify_run` | `runId` | 识别训练类型：轻松跑、长距离跑、节奏跑、间歇/变速跑、比赛/测试跑、恢复跑。基于距离、时长、配速相对个人中位数与分段波动，返回判定依据与置信度（无 GPS 时降为 LOW） |
+| `get_training_mix` | `startDate?` `endDate?` | 区间内的训练类型构成：各类型的次数、距离、距离占比，并逐条列出分类结果。逐条分类会按需解析轨迹，首次调用稍慢 |
+| `get_weather_impact` | `startDate?` `endDate?` `minDistanceKm?` | 只读已回填的 `run_weather`，按起跑气温、湿度、风速、有无降水分组，返回每组次数、加权平均配速、相对整体基线的快慢秒数，以及气温与配速的 Pearson 相关系数。不联网，没有天气时提示先 `reload_data` |
 | `reload_data` | — | 导出新文件后做增量同步：按 `(文件名, size, mtime, sha256)` 只解析变化的文件，无需重启 |
 
 ### list_runs 过滤与排序
@@ -239,6 +249,16 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
   `maxPaceSecondsPerKm` 是数值上限（排除比它更慢的记录）；带配速条件时，缺配速的记录会被排除。
 - `sortBy`：`date`（默认，新的在前）、`distance`、`duration`、`pace`（快的在前）、`climb`；缺值记录排在最后。
 - `minDistanceKm > maxDistanceKm` 或 `minPaceSecondsPerKm > maxPaceSecondsPerKm` 会抛参数错误，而不是静默返回空结果。
+
+### 训练分析口径
+
+P0 新增的五项分析都只使用已有的 TCX 数据与已回填的天气，不引入新的数据源、不新增数据库表：
+
+- **比赛预测**：Riegel 公式 `T2 = T1 × (D2/D1)^1.06`。参考成绩取区间内 1K/5K/10K/半马/全马最佳努力中与目标距离最接近的一项；目标距离本身有实测时直接返回实测值并标记 `ACTUAL`。参考距离与目标距离差得越远，`confidence` 越低。
+- **训练负荷 / ACWR**：急性窗口 7 天、慢性窗口 28 天，负荷口径默认距离（公里），也可切换为时长（分钟）。`ACWR = 急性负荷 / (慢性负荷 / 4)`；同时返回周增幅、连续训练天数、休息日、7 天单调性（均值/标准差）与 Strain。慢性窗口覆盖不足 21 天或训练日少于 7 天时 `dataSufficient=false`，置信度降为 `LOW`。
+- **坡度修正配速 GAP**：用 Minetti 跑步能量代价公式计算坡度代价比 `Cr(grade)/Cr(0)`，`GAP = 实际配速 / 代价比`，坡度夹取到 `[-45%, 45%]`；净海拔变化取每段首尾海拔差。全程 GAP 用等效平路距离加权，而不是对分段 GAP 做算术平均。
+- **训练类型识别**：无心率数据，基于距离、时长、配速相对个人中位数与分段波动做启发式判断。长距离阈值取 `max(10 km, 1.5 × 个人中位距离)`；间歇/变速要求同时有至少 2 段明显快、2 段明显慢于中位配速，避免把长距离跑里的一次停顿误判成间歇；无 GPS 轨迹时置信度降为 `LOW`。
+- **天气影响**：只读 `run_weather` 中 `status=OK` 的记录，优先使用起跑快照（缺失时退回结束快照）。分组内配速用「总时长 / 总距离」加权；样本少于 3 条时相关系数为 `null`，并在结论文本里提示样本不足。
 
 ### 返回状态
 
@@ -407,10 +427,13 @@ sqlite3 data/sport-health.db "SELECT source_file, size, modified_millis, substr(
 }
 ```
 
-口径：`observedAt` 是参与插值的**整点**，不是跑步时刻本身；任一指标缺值一律 `null`，不会当成 0 度；
-某个时刻整份快照都没有时该时刻直接是 `null`。`status` 除 `OK` 外还有三种：`UNAVAILABLE`（缺坐标、
+口径：`observedAt` 是参与插值的**整点**，不是跑步时刻本身；任一指标缺值一律 `null`，不会当成 0 度；某个时刻整份快照都没有时该时刻直接是 `null`。`status` 除 `OK` 外还有三种：`UNAVAILABLE`（缺坐标、
 超出存档覆盖范围）与 `FAILED`（抓取失败待重试）会带上 `errorMessage` 说明原因；还没回填过则是
 `MISSING`，提示调用一次 `reload_data` 即可补齐。
+
+**聚合看天气影响**：`get_weather_impact` 只读已经落库的天气行，按起跑气温、湿度、风速、有无降水分组，
+返回每组的次数、加权平均配速与相对整体基线的快慢秒数。它不会触发抓取，所以没有数据时
+先调 `reload_data`。
 
 **孤儿行清理**：`run_weather` 没有外键，记录被重导删除时天气行会留在表里。导入时删「本次解析后
 消失的 id」，以及「id 没变但起跑时刻 / 时长 / 起终点坐标变了」的记录——前者是记录没了，
@@ -486,9 +509,9 @@ JPA 在 WebFlux 上要配 R2DBC 才不阻塞，对只有两张表的场景属于
 ## 架构
 
 ```
-tools/SportHealthTools          # 15 个 @McpTool，负责参数校验与统一的 Map<String, Object> 返回结构
+tools/SportHealthTools          # 20 个 @McpTool，负责参数校验与统一的 Map<String, Object> 返回结构
         │
-service/RunAnalyticsService     # 区间汇总、按天拆分、个人最佳、对比、分段、最佳努力、海拔、停顿、趋势、id 解析
+service/RunAnalyticsService     # 区间汇总、按天拆分、个人最佳、对比、分段/GAP、最佳努力、海拔、停顿、趋势、比赛预测、ACWR、训练分类、id 解析
         │
 repository/HealthDataRepository # 抽象：dataset() / route() / reload()
         └── JdbcHealthDataRepository   # 从 SQLite 装载快照、轨迹直查库（@Primary）
@@ -509,6 +532,12 @@ importer/SourceFileScanner      # 扫描 *.tcx，产出带 size/mtime 的 Source
 importer/ContentHash            # SHA-256 指纹
 
 support/TrackPath               # 轨迹几何索引：累计距离 ↔ 时间 ↔ 海拔，分段/最佳努力/海拔共用
+support/WeatherImpactAnalyzer   # 天气影响分组统计（纯计算，不访问库或网络）
+domain/RacePrediction           # 比赛预测结果（参考成绩 + 各目标距离）
+domain/TrainingLoad             # 训练负荷 / ACWR 快照
+domain/RunClassification        # 单次训练类型识别结果
+domain/TrainingMix              # 区间训练类型构成
+domain/WeatherImpact            # 天气影响分组结果
 ```
 
 - **启动阶段**：只建表，不解析。首次访问（或 `reload_data`）触发增量同步，然后把全部摘要装进内存快照。
@@ -536,7 +565,7 @@ SQLite（`spring-boot-starter-jdbc` + `org.xerial:sqlite-jdbc`，无 ORM）。
 JAVA_HOME=/path/to/jdk-21 mvn test
 ```
 
-共 **109** 个用例（原有 42 + 持久化 19 + 资源形态 2 + 天气 42 + 工具层天气 4）：
+共 **126** 个用例（原有 42 + 持久化 19 + 资源形态 2 + 天气 42 + 工具层天气 4 + P0 分析 17）：
 
 - **真实数据**：测试固定读 `src/test/resources/tcx-dataset` 里的 5 个 TCX，而不是
   `src/main/resources/health-data`。生产目录会随导入继续增长（例如新加的骑行文件），
@@ -574,6 +603,11 @@ JAVA_HOME=/path/to/jdk-21 mvn test
 - **天气行生命周期**（`JdbcHealthDataRepositoryTest`）：文件里删掉一个 Activity 后它的天气行一起删除、
   仅距离变化时保留已回填的天气、同名文件起跑时刻变化时旧天气作废、
   历史遗留的孤儿行在同步时被清理、`stats` 不把孤儿行算进覆盖率或 `lastFetchedAt`。
+- **P0 分析**（`RunAnalyticsP0Test` / `SportHealthToolsP0Test` / `SportHealthToolsWeatherImpactTest`）：
+  5K/10K 有实测时返回 `ACTUAL`、半马/全马按 Riegel 外推且置信度随距离差下降；自定义目标距离；
+  ACWR 在只有 10 天数据时标 `LOW` 置信度并给出高风险提示；逐公里 GAP 与净海拔/坡度字段；
+  长距离跑识别与训练类型构成；工具层 5 个新工具的返回结构与 `NO_DATA` 语义；
+  真实 SQLite 下种 5 条天气行后温度/湿度/风速/干湿分组、加权配速与相关系数。
 - **插值与客户端**（`WeatherInterpolatorTest` / `OpenMeteoClientTest`）：
   线性插值、风向最短弧（350°→10° 取 0°）、`weather_code` 取最近整点、
   序列首尾边界、时间轴里出现无法解析的格子时整行压缩而不是 NPE、

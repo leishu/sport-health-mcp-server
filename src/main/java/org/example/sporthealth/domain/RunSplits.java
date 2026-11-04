@@ -24,6 +24,8 @@ import java.util.List;
  * @param secondHalfPaceSecondsPerKm 后半程配速（秒/公里）
  * @param negativeSplit              后半程是否更快；数据不足时为 null
  * @param paceStdDevSeconds          各整段配速的标准差（秒），越小越稳
+ * @param avgGradeAdjustedPaceSecondsPerKm 全程坡度修正配速（秒/公里），无海拔数据时为 null
+ * @param avgGradeAdjustedPaceText   全程坡度修正配速文本
  */
 public record RunSplits(
         String runId,
@@ -40,5 +42,7 @@ public record RunSplits(
         Double firstHalfPaceSecondsPerKm,
         Double secondHalfPaceSecondsPerKm,
         Boolean negativeSplit,
-        Double paceStdDevSeconds) {
+        Double paceStdDevSeconds,
+        Double avgGradeAdjustedPaceSecondsPerKm,
+        String avgGradeAdjustedPaceText) {
 }

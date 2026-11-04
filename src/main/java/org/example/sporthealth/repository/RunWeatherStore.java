@@ -48,6 +48,19 @@ public class RunWeatherStore {
             LIMIT :limit
             """;
 
+    private static final String SELECT_WEATHER = """
+            SELECT run_id,
+                   start_obs_time_utc, start_temperature_c, start_apparent_c,
+                   start_humidity_percent, start_precipitation_mm,
+                   start_wind_speed_kmh, start_wind_direction, start_weather_code,
+                   end_obs_time_utc, end_temperature_c, end_apparent_c,
+                   end_humidity_percent, end_precipitation_mm,
+                   end_wind_speed_kmh, end_wind_direction, end_weather_code,
+                   start_latitude, start_longitude, end_latitude, end_longitude,
+                   status, error_message, fetched_at, provider
+            FROM run_weather
+            """;
+
     private static final String UPSERT = """
             INSERT INTO run_weather (
                 run_id, start_obs_time_utc, end_obs_time_utc,
@@ -216,33 +229,37 @@ public class RunWeatherStore {
      * 把失败行当成不存在只会让用户以为功能没生效。没有这一行才返回空，表示还没回填过。
      */
     public Optional<RunWeather> find(String runId) {
-        return jdbc.sql("""
-                        SELECT run_id,
-                               start_obs_time_utc, start_temperature_c, start_apparent_c,
-                               start_humidity_percent, start_precipitation_mm,
-                               start_wind_speed_kmh, start_wind_direction, start_weather_code,
-                               end_obs_time_utc, end_temperature_c, end_apparent_c,
-                               end_humidity_percent, end_precipitation_mm,
-                               end_wind_speed_kmh, end_wind_direction, end_weather_code,
-                               start_latitude, start_longitude, end_latitude, end_longitude,
-                               status, error_message, fetched_at, provider
-                        FROM run_weather
-                        WHERE run_id = :runId
-                        """)
+        return jdbc.sql(SELECT_WEATHER + " WHERE run_id = :runId")
                 .param("runId", runId)
-                .query((rs, rowNum) -> new RunWeather(
-                        rs.getString("run_id"),
-                        snapshot(rs, "start"),
-                        snapshot(rs, "end"),
-                        RunRows.real(rs, "start_latitude"),
-                        RunRows.real(rs, "start_longitude"),
-                        RunRows.real(rs, "end_latitude"),
-                        RunRows.real(rs, "end_longitude"),
-                        RunWeather.Status.valueOf(rs.getString("status")),
-                        rs.getString("error_message"),
-                        instant(rs.getString("fetched_at")),
-                        rs.getString("provider")))
+                .query((rs, rowNum) -> map(rs))
                 .optional();
+    }
+
+    /**
+     * 读出全部天气行，供 {@code get_weather_impact} 一次性做分组统计。
+     *
+     * <p>不做区间过滤：调用方已经在内存里按跑步记录筛过区间，天气行只是按 id 关联的附属数据。
+     * 数据量是「跑步条数」级别，一次全表读比逐条查询更划算。
+     */
+    public List<RunWeather> findAll() {
+        return jdbc.sql(SELECT_WEATHER)
+                .query((rs, rowNum) -> map(rs))
+                .list();
+    }
+
+    private static RunWeather map(ResultSet rs) throws SQLException {
+        return new RunWeather(
+                rs.getString("run_id"),
+                snapshot(rs, "start"),
+                snapshot(rs, "end"),
+                RunRows.real(rs, "start_latitude"),
+                RunRows.real(rs, "start_longitude"),
+                RunRows.real(rs, "end_latitude"),
+                RunRows.real(rs, "end_longitude"),
+                RunWeather.Status.valueOf(rs.getString("status")),
+                rs.getString("error_message"),
+                instant(rs.getString("fetched_at")),
+                rs.getString("provider"));
     }
 
     /**

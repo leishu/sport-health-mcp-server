@@ -6,12 +6,15 @@ import java.time.LocalDate;
 import java.time.temporal.TemporalAdjusters;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 
 import org.example.sporthealth.domain.ActiveDay;
@@ -25,7 +28,9 @@ import org.example.sporthealth.domain.Page;
 import org.example.sporthealth.domain.PeriodSummary;
 import org.example.sporthealth.domain.PersonalBestEffort;
 import org.example.sporthealth.domain.PersonalBests;
+import org.example.sporthealth.domain.RacePrediction;
 import org.example.sporthealth.domain.RunActivity;
+import org.example.sporthealth.domain.RunClassification;
 import org.example.sporthealth.domain.RunComparison;
 import org.example.sporthealth.domain.RunDataset;
 import org.example.sporthealth.domain.RunDetail;
@@ -38,6 +43,8 @@ import org.example.sporthealth.domain.StopPoint;
 import org.example.sporthealth.domain.StopPoints;
 import org.example.sporthealth.domain.Streak;
 import org.example.sporthealth.domain.TrackPoint;
+import org.example.sporthealth.domain.TrainingLoad;
+import org.example.sporthealth.domain.TrainingMix;
 import org.example.sporthealth.domain.TrainingTrend;
 import org.example.sporthealth.domain.TrendPeriod;
 import org.example.sporthealth.repository.HealthDataRepository;
@@ -62,6 +69,17 @@ public class RunAnalyticsService {
     private static final double MIN_ELEVATION_SMOOTHING_METERS = 0d;
     private static final double DEFAULT_STOP_SECONDS = 30d;
     private static final double DEFAULT_STOP_DISPLACEMENT_METERS = 30d;
+
+    /** Riegel 公式的经验指数，用于把较短距离成绩外推到更长距离。 */
+    private static final double RIEGEL_EXPONENT = 1.06d;
+    /** 计算最佳努力时额外包含 1 公里，让资料很少时也能有一个参考点。 */
+    private static final List<Double> RACE_REFERENCE_TARGETS =
+            List.of(1000d, 5000d, 10000d, 21097.5d, 42195d);
+    /** 默认输出的预测距离：5K、10K、半马、全马。 */
+    private static final List<Double> DEFAULT_RACE_TARGETS =
+            List.of(5000d, 10000d, 21097.5d, 42195d);
+    /** Minetti 跑步能量代价公式在平地上的值（J/kg/m）。 */
+    private static final double MINETTI_FLAT_COST = 3.6d;
 
     private final HealthDataRepository repository;
     private final DateRangeResolver rangeResolver;
@@ -328,25 +346,48 @@ public class RunAnalyticsService {
         TrackPath path = TrackPath.of(repository.route(run.id()));
         if (!path.usable()) {
             return new RunSplits(run.id(), run.date(), step, 0d, 0d, null, null, null,
-                    List.of(), null, null, null, null, null, null);
+                    List.of(), null, null, null, null, null, null, null, null);
         }
 
         double total = path.totalDistanceMeters();
         List<RunSplit> splits = new ArrayList<>();
         double start = 0d;
         int index = 1;
+        // 坡度修正配速的全程汇总：用「等效平路距离」加权，而不是对每段配速做算术平均
+        double equivalentFlatMeters = 0d;
+        double gapCoveredSeconds = 0d;
+        boolean hasAltitude = false;
         while (start < total - 1e-6) {
             double end = Math.min(start + step, total);
-            double distanceKm = (end - start) / 1000d;
+            double segmentMeters = Math.max(0d, end - start);
+            double distanceKm = segmentMeters / 1000d;
             double duration = path.timeAtDistance(end) - path.timeAtDistance(start);
             Double pace = distanceKm > 0 && duration > 0
                     ? PaceFormat.round(duration / distanceKm, 1)
                     : null;
             Double gain = gainOrNull(path.altitudesBetween(start, end), 0d);
-            boolean partial = end - start < step - 1e-6;
+
+            Double startAltitude = path.altitudeAtDistance(start);
+            Double endAltitude = path.altitudeAtDistance(end);
+            Double netElevation = null;
+            Double gradePercent = null;
+            Double gapPace = null;
+            if (startAltitude != null && endAltitude != null && segmentMeters > 0) {
+                hasAltitude = true;
+                netElevation = PaceFormat.round(endAltitude - startAltitude, 1);
+                gradePercent = PaceFormat.round(netElevation / segmentMeters * 100d, 1);
+                if (pace != null) {
+                    double ratio = minettiCost(netElevation / segmentMeters) / MINETTI_FLAT_COST;
+                    gapPace = PaceFormat.round(pace / ratio, 1);
+                    equivalentFlatMeters += segmentMeters * ratio;
+                    gapCoveredSeconds += duration;
+                }
+            }
+
+            boolean partial = segmentMeters < step - 1e-6;
             splits.add(new RunSplit(index++, PaceFormat.round(start / 1000d, 3), PaceFormat.round(end / 1000d, 3),
                     PaceFormat.round(distanceKm, 3), PaceFormat.round(duration, 1), pace, PaceFormat.pace(pace),
-                    gain, partial));
+                    gain, netElevation, gradePercent, gapPace, PaceFormat.pace(gapPace), partial));
             start = end;
         }
 
@@ -372,12 +413,16 @@ public class RunAnalyticsService {
         double avgPace = path.totalSeconds() > 0 && total > 0
                 ? PaceFormat.round(path.totalSeconds() / (total / 1000d), 1)
                 : null;
+        Double avgGapPace = hasAltitude && equivalentFlatMeters > 0 && gapCoveredSeconds > 0
+                ? PaceFormat.round(gapCoveredSeconds / (equivalentFlatMeters / 1000d), 1)
+                : null;
         return new RunSplits(run.id(), run.date(), step,
                 PaceFormat.round(total / 1000d, 3),
                 PaceFormat.round(path.totalSeconds(), 1),
                 PaceFormat.duration(path.totalSeconds()),
                 avgPace, PaceFormat.pace(avgPace),
-                splits, fastest, slowest, firstHalf, secondHalf, negativeSplit, stdDev);
+                splits, fastest, slowest, firstHalf, secondHalf, negativeSplit, stdDev,
+                avgGapPace, PaceFormat.pace(avgGapPace));
     }
 
     /**
@@ -695,6 +740,532 @@ public class RunAnalyticsService {
                         + " 天，最长连续 " + longest.days() + " 天";
         return new Consistency(range.from(), range.to(), days.size(), range.dayCount(), activeRate,
                 current, longest, averageGap, last, days, text);
+    }
+
+    /**
+     * 基于区间内最佳努力预测比赛成绩。参考成绩取 1K / 5K / 10K / 半马 / 全马中距离目标最近的一项，
+     * 用 Riegel 公式外推；目标距离本身有实测成绩时直接返回实测值。
+     *
+     * @param range            统计区间
+     * @param targetDistanceKm 指定目标距离（公里），为空时输出 5K / 10K / 半马 / 全马
+     */
+    public RacePrediction predictRace(DateRange range, Double targetDistanceKm) {
+        List<PersonalBestEffort> references = effortBests(range, RACE_REFERENCE_TARGETS);
+        if (references.isEmpty()) {
+            return new RacePrediction(range.from(), range.to(), "riegel", RIEGEL_EXPONENT,
+                    List.of(), List.of(), "区间内没有可用的 GPS 轨迹，或单次距离不足 1 公里，无法做成绩预测");
+        }
+        List<Double> targets = targetDistanceKm != null && targetDistanceKm > 0
+                ? List.of(targetDistanceKm * 1000d)
+                : DEFAULT_RACE_TARGETS;
+        List<RacePrediction.Prediction> predictions = new ArrayList<>();
+        for (double target : targets) {
+            RacePrediction.Prediction prediction = predictOne(target, references);
+            if (prediction != null) {
+                predictions.add(prediction);
+            }
+        }
+        return new RacePrediction(range.from(), range.to(), "riegel", RIEGEL_EXPONENT,
+                references, predictions, racePredictionText(predictions));
+    }
+
+    private static RacePrediction.Prediction predictOne(double targetMeters,
+                                                        List<PersonalBestEffort> references) {
+        PersonalBestEffort exact = references.stream()
+                .filter(reference -> Math.abs(reference.targetMeters() - targetMeters) < 1d)
+                .findFirst()
+                .orElse(null);
+        if (exact != null) {
+            return prediction(targetMeters, exact.durationSeconds(), "ACTUAL", "HIGH", exact);
+        }
+
+        PersonalBestEffort reference = null;
+        double bestScore = Double.POSITIVE_INFINITY;
+        for (PersonalBestEffort candidate : references) {
+            if (candidate.targetMeters() <= 0 || candidate.durationSeconds() <= 0) {
+                continue;
+            }
+            double score = Math.abs(Math.log(targetMeters / candidate.targetMeters()));
+            if (score < bestScore - 1e-9
+                    || (Math.abs(score - bestScore) <= 1e-9
+                            && reference != null
+                            && candidate.targetMeters() > reference.targetMeters())) {
+                bestScore = score;
+                reference = candidate;
+            }
+        }
+        if (reference == null) {
+            return null;
+        }
+        double predictedSeconds = reference.durationSeconds()
+                * Math.pow(targetMeters / reference.targetMeters(), RIEGEL_EXPONENT);
+        return prediction(targetMeters, predictedSeconds, "RIEGEL",
+                predictionConfidence(targetMeters, reference.targetMeters()), reference);
+    }
+
+    private static RacePrediction.Prediction prediction(double targetMeters, double seconds,
+                                                        String source, String confidence,
+                                                        PersonalBestEffort reference) {
+        double pace = seconds / (targetMeters / 1000d);
+        return new RacePrediction.Prediction(
+                targetMeters,
+                PaceFormat.round(targetMeters / 1000d, 3),
+                source,
+                PaceFormat.round(seconds, 1),
+                PaceFormat.duration(seconds),
+                PaceFormat.round(pace, 1),
+                PaceFormat.pace(pace),
+                confidence,
+                reference.targetMeters(),
+                reference.runId(),
+                reference.date(),
+                PaceFormat.round(reference.durationSeconds(), 1));
+    }
+
+    /** 参考距离与目标距离差得越远，外推误差越大。 */
+    private static String predictionConfidence(double targetMeters, double referenceMeters) {
+        double ratio = Math.max(targetMeters, referenceMeters) / Math.min(targetMeters, referenceMeters);
+        if (ratio <= 1.5d) {
+            return "HIGH";
+        }
+        if (ratio <= 2.5d && referenceMeters >= 3000d) {
+            return "MEDIUM";
+        }
+        return "LOW";
+    }
+
+    private static String racePredictionText(List<RacePrediction.Prediction> predictions) {
+        if (predictions.isEmpty()) {
+            return "没有足够的参考成绩，无法预测";
+        }
+        RacePrediction.Prediction headline = predictions.stream()
+                .filter(prediction -> Math.abs(prediction.targetMeters() - 10000d) < 1d)
+                .findFirst()
+                .orElse(predictions.get(0));
+        return "基于 " + raceDistanceLabel(headline.referenceMeters()) + " 最佳 "
+                + PaceFormat.duration(headline.referenceDurationSeconds())
+                + "（" + headline.referenceDate() + "），预测 "
+                + raceDistanceLabel(headline.targetMeters()) + " 约 "
+                + headline.predictedText() + "（" + headline.paceText() + "）";
+    }
+
+    private static String raceDistanceLabel(double meters) {
+        if (Math.abs(meters - 1000d) < 1d) {
+            return "1 公里";
+        }
+        if (Math.abs(meters - 5000d) < 1d) {
+            return "5 公里";
+        }
+        if (Math.abs(meters - 10000d) < 1d) {
+            return "10 公里";
+        }
+        if (Math.abs(meters - 21097.5d) < 1d) {
+            return "半程马拉松";
+        }
+        if (Math.abs(meters - 42195d) < 1d) {
+            return "全程马拉松";
+        }
+        return PaceFormat.round(meters / 1000d, 2) + " 公里";
+    }
+
+    /**
+     * 训练负荷与 ACWR。急性窗口 7 天、慢性窗口 28 天，负荷口径可选距离或时长。
+     *
+     * <p>没有心率时，距离/时长是最稳定的替代指标；{@code confidence} 会明确标出数据覆盖不足，
+     * 避免用短期数据给出确定的风险结论。
+     *
+     * @param anchor 评估截止日期（含），为空时取数据集最后一天
+     * @param metric {@code distance}（默认）或 {@code duration}
+     */
+    public TrainingLoad trainingLoad(LocalDate anchor, String metric) {
+        List<RunActivity> all = repository.dataset().activities();
+        LocalDate end = anchor != null ? anchor : all.stream()
+                .map(RunActivity::date).max(Comparator.naturalOrder()).orElse(LocalDate.now());
+        String normalized = "duration".equalsIgnoreCase(metric) ? "duration" : "distance";
+
+        List<RunActivity> chronicRuns = runs(new DateRange(end.minusDays(27), end));
+        List<RunActivity> acuteRuns = chronicRuns.stream()
+                .filter(run -> !run.date().isBefore(end.minusDays(6)))
+                .toList();
+        List<RunActivity> previousRuns = runs(new DateRange(end.minusDays(13), end.minusDays(7)));
+
+        TrainingLoad.LoadWindow acute = loadWindow(acuteRuns, 7, normalized);
+        TrainingLoad.LoadWindow chronic = loadWindow(chronicRuns, 28, normalized);
+        double chronicWeekly = PaceFormat.round(chronic.load() / 4d, 2);
+        Double acwr = chronicWeekly > 0
+                ? PaceFormat.round(acute.load() / chronicWeekly, 2)
+                : null;
+
+        LocalDate firstDate = all.stream().map(RunActivity::date)
+                .min(Comparator.naturalOrder()).orElse(null);
+        int coverageDays = 0;
+        if (firstDate != null && !firstDate.isAfter(end)) {
+            LocalDate coverageStart = firstDate.isBefore(end.minusDays(27))
+                    ? end.minusDays(27) : firstDate;
+            coverageDays = (int) (end.toEpochDay() - coverageStart.toEpochDay()) + 1;
+        }
+        boolean dataSufficient = coverageDays >= 21 && chronic.trainingDays() >= 7;
+        String confidence = coverageDays >= 28 && chronic.trainingDays() >= 14
+                ? "HIGH" : dataSufficient ? "MEDIUM" : "LOW";
+        String riskLevel = riskLevel(acwr, chronic.load());
+
+        double previous = previousLoad(previousRuns, normalized);
+        Double weeklyRamp = previous > 0
+                ? PaceFormat.round((acute.load() - previous) / previous * 100d, 1)
+                : null;
+
+        int consecutiveDays = consecutiveTrainingDays(all, end);
+        int restDays = Math.max(0, 7 - acute.trainingDays());
+        Map<LocalDate, Double> dailyLoads = new HashMap<>();
+        for (RunActivity run : acuteRuns) {
+            dailyLoads.merge(run.date(), loadOf(run, normalized), Double::sum);
+        }
+        Double monotony = monotony(dailyLoads, end.minusDays(6), end);
+        Double strain = monotony == null ? null : PaceFormat.round(acute.load() * monotony, 1);
+
+        String recommendation = recommendation(riskLevel, confidence, coverageDays, weeklyRamp);
+        String unit = "duration".equals(normalized) ? "分钟" : "公里";
+        String text = "截至 " + end + "，近 7 天负荷 " + acute.load() + " " + unit
+                + "，慢性周均 " + chronicWeekly + " " + unit
+                + (acwr == null ? "，ACWR 无法计算" : "，ACWR " + acwr + "（" + riskText(riskLevel) + "）")
+                + (weeklyRamp == null ? "" : "；最近一周比前一周"
+                        + (weeklyRamp >= 0 ? "增加 " : "减少 ") + Math.abs(weeklyRamp) + "%");
+
+        return new TrainingLoad(end, normalized, acute, chronic, chronicWeekly, acwr,
+                coverageDays, dataSufficient, confidence, riskLevel, weeklyRamp,
+                consecutiveDays, restDays, monotony, strain, recommendation, text);
+    }
+
+    private static TrainingLoad.LoadWindow loadWindow(List<RunActivity> runs, int days, String metric) {
+        double distanceKm = PaceFormat.round(runs.stream()
+                .mapToDouble(RunActivity::distanceMeters).sum() / 1000d, 2);
+        double durationMinutes = PaceFormat.round(runs.stream()
+                .mapToDouble(RunActivity::durationSeconds).sum() / 60d, 1);
+        double load = "duration".equals(metric) ? durationMinutes : distanceKm;
+        int trainingDays = (int) runs.stream().map(RunActivity::date).distinct().count();
+        return new TrainingLoad.LoadWindow(days, runs.size(), trainingDays,
+                distanceKm, durationMinutes, PaceFormat.round(load, 1));
+    }
+
+    private static double previousLoad(List<RunActivity> runs, String metric) {
+        double distanceKm = runs.stream().mapToDouble(RunActivity::distanceMeters).sum() / 1000d;
+        double durationMinutes = runs.stream().mapToDouble(RunActivity::durationSeconds).sum() / 60d;
+        return "duration".equals(metric) ? durationMinutes : distanceKm;
+    }
+
+    private static double loadOf(RunActivity run, String metric) {
+        return "duration".equals(metric) ? run.durationSeconds() / 60d : run.distanceMeters() / 1000d;
+    }
+
+    private static int consecutiveTrainingDays(List<RunActivity> all, LocalDate end) {
+        Set<LocalDate> dates = new HashSet<>();
+        for (RunActivity run : all) {
+            dates.add(run.date());
+        }
+        int count = 0;
+        LocalDate cursor = end;
+        while (dates.contains(cursor)) {
+            count++;
+            cursor = cursor.minusDays(1);
+        }
+        return count;
+    }
+
+    /** 7 天每日负荷的均值/标准差；休息日为 0 也参与计算。 */
+    private static Double monotony(Map<LocalDate, Double> dailyLoads, LocalDate from, LocalDate to) {
+        int days = (int) (to.toEpochDay() - from.toEpochDay()) + 1;
+        if (days < 2) {
+            return null;
+        }
+        double mean = 0d;
+        double[] values = new double[days];
+        for (int i = 0; i < days; i++) {
+            values[i] = dailyLoads.getOrDefault(from.plusDays(i), 0d);
+            mean += values[i];
+        }
+        mean /= days;
+        if (mean <= 1e-9) {
+            return null;
+        }
+        double variance = 0d;
+        for (double value : values) {
+            variance += (value - mean) * (value - mean);
+        }
+        double stdDev = Math.sqrt(variance / days);
+        return stdDev <= 1e-9 ? null : PaceFormat.round(mean / stdDev, 2);
+    }
+
+    private static String riskLevel(Double acwr, double chronicLoad) {
+        if (chronicLoad <= 0 || acwr == null) {
+            return "INSUFFICIENT_DATA";
+        }
+        if (acwr < 0.8d) {
+            return "UNDERTRAINING";
+        }
+        if (acwr <= 1.3d) {
+            return "OPTIMAL";
+        }
+        if (acwr <= 1.5d) {
+            return "CAUTION";
+        }
+        return "HIGH_RISK";
+    }
+
+    private static String riskText(String riskLevel) {
+        return switch (riskLevel) {
+            case "UNDERTRAINING" -> "偏低";
+            case "OPTIMAL" -> "正常";
+            case "CAUTION" -> "偏高";
+            case "HIGH_RISK" -> "高风险";
+            default -> "数据不足";
+        };
+    }
+
+    private static String recommendation(String riskLevel, String confidence, int coverageDays,
+                                         Double weeklyRamp) {
+        String base = switch (riskLevel) {
+            case "UNDERTRAINING" -> "近期负荷低于慢性基线，可能处于减量或恢复期；若目标是提升，可每周增加 10-15% 跑量。";
+            case "OPTIMAL" -> "负荷在安全区间，维持当前节奏，注意保留至少 1-2 个休息日。";
+            case "CAUTION" -> "周负荷增长偏快，本周建议不再加量，优先睡眠与恢复。";
+            case "HIGH_RISK" -> "ACWR 超过 1.5，伤病风险升高；建议本周减量 20-30%，并增加休息日。";
+            default -> "慢性负荷样本不足，先保持 3-4 周稳定训练，再评估 ACWR 更有意义。";
+        };
+        if ("LOW".equals(confidence)) {
+            base = "数据只覆盖 " + coverageDays + " 天，ACWR 仅供参考。" + base;
+        }
+        if (weeklyRamp != null && weeklyRamp > 30d && !"HIGH_RISK".equals(riskLevel)) {
+            base += " 本周跑量比上周增加 " + weeklyRamp + "%，即使 ACWR 正常也建议控制增幅。";
+        }
+        return base;
+    }
+
+    /**
+     * 单次跑步的训练类型识别。没有心率，规则基于距离、时长、配速相对个人中位数与分段波动。
+     */
+    public RunClassification classify(RunActivity run) {
+        List<RunActivity> all = repository.dataset().activities();
+        return classify(run, baselinePace(all), medianDistanceKm(all));
+    }
+
+    private RunClassification classify(RunActivity run, double baselinePace, double medianDistanceKm) {
+        RunSplits splits = splits(run, DEFAULT_SPLIT_METERS);
+        boolean hasGps = !splits.splits().isEmpty();
+        double distanceKm = PaceFormat.round(run.distanceMeters() / 1000d, 2);
+        Double pace = run.avgPaceSecondsPerKm();
+        double paceRatio = baselinePace > 0 && pace != null ? pace / baselinePace : 1d;
+        Double stdDev = splits.paceStdDevSeconds();
+        Double gapPace = splits.avgGradeAdjustedPaceSecondsPerKm();
+        List<String> reasons = new ArrayList<>();
+
+        double longThreshold = Math.max(10d, medianDistanceKm * 1.5d);
+        boolean longRun = distanceKm >= longThreshold || run.durationSeconds() >= 90d * 60d;
+        boolean standardDistance = nearestStandardDistance(distanceKm) != null;
+        boolean race = standardDistance && pace != null && baselinePace > 0
+                && paceRatio <= 0.92d && (stdDev == null || stdDev < 15d);
+        double contrast = splitContrast(splits);
+        // 间歇/变速跑应当有「多次快 + 多次慢」的交替，而不是某一段遇到红灯单独变慢。
+        // 只看标准差或最快最慢差，会把长距离跑里的一个停顿误判成间歇。
+        IntervalSignal interval = intervalSignal(splits, stdDev);
+        boolean tempo = pace != null && baselinePace > 0 && paceRatio <= 0.95d
+                && distanceKm >= 5d && (stdDev == null || stdDev < 20d);
+        boolean recovery = pace != null && baselinePace > 0 && paceRatio >= 1.08d
+                && distanceKm < medianDistanceKm * 1.2d;
+
+        String type;
+        String confidence;
+        if (race) {
+            type = "RACE";
+            confidence = paceRatio <= 0.88d ? "HIGH" : "MEDIUM";
+            reasons.add("距离 " + distanceKm + " 公里接近标准赛事距离");
+            reasons.add("平均配速比个人中位快 " + Math.round((1d - paceRatio) * 100d) + "%");
+        } else if (interval.isInterval()) {
+            type = "INTERVAL";
+            confidence = (stdDev != null && stdDev >= 30d) || contrast >= 90d ? "HIGH" : "MEDIUM";
+            reasons.add("有 " + interval.fastSplits() + " 段明显快于中位配速、"
+                    + interval.slowSplits() + " 段明显慢于中位配速，呈交替变速特征");
+            if (stdDev != null) {
+                reasons.add("分段配速标准差 " + stdDev + " 秒/公里");
+            }
+            if (contrast > 0) {
+                reasons.add("最快与最慢分段相差 " + PaceFormat.round(contrast, 1) + " 秒/公里");
+            }
+        } else if (longRun) {
+            type = "LONG_RUN";
+            confidence = distanceKm >= Math.max(15d, medianDistanceKm * 1.8d)
+                    || run.durationSeconds() >= 120d * 60d ? "HIGH" : "MEDIUM";
+            if (distanceKm >= longThreshold) {
+                reasons.add("距离 " + distanceKm + " 公里达到长距离阈值 "
+                        + PaceFormat.round(longThreshold, 1) + " 公里");
+            }
+            if (run.durationSeconds() >= 90d * 60d) {
+                reasons.add("时长 " + PaceFormat.duration(run.durationSeconds()) + " 达到 90 分钟");
+            }
+        } else if (tempo) {
+            type = "TEMPO";
+            confidence = paceRatio <= 0.90d && stdDev != null && stdDev < 10d ? "HIGH" : "MEDIUM";
+            reasons.add("平均配速比个人中位快 " + Math.round((1d - paceRatio) * 100d) + "%，且分段波动较小");
+        } else if (recovery) {
+            type = "RECOVERY";
+            confidence = "MEDIUM";
+            reasons.add("平均配速比个人中位慢 " + Math.round((paceRatio - 1d) * 100d) + "%");
+            reasons.add("距离 " + distanceKm + " 公里低于个人常规距离");
+        } else {
+            type = "EASY";
+            confidence = hasGps ? "MEDIUM" : "LOW";
+            reasons.add("配速接近个人中位，未触发高强度或长距离规则");
+        }
+
+        if (!hasGps) {
+            confidence = "LOW";
+            reasons.add("缺少 GPS 轨迹，仅按距离/时长/配速分类");
+        }
+
+        String typeText = typeText(type);
+        String text = run.id() + " 判定为" + typeText + "（" + confidence + "）";
+        return new RunClassification(run.id(), run.date(), type, typeText, confidence, reasons,
+                distanceKm, pace, PaceFormat.pace(pace),
+                baselinePace > 0 ? PaceFormat.round(baselinePace, 1) : null,
+                PaceFormat.pace(baselinePace > 0 ? baselinePace : null),
+                stdDev, gapPace, PaceFormat.pace(gapPace), text);
+    }
+
+    /**
+     * 区间内的训练类型构成。逐条分类会按需解析轨迹，首次调用可能稍慢，之后命中轨迹缓存。
+     */
+    public TrainingMix trainingMix(DateRange range) {
+        List<RunActivity> all = repository.dataset().activities();
+        double baselinePace = baselinePace(all);
+        double medianDistanceKm = medianDistanceKm(all);
+        List<RunClassification> classified = runs(range).stream()
+                .map(run -> classify(run, baselinePace, medianDistanceKm))
+                .toList();
+
+        Map<String, List<RunClassification>> byType = new LinkedHashMap<>();
+        for (RunClassification result : classified) {
+            byType.computeIfAbsent(result.type(), key -> new ArrayList<>()).add(result);
+        }
+        double totalDistance = classified.stream()
+                .mapToDouble(RunClassification::distanceKm).sum();
+        List<TrainingMix.TypeSummary> types = byType.entrySet().stream()
+                .map(entry -> {
+                    double distance = entry.getValue().stream()
+                            .mapToDouble(RunClassification::distanceKm).sum();
+                    return new TrainingMix.TypeSummary(
+                            entry.getKey(),
+                            typeText(entry.getKey()),
+                            entry.getValue().size(),
+                            PaceFormat.round(distance, 2),
+                            totalDistance > 0 ? PaceFormat.round(distance / totalDistance * 100d, 1) : 0d);
+                })
+                .sorted(Comparator.comparingDouble(TrainingMix.TypeSummary::distanceKm).reversed())
+                .toList();
+        List<TrainingMix.RunTypeRow> rows = classified.stream()
+                .map(result -> new TrainingMix.RunTypeRow(result.runId(), result.date(),
+                        result.distanceKm(), result.paceText(), result.type(), result.typeText(),
+                        result.confidence()))
+                .toList();
+
+        String text;
+        if (types.isEmpty()) {
+            text = "区间 " + range.text() + " 内没有可用于分类的记录";
+        } else {
+            List<String> parts = types.stream()
+                    .map(type -> type.typeText() + " " + type.runCount() + " 次（" + type.percent() + "%）")
+                    .toList();
+            text = "区间 " + range.text() + " 共 " + classified.size() + " 次跑步："
+                    + String.join("、", parts);
+        }
+        return new TrainingMix(range.from(), range.to(), classified.size(), types, rows, text);
+    }
+
+    private static double baselinePace(List<RunActivity> all) {
+        List<Double> paces = all.stream()
+                .map(RunActivity::avgPaceSecondsPerKm)
+                .filter(Objects::nonNull)
+                .filter(pace -> pace > 0)
+                .sorted()
+                .toList();
+        return paces.isEmpty() ? 0d : median(paces);
+    }
+
+    private static double medianDistanceKm(List<RunActivity> all) {
+        List<Double> distances = all.stream()
+                .map(run -> run.distanceMeters() / 1000d)
+                .filter(distance -> distance > 0)
+                .sorted()
+                .toList();
+        return distances.isEmpty() ? 0d : median(distances);
+    }
+
+    private static double median(List<Double> sorted) {
+        int size = sorted.size();
+        return size % 2 == 1
+                ? sorted.get(size / 2)
+                : (sorted.get(size / 2 - 1) + sorted.get(size / 2)) / 2d;
+    }
+
+    private static Double nearestStandardDistance(double distanceKm) {
+        for (double standard : List.of(5d, 10d, 21.0975d, 42.195d)) {
+            if (Math.abs(distanceKm - standard) / standard <= 0.03d) {
+                return standard;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 判断是否为间歇/变速跑：只看整段（不含最后不满一段），要求至少 3 段，
+     * 且同时有至少 2 段明显快、2 段明显慢于中位配速。这样能避免把长距离跑里
+     * 遇到红灯或补水造成的单段变慢误判为变速训练。
+     */
+    private static IntervalSignal intervalSignal(RunSplits splits, Double stdDev) {
+        List<Double> paces = splits.splits().stream()
+                .filter(split -> !split.partial())
+                .map(RunSplit::paceSecondsPerKm)
+                .filter(Objects::nonNull)
+                .filter(pace -> pace > 0)
+                .sorted()
+                .toList();
+        if (paces.size() < 3 || stdDev == null || stdDev < 20d) {
+            return new IntervalSignal(false, 0, 0);
+        }
+        double medianPace = median(paces);
+        int fast = (int) paces.stream().filter(pace -> pace <= medianPace - 15d).count();
+        int slow = (int) paces.stream().filter(pace -> pace >= medianPace + 15d).count();
+        return new IntervalSignal(fast >= 2 && slow >= 2, fast, slow);
+    }
+
+    private record IntervalSignal(boolean isInterval, int fastSplits, int slowSplits) {
+    }
+
+    private static double splitContrast(RunSplits splits) {
+        if (splits.fastest() == null || splits.slowest() == null) {
+            return 0d;
+        }
+        Double fastest = splits.fastest().paceSecondsPerKm();
+        Double slowest = splits.slowest().paceSecondsPerKm();
+        return fastest == null || slowest == null ? 0d : Math.max(0d, slowest - fastest);
+    }
+
+    private static String typeText(String type) {
+        return switch (type) {
+            case "LONG_RUN" -> "长距离跑";
+            case "TEMPO" -> "节奏跑";
+            case "INTERVAL" -> "间歇/变速跑";
+            case "RACE" -> "比赛/测试跑";
+            case "RECOVERY" -> "恢复跑";
+            default -> "轻松跑";
+        };
+    }
+
+    private static double minettiCost(double grade) {
+        double i = Math.clamp(grade, -0.45d, 0.45d);
+        return 155.4d * i * i * i * i * i
+                - 30.4d * i * i * i * i
+                - 43.3d * i * i * i
+                + 46.3d * i * i
+                + 19.5d * i
+                + MINETTI_FLAT_COST;
     }
 
     private Double paceOf(List<RunActivity> runs) {
