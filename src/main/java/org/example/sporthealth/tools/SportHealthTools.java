@@ -1,5 +1,10 @@
 package org.example.sporthealth.tools;
 
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -31,6 +36,7 @@ import org.example.sporthealth.domain.RunLookup;
 import org.example.sporthealth.domain.RunSplits;
 import org.example.sporthealth.domain.RunSummary;
 import org.example.sporthealth.domain.RunWeather;
+import org.example.sporthealth.domain.StopPoint;
 import org.example.sporthealth.domain.StopPoints;
 import org.example.sporthealth.domain.TrackPoint;
 import org.example.sporthealth.domain.TrainingLoad;
@@ -58,8 +64,9 @@ import org.springframework.stereotype.Component;
  * <p>通用约定：
  * <ul>
  *   <li>日期参数统一为 {@code yyyy-MM-dd}；不传时默认覆盖数据集自身的完整区间。</li>
- *   <li>所有工具方法统一返回 {@code Map<String, Object>}，字段由 MCP 层直接序列化成 JSON；
- *       Jackson 3 默认把 {@code java.time} 序列化成 ISO-8601 字符串，日期字段不会是时间戳数组。</li>
+ *   <li>所有工具方法统一返回 {@code Map<String, Object>}，字段由 MCP 层直接序列化成 JSON。
+ *       返回体里的时间字段在工具层就格式化成 {@code yyyy-MM-dd HH:mm:ss}：本地时间按原值输出，
+ *       {@code Instant}（UTC 语义）按 UTC 输出；只有日期的字段仍保持 {@code yyyy-MM-dd}。</li>
  *   <li>返回体通过 {@code status} 区分结果：{@code OK}、{@code NO_DATA}（区间内无记录或缺少所需数据）、
  *       {@code NO_GPS}（没有可用轨迹）、{@code NOT_FOUND}（id 不存在）、
  *       {@code AMBIGUOUS}（id 匹配到多条）。</li>
@@ -78,6 +85,12 @@ public class SportHealthTools {
     private static final double PACE_OUTLIER_PERCENT = 25d;
     /** 记录数少于这个值时中位数不具代表性，不做配速离群判定。 */
     private static final int MIN_RUNS_FOR_PACE_OUTLIER = 3;
+    /** 返回体里的本地时间统一成这个格式，避免默认的 ISO-8601（带 T）。 */
+    private static final DateTimeFormatter LOCAL_TIME_FORMAT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.ROOT);
+    /** {@code Instant} 本身是 UTC 语义，按 UTC 格式化，不伪装成本地时间。 */
+    private static final DateTimeFormatter UTC_TIME_FORMAT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.ROOT).withZone(ZoneOffset.UTC);
 
     private final RunAnalyticsService analytics;
     private final HealthDataRepository repository;
@@ -158,7 +171,7 @@ public class SportHealthTools {
                 withTrack ? routePageSize(trackLimit) : 0);
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "OK");
-        result.put("activity", run);
+        result.put("activity", toActivityDetail(run));
         result.put("paceText", detail.paceText());
         result.put("speedText", detail.speedText());
         Object weather = weatherDetail(run.id());
@@ -288,7 +301,7 @@ public class SportHealthTools {
             block.put("errorMessage", weather.errorMessage());
         }
         block.put("provider", weather.provider());
-        block.put("fetchedAt", weather.fetchedAt());
+        block.put("fetchedAt", formatDateTime(weather.fetchedAt()));
         block.put("start", weatherPoint(weather.start()));
         block.put("end", weatherPoint(weather.end()));
         return block;
@@ -300,7 +313,7 @@ public class SportHealthTools {
             return null;
         }
         Map<String, Object> point = new LinkedHashMap<>();
-        point.put("observedAt", snapshot.observedAtUtc());
+        point.put("observedAt", formatDateTime(snapshot.observedAtUtc()));
         point.put("temperatureC", round(snapshot.temperatureC(), 1));
         point.put("apparentTemperatureC", round(snapshot.apparentTemperatureC(), 1));
         point.put("humidityPercent", round(snapshot.humidityPercent(), 1));
@@ -316,6 +329,28 @@ public class SportHealthTools {
 
     private static Double round(Double value, int scale) {
         return value == null ? null : PaceFormat.round(value, scale);
+    }
+
+    /** 本地时间按 {@code yyyy-MM-dd HH:mm:ss} 输出；null 保持 null，不写成空字符串。 */
+    private static String formatDateTime(LocalDateTime value) {
+        return value == null ? null : LOCAL_TIME_FORMAT.format(value);
+    }
+
+    /** UTC 时刻同样用这个格式，但不带 {@code Z}，保留「这是 UTC」的字段语义。 */
+    private static String formatDateTime(Instant value) {
+        return value == null ? null : UTC_TIME_FORMAT.format(value);
+    }
+
+    /** 仓储里直接取出的 ISO 时间文本（如天气统计的 lastFetchedAt）也要归一化。 */
+    private static String formatDateTimeText(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return formatDateTime(Instant.parse(value));
+        } catch (DateTimeParseException e) {
+            return value;
+        }
     }
 
     /** 按天 / 周 / 月聚合，只返回有记录的周期。 */
@@ -764,7 +799,7 @@ public class SportHealthTools {
         result.put("stopCount", stops.stopCount());
         result.put("totalStopSeconds", stops.totalStopSeconds());
         result.put("totalStopText", stops.totalStopText());
-        result.put("stops", stops.stops());
+        result.put("stops", stops.stops().stream().map(this::toStopPoint).toList());
         return result;
     }
 
@@ -834,7 +869,7 @@ public class SportHealthTools {
         result.put("status", "OK");
         result.put("dataDir", dataset.dataDir());
         result.put("zoneId", properties.zoneId());
-        result.put("loadedAt", dataset.loadedAt());
+        result.put("loadedAt", formatDateTime(dataset.loadedAt()));
         result.put("fileCount", dataset.sourceFiles().size());
         result.put("runCount", dataset.runCount());
         result.put("files", dataset.sourceFiles());
@@ -850,7 +885,7 @@ public class SportHealthTools {
             result.put("creators", activities.stream().map(RunActivity::creator)
                     .filter(creator -> creator != null && !creator.isBlank()).distinct().toList());
             result.put("routeTypes", activities.stream().map(RunActivity::routeTypeText)
-                    .filter(text -> text != null).distinct().toList());
+                    .filter(Objects::nonNull).distinct().toList());
         }
         result.put("quality", quality(dataset));
         return result;
@@ -890,7 +925,7 @@ public class SportHealthTools {
         storage.put("scannedFiles", sync.scanned());
         storage.put("importedFiles", sync.imported());
         storage.put("unchangedFiles", sync.unchanged());
-        storage.put("syncedAt", sync.syncedAt());
+        storage.put("syncedAt", formatDateTime(sync.syncedAt()));
         storage.put("missingSourceFiles", sync.missingSourceFiles());
         Map<String, Object> weather = weatherInfo();
         if (weather != null) {
@@ -921,7 +956,7 @@ public class SportHealthTools {
             weather.put("unavailable", stats.unavailable());
             weather.put("failed", stats.failed());
             weather.put("missing", stats.missing());
-            weather.put("lastFetchedAt", stats.lastFetchedAt());
+            weather.put("lastFetchedAt", formatDateTimeText(stats.lastFetchedAt()));
             weather.put("coveragePercent", stats.totalRuns() == 0
                     ? null
                     : PaceFormat.round(stats.ok() * 100d / stats.totalRuns(), 1));
@@ -1093,6 +1128,51 @@ public class SportHealthTools {
         return activities.stream().filter(predicate).map(RunActivity::id).toList();
     }
 
+    /**
+     * 单次详情的完整字段。原先直接返回 record，时间会被序列化成 ISO-8601；
+     * 这里显式展开，保证 {@code get_run_detail} 和列表接口的时间格式一致。
+     */
+    private Map<String, Object> toActivityDetail(RunActivity run) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("id", run.id());
+        row.put("activityId", run.activityId());
+        row.put("sport", run.sport());
+        row.put("date", run.date());
+        row.put("startTime", formatDateTime(run.startTime()));
+        row.put("endTime", formatDateTime(run.endTime()));
+        row.put("startTimeUtc", formatDateTime(run.startTimeUtc()));
+        row.put("durationSeconds", run.durationSeconds());
+        row.put("distanceMeters", run.distanceMeters());
+        row.put("climbMeters", run.climbMeters());
+        row.put("descentMeters", run.descentMeters());
+        row.put("routeType", run.routeType());
+        row.put("routeTypeText", run.routeTypeText());
+        row.put("trackPointCount", run.trackPointCount());
+        row.put("avgSpeedKmh", run.avgSpeedKmh());
+        row.put("avgPaceSecondsPerKm", run.avgPaceSecondsPerKm());
+        row.put("startLatitude", run.startLatitude());
+        row.put("startLongitude", run.startLongitude());
+        row.put("endLatitude", run.endLatitude());
+        row.put("endLongitude", run.endLongitude());
+        row.put("minAltitudeMeters", run.minAltitudeMeters());
+        row.put("maxAltitudeMeters", run.maxAltitudeMeters());
+        row.put("sourceFile", run.sourceFile());
+        row.put("creator", run.creator());
+        return row;
+    }
+
+    private Map<String, Object> toStopPoint(StopPoint stop) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("startTime", formatDateTime(stop.startTime()));
+        row.put("endTime", formatDateTime(stop.endTime()));
+        row.put("durationSeconds", stop.durationSeconds());
+        row.put("durationText", stop.durationText());
+        row.put("latitude", stop.latitude());
+        row.put("longitude", stop.longitude());
+        row.put("altitudeMeters", stop.altitudeMeters());
+        return row;
+    }
+
     private Map<String, Object> toRunRow(RunActivity run) {
         if (run == null) {
             return Map.of();
@@ -1101,7 +1181,7 @@ public class SportHealthTools {
         row.put("id", run.id());
         row.put("date", run.date());
         row.put("sport", run.sport());
-        row.put("startTime", run.startTime());
+        row.put("startTime", formatDateTime(run.startTime()));
         row.put("distanceKm", PaceFormat.round(run.distanceMeters() / 1000d, 2));
         row.put("durationMinutes", PaceFormat.round(run.durationSeconds() / 60d, 1));
         row.put("durationText", PaceFormat.duration(run.durationSeconds()));
@@ -1129,7 +1209,7 @@ public class SportHealthTools {
     /** 轨迹点的对外结构：海拔按米保留 2 位小数，压掉导出文件里的浮点噪声；经纬度保持原精度。 */
     private Map<String, Object> toRoutePoint(TrackPoint point) {
         Map<String, Object> row = new LinkedHashMap<>();
-        row.put("timestamp", point.timestamp());
+        row.put("timestamp", formatDateTime(point.timestamp()));
         row.put("latitude", point.latitude());
         row.put("longitude", point.longitude());
         row.put("altitudeMeters", point.altitudeMeters() == null
@@ -1153,7 +1233,7 @@ public class SportHealthTools {
         }
         int limit = Math.min(maxPoints, MAX_ROUTE_LIMIT);
         if (limit <= 1) {
-            return List.of(points.get(0));
+            return List.of(points.getFirst());
         }
         List<TrackPoint> sampled = new ArrayList<>(limit);
         double step = (points.size() - 1d) / (limit - 1d);

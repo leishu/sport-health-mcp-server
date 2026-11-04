@@ -443,9 +443,9 @@ sqlite3 data/sport-health.db "SELECT source_file, size, modified_millis, substr(
 "weather": {
   "status": "OK",
   "provider": "open-meteo",
-  "fetchedAt": "2026-11-04T02:11:07Z",
+  "fetchedAt": "2026-11-04 02:11:07",
   "start": {
-    "observedAt": "2026-10-24T22:00:00Z",
+    "observedAt": "2026-10-24 22:00:00",
     "temperatureC": 8.0, "apparentTemperatureC": 6.2,
     "humidityPercent": 72.0, "precipitationMm": 0.2,
     "windSpeedKmh": 12.0, "windDirectionDegrees": 315.0, "windDirection": "西北",
@@ -454,6 +454,8 @@ sqlite3 data/sport-health.db "SELECT source_file, size, modified_millis, substr(
   "end": { "...": "同上，跑完时刻" }
 }
 ```
+
+返回体里的时间统一为 `yyyy-MM-dd HH:mm:ss`：本地时间按配置时区输出，`*Utc` / `fetchedAt` 等 UTC 字段仍按 UTC 输出；只有日期的字段（如 `date`）保持 `yyyy-MM-dd`。
 
 口径：`observedAt` 是参与插值的**整点**，不是跑步时刻本身；任一指标缺值一律 `null`，不会当成 0 度；某个时刻整份快照都没有时该时刻直接是 `null`。`status` 除 `OK` 外还有三种：`UNAVAILABLE`（缺坐标、
 超出存档覆盖范围）与 `FAILED`（抓取失败待重试）会带上 `errorMessage` 说明原因；还没回填过则是
