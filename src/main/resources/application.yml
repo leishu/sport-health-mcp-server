@@ -5,6 +5,12 @@ server:
 spring:
   application:
     name: sport-health-mcp-server
+  # 只用 JdbcClient 显式建库，屏蔽 Spring Boot 的数据源自动配置
+  # （否则 SqliteDataSource + Hikari 的组合会在启动阶段就抢着建连接）
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration
+      - org.springframework.boot.jdbc.autoconfigure.JdbcClientAutoConfiguration
   ai:
     mcp:
       server:
@@ -18,8 +24,10 @@ spring:
 sport:
   health:
     # TCX 目录：支持 classpath: 前缀，也支持本地绝对路径（如 /home/leishu/health-export）
-    # 只会扫描该目录下的 *.tcx，其它文件会被忽略
+    # 只会扫描该目录下的 *.tcx，其它文件会被忽略；解析结果写入 SQLite，删除源文件不丢历史数据
     data-dir: classpath:health-data
+    # SQLite 数据库文件；相对路径按进程工作目录解析，目录不存在会自动创建
+    db-path: ./data/sport-health.db
     # TCX 内时间为 UTC，换算成本地日期用的时区（影响 date 字段与按天聚合）
     zone-id: Asia/Shanghai
     # 列表接口未显式传 limit 时的默认条数

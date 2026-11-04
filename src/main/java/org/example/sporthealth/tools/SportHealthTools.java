@@ -32,6 +32,8 @@ import org.example.sporthealth.domain.StopPoints;
 import org.example.sporthealth.domain.TrackPoint;
 import org.example.sporthealth.domain.TrainingTrend;
 import org.example.sporthealth.repository.HealthDataRepository;
+import org.example.sporthealth.repository.JdbcHealthDataRepository;
+import org.example.sporthealth.repository.RunRows;
 import org.example.sporthealth.service.RunAnalyticsService;
 import org.example.sporthealth.support.DateRange;
 import org.example.sporthealth.support.PaceFormat;
@@ -569,6 +571,7 @@ public class SportHealthTools {
         result.put("runCount", dataset.runCount());
         result.put("files", dataset.sourceFiles());
         result.put("warnings", dataset.warnings());
+        result.put("storage", storageInfo());
 
         if (!activities.isEmpty()) {
             result.put("firstDate", activities.stream().map(RunActivity::date).min(java.util.Comparator.naturalOrder()).orElse(null));
@@ -585,19 +588,43 @@ public class SportHealthTools {
         return result;
     }
 
-    /** 重新扫描并重建快照，旧轨迹缓存随之丢弃。 */
+    /** 重新扫描并增量同步，旧轨迹缓存随之丢弃。 */
     @McpTool(name = "reload_data",
-            description = "重新扫描数据目录并解析全部 TCX 文件。导出新数据到目录后调用它即可刷新，无需重启服务。")
+            description = "重新扫描数据目录，把新增或内容变化的 TCX 文件增量同步进 SQLite，无需重启服务。"
+                    + "未变化的文件按 size/mtime/sha256 跳过，不会重复解析；源文件已删除的历史记录会保留。")
     public Map<String, Object> reloadData() {
         repository.reload();
         RunDataset dataset = repository.dataset();
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "OK");
-        result.put("message", "已重新加载 " + dataset.sourceFiles().size() + " 个文件、"
-                + dataset.runCount() + " 条跑步记录");
+        result.put("message", "已同步 " + dataset.runCount() + " 条跑步记录，来源文件 "
+                + dataset.sourceFiles().size() + " 个");
         result.put("runCount", dataset.runCount());
         result.put("warnings", dataset.warnings());
+        result.put("storage", storageInfo());
         return result;
+    }
+
+    /**
+     * 持久化层状态：库里现有记录量、本次同步的增量统计。
+     *
+     * <p>只在仓储实现为 JDBC 版时给出明细，其它实现（含测试中的内存实现）返回 {@code null}，
+     * 保证工具层不依赖具体仓储类型。
+     */
+    private Map<String, Object> storageInfo() {
+        if (!(repository instanceof JdbcHealthDataRepository jdbcRepository)) {
+            return null;
+        }
+        RunRows.SyncResult sync = jdbcRepository.lastSync();
+        Map<String, Object> storage = new LinkedHashMap<>();
+        storage.put("type", "sqlite");
+        storage.put("dbPath", properties.dbPath());
+        storage.put("scannedFiles", sync.scanned());
+        storage.put("importedFiles", sync.imported());
+        storage.put("unchangedFiles", sync.unchanged());
+        storage.put("syncedAt", sync.syncedAt());
+        storage.put("missingSourceFiles", sync.missingSourceFiles());
+        return storage;
     }
 
     private Map<String, Object> splitsMap(RunSplits splits) {

@@ -40,3 +40,8 @@ build/
 /logs/
 /.idea/
 /.mvn/
+
+### 运行时数据（健康数据不进版本库） ###
+/data/
+.Trash-*/
+.workbuddy/

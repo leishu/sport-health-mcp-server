@@ -13,6 +13,9 @@
 - 「把 11-01 的轨迹按 200 个点分页给我。」
 
 > 数据源只读取 `*.tcx`。目录里的其它文件不会被扫描或解析。
+>
+> 解析结果写入本地 **SQLite**（`data/sport-health.db`）：TCX 是导入源，库是事实源。
+> 导出新文件后调 `reload_data` 做增量同步，**删掉源文件也不会丢历史记录**。
 
 ---
 
@@ -39,10 +42,20 @@ JAVA_HOME=/path/to/jdk-21 java -jar target/sport-health-mcp-server-1.0.0.jar
 正常启动日志会包含：
 
 ```
+SQLite 数据库文件: /home/you/sport-health-mcp-server/data/sport-health.db
 Registered tools: 15
 Netty started on port 8080 (http)
-已加载 5 个 TCX 文件、5 条跑步记录（轨迹按需加载）
 ```
+
+首次请求（或调 `reload_data`）时才做同步，日志会多出：
+
+```
+SQLite 结构已从版本 0 升级到 1
+增量同步完成：扫描 5 个文件、重导 5 个、未变 0 个，库中活动 5 条
+快照已装载：5 条活动、5 个来源文件
+```
+
+第二次启动只会看到 `重导 0 个、未变 5 个`——未变化的文件连内容都不读。
 
 ---
 
@@ -163,7 +176,7 @@ Netty started on port 8080 (http)
 | `duplicateTimestampRunIds` | 同一记录内存在重复时间戳，会让分段/最佳努力的插值失真 |
 | `clean` | 告警、0 距离、缺配速、缺起跑坐标、配速离群、重复时间戳全部为空时为 `true`；缺海拔与重复 Activity Id 只作提示，不参与判定 |
 
-`duplicateTimestampRunIds` 需要逐条解析轨迹，首次调用稍慢，之后命中轨迹缓存。
+`duplicateTimestampRunIds` 需要逐条读取轨迹，首次调用稍慢，之后命中轨迹缓存。
 
 ---
 
@@ -203,7 +216,7 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 
 | 工具 | 参数 | 说明 |
 | --- | --- | --- |
-| `describe_data_source` | — | 数据目录、已加载文件、记录数、日期范围、来源、RouteType、解析告警分类，以及 quality 块（0 距离、缺配速/坐标/海拔、重复 Activity Id、配速离群、重复时间戳） |
+| `describe_data_source` | — | 数据目录、已加载文件、记录数、日期范围、来源、RouteType、解析告警分类、`storage`（库路径与本次同步统计），以及 quality 块（0 距离、缺配速/坐标/海拔、重复 Activity Id、配速离群、重复时间戳） |
 | `list_runs` | `startDate?` `endDate?` `sport?` `min/maxDistanceKm?` `min/maxPaceSecondsPerKm?` `weekday?` `sortBy?` `offset?` `limit?` | 区间内的记录（新的在前，分页），含距离/时长/配速/爬升 |
 | `get_run_detail` | `runId` `includeTrack?` `trackOffset?` `trackLimit?` | 单次完整详情：起止时间、时长、距离、平均配速/速度、爬升与下降、海拔范围、起终点坐标，可选附带轨迹分页 |
 | `get_run_route` | `runId` `offset?` `limit?` `format?` `maxPoints?` | 轨迹点分页（时间/纬度/经度/海拔，海拔保留 2 位小数），可输出 GeoJSON；`maxPoints` 降采样后会忽略 `offset`/`limit` |
@@ -217,7 +230,7 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `get_consistency` | `startDate?` `endDate?` | 打卡天数占比、当前/最长连续天数、平均间隔、日历热力数据；当前连续以最后一次记录为锚点 |
 | `get_elevation_profile` | `runId` `bucketMeters?` `smoothingMeters?` | 按距离分桶的海拔剖面（默认 100 米一桶、最小 10；平滑默认 1 米、0 表示不平滑），含累计爬升下降与坡度 |
 | `get_stop_points` | `runId` `minStopSeconds?` `maxDisplacementMeters?` | 检测停顿（默认 30 秒、30 米）：相邻轨迹点间隔≥阈值且位移≤阈值，返回时长、位置与总停顿 |
-| `reload_data` | — | 导出新文件后重新扫描，无需重启 |
+| `reload_data` | — | 导出新文件后做增量同步：按 `(文件名, size, mtime, sha256)` 只解析变化的文件，无需重启 |
 
 ### list_runs 过滤与排序
 
@@ -263,7 +276,8 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 ```yaml
 sport:
   health:
-    data-dir: classpath:health-data   # 支持 classpath: 前缀或本地绝对路径
+    data-dir: classpath:health-data   # 支持 classpath: 前缀、本地绝对路径或相对路径
+    db-path: ./data/sport-health.db   # SQLite 数据库文件，相对路径按进程工作目录解析
     zone-id: Asia/Shanghai            # TCX 内 UTC 时间换算所用时区
     default-page-size: 20             # 列表默认条数
     max-page-size: 200                # 列表最大条数（小于默认值时自动提升）
@@ -275,7 +289,74 @@ sport:
 sport:
   health:
     data-dir: /home/leishu/health-export
+    db-path: /home/leishu/health-export/sport-health.db
 ```
+
+> `data-dir` 与 `db-path` 不要在同一个目录里互相包含：`*.tcx` 只在 `data-dir` 扫描，
+> 库文件放在数据目录里不影响正确性，但备份时容易一起被误删。
+
+---
+
+## 持久化
+
+TCX 文件只在**内容变化**时被解析一次，结果写进 SQLite；之后所有查询都走库和内存快照。
+
+### 三张表
+
+| 表 | 内容 |
+| --- | --- |
+| `run_activity` | 一次运动一行：摘要字段（时间、距离、配速、爬升、起终点坐标…）+ `source_file` + `content_hash` + `imported_at` |
+| `track_point` | 轨迹点，主键 `(run_id, seq)`，`WITHOUT ROWID`，一个活动的点物理连续 |
+| `source_file` | 来源文件指纹：`size`、`modified_millis`、`content_hash`，增量同步的比对基准 |
+
+表结构版本记在 `PRAGMA user_version`（当前为 2）。以后加心率、步频等列时，
+往 `SqliteSchema.MIGRATIONS` 追加一段脚本并把 `SCHEMA_VERSION` 加一即可，不需要 Flyway；
+版本 1 的旧库会在启动时自动补上 `source_file.status` / `error_message` 两列，不需要删库重建。
+
+### 增量规则
+
+启动（首次访问）与 `reload_data` 都会执行同一套同步：
+
+| 情况 | 行为 |
+| --- | --- |
+| 库里没有这个文件 | 算 SHA-256 → 解析 → 事务内写入 |
+| `size` 与 `mtime` 都没变 | **直接跳过，不读文件内容** |
+| 元数据变了但 SHA-256 相同（被 touch 过） | 只刷新元数据，不重导 |
+| 元数据变了且 SHA-256 不同 | 重新解析，事务内「删旧行 + 插新行」 |
+| 元数据不可用（fat jar 内资源） | 退化为每次都算 SHA-256；数据目录放在 jar 里同样可用 |
+| 源文件被删除 | **历史记录保留**，只把文件记为缺失 |
+| 文件解析失败 | 记 warning 与失败状态并跳过，**不删除库中已有数据**；文件内容不变时不再重试，但每次同步都会把这个原因重新放进 `warnings` |
+| 扫描不到任何文件（路径配错、挂载点未就绪） | 只记 warning，**不清空指纹表**，避免恢复后把全部文件重导一遍 |
+| 记录 id 已被其它来源文件占用 | 拒绝导入并记 warning，不静默覆盖另一份记录 |
+
+写入以文件为单位放在一个事务里，中途失败整体回滚，不会出现「摘要写进去、轨迹没写完」的半截记录。
+`mtime` 取整到秒，规避 ext4 与 FAT 的时间戳精度差异。
+
+### 怎么查
+
+```bash
+sqlite3 data/sport-health.db "SELECT id, run_date, round(distance_meters/1000.0,2) km FROM run_activity ORDER BY run_date DESC LIMIT 5;"
+sqlite3 data/sport-health.db "SELECT COUNT(*), round(SUM(distance_meters)/1000.0,1) FROM run_activity WHERE run_date LIKE '2026-11%';"
+sqlite3 data/sport-health.db "SELECT source_file, size, modified_millis, substr(content_hash,1,12) FROM source_file;"
+```
+
+### 备份与迁移
+
+```bash
+# 备份：库 + WAL 一起拷，或先 checkpoint
+sqlite3 data/sport-health.db "PRAGMA wal_checkpoint(TRUNCATE);"
+cp data/sport-health.db ~/backup/sport-health-$(date +%F).db
+```
+
+换机器时只带 `sport-health.db` 过去，`data-dir` 指向空目录也能正常查历史；
+日志里 `missing=...` 会列出哪些来源文件不在本地。
+
+### 为什么不用 MySQL / JPA
+
+单用户、本地 MCP、数据量 MB 级。引数据库只是换来部署负担与网络依赖；
+JPA 在 WebFlux 上要配 R2DBC 才不阻塞，对只有两张表的场景属于过度设计。
+这里用 `spring-boot-starter-jdbc` + `org.xerial:sqlite-jdbc`，
+`JdbcClient` 直接写 SQL，连接池上限压到 1 规避 SQLite 单写者限制。
 
 ---
 
@@ -312,22 +393,35 @@ tools/SportHealthTools          # 15 个 @McpTool，负责参数校验与统一�
 service/RunAnalyticsService     # 区间汇总、按天拆分、个人最佳、对比、分段、最佳努力、海拔、停顿、趋势、id 解析
         │
 repository/HealthDataRepository # 抽象：dataset() / route() / reload()
-        └── TcxRunRepository    # 扫描目录、懒加载轨迹、缓存快照
+        └── JdbcHealthDataRepository   # 从 SQLite 装载快照、轨迹直查库（@Primary）
                 │
-importer/TcxParser              # TCX → RunActivity + TrackPoint，纯解析无 Spring 依赖
+repository/TcxIncrementalImporter  # 增量同步的唯一写入口：比指纹、解析、事务批量写入
+        ├── SourceFileStateStore   # source_file 表：size / mtime / sha256
+        ├── SqliteSchema           # 建表与 PRAGMA user_version 版本迁移
+        └── importer/TcxParser     # TCX → RunActivity + TrackPoint，纯解析无 Spring 依赖
+
+importer/SourceFileScanner      # 扫描 *.tcx，产出带 size/mtime 的 SourceFile
+importer/ContentHash            # SHA-256 指纹
 
 support/TrackPath               # 轨迹几何索引：累计距离 ↔ 时间 ↔ 海拔，分段/最佳努力/海拔共用
 ```
 
-- **启动阶段**：只解析摘要，轨迹不入内存。
-- **首次请求轨迹**：按记录 id 找到来源文件，重新解析并缓存；`reload_data` 后缓存随旧快照一起丢弃。
-- **返回体**：工具方法统一返回 `Map<String, Object>`（`status` + 业务字段），不再做多余的 `convertValue` 预转换，直接交给 MCP 层的 Jackson 3 序列化；`LocalDate` / `LocalDateTime` / `Instant` 输出 ISO-8601 字符串。
+- **启动阶段**：只建表，不解析。首次访问（或 `reload_data`）触发增量同步，然后把全部摘要装进内存快照。
+- **轨迹**：`route(runId)` 直接查 `track_point`，不再重解析 XML；按 id 缓存，`reload_data` 后随旧快照丢弃。
+- **内存快照的作用**：区间过滤、按天聚合、趋势、连续性等统计仍在 Java 里跑，SQL 只负责取数，
+  避免把 `RunAnalyticsService` 改写成 SQL 拼装器。
+- **返回体**：工具方法统一返回 `Map<String, Object>`（`status` + 业务字段），直接交给 MCP 层的 Jackson 3 序列化；`LocalDate` / `LocalDateTime` / `Instant` 输出 ISO-8601 字符串。
 - **传输层**：WebFlux（Reactor Netty）+ Streamable-HTTP，端点 `POST /mcp`。
+- **旧实现**：`repository/TcxRunRepository` 是纯内存版本，已标 `@Deprecated` 且不再是 Bean，仅保留给既有单测做对照。
 
-技术栈：Java 21、Spring Boot 4.1.2、Spring AI 2.0.2（Jackson 3、MCP Java SDK 2.1.0）、Reactor Netty。
+技术栈：Java 21、Spring Boot 4.1.2、Spring AI 2.0.2（Jackson 3、MCP Java SDK 2.1.0）、Reactor Netty、
+SQLite（`spring-boot-starter-jdbc` + `org.xerial:sqlite-jdbc`，无 ORM）。
 
 > 依赖的是 `spring-ai-starter-mcp-server-webflux`，它已自带 `spring-boot-starter-webflux`。
 > 不要再引入 `spring-boot-starter-web`，否则应用会退回 Servlet 栈，MCP 的 reactive handler 不会注册。
+>
+> `application.yml` 里排除了 `DataSourceAutoConfiguration`：SQLite 没有主机端口，自动配置推断不出 URL，
+> 数据源与 `JdbcClient` 都由 `config/SqliteDataSourceConfiguration` 显式创建。
 
 ---
 
@@ -337,10 +431,12 @@ support/TrackPath               # 轨迹几何索引：累计距离 ↔ 时间 �
 JAVA_HOME=/path/to/jdk-21 mvn test
 ```
 
-共 **42** 个用例：
+共 **58** 个用例（原有 42 + 持久化 14 + 资源形态 2）：
 
-- **真实数据**：直接用 `src/main/resources/health-data` 里的 5 个 TCX，断言单次解析
-  （2448s / 7123m / 爬升 10.1m / 1216 个轨迹点）、UTC→本地日期换算、全量汇总
+- **真实数据**：测试固定读 `src/test/resources/tcx-dataset` 里的 5 个 TCX，而不是
+  `src/main/resources/health-data`。生产目录会随导入继续增长（例如新加的骑行文件），
+  断言里写死的「5 条记录 / 38.28 km」会跟着一起挂；用独立 fixture 后新增数据不再影响单测。
+  断言单次解析（2448s / 7123m / 爬升 10.1m / 1216 个轨迹点）、UTC→本地日期换算、全量汇总
   （38.28 km / 219.8 min / 平均配速 5'45"/km）、区间过滤、按天拆分、最佳成绩、对比与轨迹分页。
 - **轨迹分析**：逐公里分段（末段 `partial`、前后半程与负分段）、单次最佳努力、跨记录 1K/5K 最佳、
   海拔剖面、停顿检测与 `describe_data_source` 的 quality 自检。
@@ -349,6 +445,16 @@ JAVA_HOME=/path/to/jdk-21 mvn test
 - **内联 XML 边界用例**：一个 Lap 多个 Track、缺 `Lap@StartTime` 时用 `Activity/Id` 兜底、
   部分 Lap 缺 `TotalTimeSeconds`、缺 `Time`/非法数字/缺经纬度进入 warnings、
   坐标缺失输出 `null`、一个文件多个 `Activity`、未知 `RouteType`、模糊 id 多义检测。
+- **持久化**（`JdbcHealthDataRepositoryTest`，用真实 SQLite 文件而不是 mock）：首次全量导入、
+  二次同步零重导（幂等）、元数据变化但内容相同不重导、内容变化替换旧行而不产生重复、
+  删除源文件后历史与轨迹仍可查、缺坐标写库再读出仍是 `null`、坏文件不破坏已有数据、
+  `source_file` 指纹落库。另含 4 个回归用例：
+  - 连接池只有 1 条连接时也能建表（建表 DDL 不能包在需要第二条连接的事务里，否则等 10s 超时）；
+  - 解析失败的文件在内容未变时仍然回放告警，不会因为「已同步」而被静默跳过；
+  - 数据目录扫描不到任何文件时保留指纹表，不把已有记录当成「源文件已删除」；
+  - 版本 1 的旧库能原地升级到版本 2（补 `status` / `error_message` 两列），不需要删库。
+- **资源形态**（`SourceFileScannerTest`）：同一份扫描逻辑在普通目录与 fat jar 内条目下都能
+  拿到文件名、哈希与可读流；jar 形态拿不到 `mtime` 时退化为按内容哈希判断变更。
 
 ---
 
@@ -360,17 +466,24 @@ JAVA_HOME=/path/to/jdk-21 mvn test
 | `status: "AMBIGUOUS"` | `runId` 太短，按返回的 `candidates` 改用完整 id |
 | 轨迹点数量比预期少 | 查看 `warnings`，是否有缺 `Time` 被跳过的点 |
 | `warnings` 不为空但数据正常 | 字段级问题，通常不影响聚合；按告警类型决定是否修源文件 |
-| `describe_data_source` 首次调用很慢 | `duplicateTimestampRunIds` 要逐条解析轨迹，之后命中缓存；只想看汇总时用其它工具 |
+| `describe_data_source` 首次调用很慢 | `duplicateTimestampRunIds` 要逐条读轨迹，首次从库加载后命中缓存；只想看汇总时用其它工具 |
 | 启动报 `Port 8080 was already in use` | 旧进程未退出，先停掉再启动 |
 | 客户端连上但工具列表为空 | 检查是否误加了 `spring-boot-starter-web`，它会让应用退回 Servlet 栈 |
 | 手写 HTTP 返回 400 / 406 | 缺少 `initialize`、`Mcp-Session-Id`，或 `Accept` 少了 `text/event-stream` |
+| 启动报 `数据库结构版本 N 高于程序支持的 1` | 库文件被更新版本的程序写过，升级程序或换一个 `db-path` |
+| 改了 TCX 内容但结果没变 | 文件 `size`/`mtime` 都没变（例如原地覆盖但时间戳被保留）。touch 一下文件或删库重导 |
+| `warnings` 里有「数据目录 … 下没有找到 *.tcx 文件」 | `data-dir` 写错；相对路径会按进程工作目录解析 |
+| 想彻底重建 | 停服务，删 `db-path` 指向的文件（含 `-wal`/`-shm`），重启后自动全量导入 |
 
 ---
 
 ## 扩展点
 
 1. **其它运动类型**：解析阶段不按运动类型过滤，新增骑行/游泳 TCX 会直接出现在结果里，可用 `sport` 参数筛选。工具名当前是 `list_runs` 等，如需通用可改为 `list_activities`。
-2. **心率 / 步频**：若导出文件出现 `Trackpoint/HeartRateBpm`、`Cadence`，在 `TcxParser.parseTrackpoints` 增加字段并扩展 `TrackPoint` 即可，聚合层无需改动。
+2. **心率 / 步频**：若导出文件出现 `Trackpoint/HeartRateBpm`、`Cadence`，在 `TcxParser.parseTrackpoints` 增加字段并扩展 `TrackPoint`，
+   同时给 `track_point` 加列——`SqliteSchema.MIGRATIONS` 追加一段脚本、`SCHEMA_VERSION` 加一，同步时按版本号自动升级。
 3. **其它数据源**：新增 `XxxRepository implements HealthDataRepository`，组装 `RunDataset` 后工具层零改动。
-4. **stdio 模式**：换成 `spring-ai-starter-mcp-server`，设置 `spring.ai.mcp.server.stdio: true` 与 `spring.main.web-application-type: none`，客户端用 `command` 启动 `java -jar`。
-5. **鉴权**：HTTP 传输默认无鉴权，对外暴露前需加 Spring Security 或网关（WebFlux 用 `SecurityWebFilterChain`）。
+4. **不用内存快照**：数据量涨到 GB 级后，可把 `RunAnalyticsService` 的过滤下推到 SQL，
+   `dataset()` 退出主路径；当前体量（1000 次跑步 ≈ 120 万轨迹点，几十 MB）没必要。
+5. **stdio 模式**：换成 `spring-ai-starter-mcp-server`，设置 `spring.ai.mcp.server.stdio: true` 与 `spring.main.web-application-type: none`，客户端用 `command` 启动 `java -jar`。
+6. **鉴权**：HTTP 传输默认无鉴权，对外暴露前需加 Spring Security 或网关（WebFlux 用 `SecurityWebFilterChain`）。

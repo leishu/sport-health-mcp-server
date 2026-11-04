@@ -22,7 +22,6 @@ import org.example.sporthealth.importer.TcxParser;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
 import org.springframework.core.io.support.ResourcePatternResolver;
-import org.springframework.stereotype.Repository;
 
 /**
  * 扫描配置目录下的 {@code *.tcx} 并解析为运动记录。
@@ -38,8 +37,12 @@ import org.springframework.stereotype.Repository;
  *
  * <p>并发：{@code loaded} 为 volatile，首次加载与 {@code reload} 用双重检查/方法锁串行化；
  * 轨迹缓存是快照内的 {@link ConcurrentHashMap}，同一记录可能被并发解析一次，但结果一致。
+ *
+ * @deprecated 纯内存实现，重启即丢且每次都要全量解析 XML。生产环境由
+ *             {@link JdbcHealthDataRepository}（SQLite + 增量同步）取代；
+ *             本类不再注册为 Bean，保留仅为兼容既有单测与对照参考。
  */
-@Repository
+@Deprecated(since = "1.1.0", forRemoval = false)
 @Slf4j
 public class TcxRunRepository implements HealthDataRepository {
 

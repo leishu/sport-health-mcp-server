@@ -11,6 +11,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * 并保证 {@code maxPageSize >= defaultPageSize}。
  *
  * @param dataDir         TCX 文件所在目录，支持 {@code classpath:} 前缀或本地绝对路径
+ * @param dbPath          SQLite 数据库文件路径，相对路径按进程工作目录解析
  * @param zoneId          TCX 内时间为 UTC，换算成本地日期所用时区
  * @param defaultPageSize 未显式传 limit 时的返回条数
  * @param maxPageSize     列表接口允许的最大条数
@@ -18,17 +19,20 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 @ConfigurationProperties(prefix = "sport.health")
 public record HealthDataProperties(
         String dataDir,
+        String dbPath,
         String zoneId,
         int defaultPageSize,
         int maxPageSize) {
 
     public static final String DEFAULT_DATA_DIR = "classpath:health-data";
+    public static final String DEFAULT_DB_PATH = "./data/sport-health.db";
     public static final String DEFAULT_ZONE_ID = "Asia/Shanghai";
     public static final int DEFAULT_PAGE_SIZE = 20;
     public static final int DEFAULT_MAX_PAGE_SIZE = 200;
 
     public HealthDataProperties {
         dataDir = isBlank(dataDir) ? DEFAULT_DATA_DIR : dataDir.trim();
+        dbPath = isBlank(dbPath) ? DEFAULT_DB_PATH : dbPath.trim();
         zoneId = isBlank(zoneId) ? DEFAULT_ZONE_ID : zoneId.trim();
         defaultPageSize = defaultPageSize <= 0 ? DEFAULT_PAGE_SIZE : defaultPageSize;
         maxPageSize = maxPageSize <= 0 ? DEFAULT_MAX_PAGE_SIZE : maxPageSize;
