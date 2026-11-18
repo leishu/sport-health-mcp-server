@@ -45,6 +45,7 @@ import org.example.sporthealth.domain.TrainingTrend;
 import org.example.sporthealth.domain.WeatherImpact;
 import org.example.sporthealth.domain.WeatherSnapshot;
 import org.example.sporthealth.repository.HealthDataRepository;
+import org.example.sporthealth.repository.HuaweiExportImporter;
 import org.example.sporthealth.repository.JdbcHealthDataRepository;
 import org.example.sporthealth.repository.RunRows;
 import org.example.sporthealth.repository.RunWeatherStore;
@@ -931,7 +932,41 @@ public class SportHealthTools {
         if (weather != null) {
             storage.put("weather", weather);
         }
+        Map<String, Object> health = healthInfo(jdbcRepository);
+        if (health != null) {
+            storage.put("health", health);
+        }
         return storage;
+    }
+
+    /**
+     * 华为 JSON 导出的规模：运动、健康指标、分钟活动各有多少行。
+     *
+     * <p>这些表不参与跑步分析，但用户需要能确认「全量导出确实进库了」，
+     * 所以挂在存储状态里，而不是单独开一个工具。
+     */
+    private Map<String, Object> healthInfo(JdbcHealthDataRepository repository) {
+        try {
+            HuaweiExportImporter.StorageStats stats = repository.healthStats();
+            HuaweiExportImporter.Result sync = repository.lastHuaweiSync();
+            Map<String, Object> health = new LinkedHashMap<>();
+            health.put("workouts", stats.workouts());
+            health.put("runningWorkouts", stats.runningWorkouts());
+            health.put("otherWorkouts", stats.otherWorkouts());
+            health.put("healthMetrics", stats.healthMetrics());
+            health.put("activityMinutes", stats.activityMinutes());
+            health.put("metricTypes", stats.metricTypes());
+            health.put("firstMetricDate", stats.firstMetricDate());
+            health.put("lastMetricDate", stats.lastMetricDate());
+            health.put("scannedFiles", sync.scanned());
+            health.put("importedFiles", sync.imported());
+            health.put("unchangedFiles", sync.unchanged());
+            health.put("mergedDuplicateWorkouts", sync.mergedDuplicates());
+            return health;
+        } catch (RuntimeException e) {
+            log.warn("读取华为导出统计失败", e);
+            return Map.of("error", String.valueOf(e.getMessage()));
+        }
     }
 
     /**

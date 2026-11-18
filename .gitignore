@@ -47,3 +47,8 @@ build/
 /src/main/resources/health-data/*.tcx
 .Trash-*/
 .workbuddy/
+/src/main/resources/health-data/HUAWEI_HEALTH/
+/src/main/resources/health-data/HUAWEI_Research-/
+/src/main/resources/health-data/Health_data_20261110112136.zip
+/src/main/resources/health-data/无标题文档 1
+/src/test/resources/tcx-dataset/

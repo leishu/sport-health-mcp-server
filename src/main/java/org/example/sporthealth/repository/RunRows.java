@@ -20,10 +20,17 @@ public class RunRows {
     }
 
     /** {@code track_point} 一行的原始形态，按 {@code seq} 升序读出。 */
-    public record TrackRow(int seq, LocalDateTime timestamp, Double latitude, Double longitude, Double altitude) {
+    public record TrackRow(int seq,
+                           LocalDateTime timestamp,
+                           Double latitude,
+                           Double longitude,
+                           Double altitude,
+                           Integer heartRate,
+                           Integer cadence,
+                           Double distanceMeters) {
 
         TrackPoint toTrackPoint() {
-            return new TrackPoint(timestamp, latitude, longitude, altitude);
+            return new TrackPoint(timestamp, latitude, longitude, altitude, heartRate, cadence, distanceMeters);
         }
     }
 
@@ -127,6 +134,12 @@ public class RunRows {
 
     static String instantText(Instant value) {
         return value == null ? null : value.toString();
+    }
+
+    /** 读可空整数列，语义同 {@link #real(ResultSet, String)}。 */
+    static Integer integer(ResultSet rs, String column) throws SQLException {
+        Object value = rs.getObject(column);
+        return value == null ? null : ((Number) value).intValue();
     }
 
     static Instant instant(String value) {

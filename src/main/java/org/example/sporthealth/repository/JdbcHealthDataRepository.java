@@ -45,11 +45,12 @@ public class JdbcHealthDataRepository implements HealthDataRepository {
                    start_latitude, start_longitude, end_latitude, end_longitude,
                    min_altitude_meters, max_altitude_meters, source_file, creator
             FROM run_activity
+            WHERE sport_family = 'RUN'
             ORDER BY start_time DESC
             """;
 
     private static final String SELECT_TRACK_POINTS = """
-            SELECT seq, timestamp, latitude, longitude, altitude
+            SELECT seq, timestamp, latitude, longitude, altitude, heart_rate, cadence, distance_meters
             FROM track_point
             WHERE run_id = ?
             ORDER BY seq
@@ -86,7 +87,10 @@ public class JdbcHealthDataRepository implements HealthDataRepository {
             RunRows.dateTime(rs.getString("timestamp")),
             RunRows.real(rs, "latitude"),
             RunRows.real(rs, "longitude"),
-            RunRows.real(rs, "altitude"));
+            RunRows.real(rs, "altitude"),
+            RunRows.integer(rs, "heart_rate"),
+            RunRows.integer(rs, "cadence"),
+            RunRows.real(rs, "distance_meters"));
 
     /** 快照与轨迹缓存成对替换，保证 reload 后不会出现「新摘要 + 旧轨迹」的混搭。 */
     private record Snapshot(RunDataset dataset, ConcurrentHashMap<String, List<TrackPoint>> routes) {
@@ -149,6 +153,17 @@ public class JdbcHealthDataRepository implements HealthDataRepository {
     public SyncResult lastSync() {
         current();
         return lastSync == null ? SyncResult.empty(Instant.now()) : lastSync;
+    }
+
+    /** 最近一次华为导出同步的统计。 */
+    public HuaweiExportImporter.Result lastHuaweiSync() {
+        current();
+        return importer.lastHuaweiSync();
+    }
+
+    /** 华为数据的规模（运动、健康指标、分钟活动），供 {@code describe_data_source} 展示。 */
+    public HuaweiExportImporter.StorageStats healthStats() {
+        return importer.huaweiStats();
     }
 
     private Snapshot current() {

@@ -1,5 +1,6 @@
 package org.example.sporthealth.repository;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -28,6 +29,11 @@ import org.springframework.transaction.support.TransactionOperations;
 
 /**
  * 把扫描到的 TCX 文件增量同步进 SQLite，是导入过程的唯一写入口。
+ *
+ * <p>TCX 导入结束后会接着跑一次华为 JSON 导出同步（{@link HuaweiExportImporter}）：
+ * 两者共用 {@code source_file} 指纹表但按 {@code kind} 隔离。同一次跑步两边都有时
+ * 以 JSON 为准——它是 TCX 的超集，额外带心率、步频、步数与热量；TCX 这边主动让位，
+ * 不写入也不覆盖，避免同一次跑步出现两行。
  *
  * <p>判断规则（按代价从低到高）：
  * <ol>
@@ -69,6 +75,9 @@ public class TcxIncrementalImporter {
             VALUES (?, ?, ?, ?, ?, ?)
             """;
 
+    /** 华为与 TCX 判为同一次跑步的时间容差，口径与 {@link HuaweiExportImporter} 一致。 */
+    private static final long SAME_ACTIVITY_TOLERANCE_SECONDS = 120;
+
     private final JdbcClient jdbc;
     private final TransactionOperations transactions;
     private final SourceFileScanner scanner;
@@ -77,6 +86,10 @@ public class TcxIncrementalImporter {
     private final SourceFileStateStore stateStore;
     private final SqliteSchema schema;
     private final WeatherBackfill weatherBackfill;
+    private final HuaweiExportImporter huaweiImporter;
+
+    /** 最近一次华为导出同步的结果，供 {@code describe_data_source} 展示。 */
+    private volatile HuaweiExportImporter.Result lastHuaweiSync = HuaweiExportImporter.Result.empty(Instant.now());
 
     public TcxIncrementalImporter(JdbcClient jdbc,
                                   TransactionOperations transactions,
@@ -85,7 +98,8 @@ public class TcxIncrementalImporter {
                                   HealthDataProperties properties,
                                   SourceFileStateStore stateStore,
                                   SqliteSchema schema,
-                                  WeatherBackfill weatherBackfill) {
+                                  WeatherBackfill weatherBackfill,
+                                  HuaweiExportImporter huaweiImporter) {
         this.jdbc = jdbc;
         this.transactions = transactions;
         this.scanner = scanner;
@@ -94,6 +108,7 @@ public class TcxIncrementalImporter {
         this.stateStore = stateStore;
         this.schema = schema;
         this.weatherBackfill = weatherBackfill;
+        this.huaweiImporter = huaweiImporter;
     }
 
     /** 扫描数据目录并把变化写入库，返回本次同步的统计。 */
@@ -153,11 +168,37 @@ public class TcxIncrementalImporter {
         log.info("增量同步完成：扫描 {} 个文件、重导 {} 个、未变 {} 个，库中活动 {} 条",
                 files.size(), imported, unchanged, activityCount());
 
+        // 华为 JSON 导出必须在 TCX 之后：它要用刚落库的 TCX 记录做「是否同一次跑步」的判断。
+        // 失败只进 warnings，不影响已经写好的 TCX 数据。
+        syncHuaweiExport(warnings);
+
         // 天气回填放在导入事务全部结束之后：HTTP 调用不能占用池里唯一的连接。
         // 失败只进 warnings，绝不影响已经写好的跑步数据。
         appendWeather(syncedAt, warnings);
 
         return new SyncResult(files.size(), imported, unchanged, orphaned, warnings, syncedAt);
+    }
+
+    /** 跑一次华为导出同步；任何异常都降级成一条 warning。 */
+    private void syncHuaweiExport(List<String> warnings) {
+        try {
+            HuaweiExportImporter.Result result = huaweiImporter.sync();
+            lastHuaweiSync = result;
+            warnings.addAll(result.warnings());
+        } catch (RuntimeException e) {
+            log.warn("华为导出同步异常，已忽略", e);
+            warnings.add("华为导出同步异常：" + e.getMessage() + "，TCX 数据不受影响");
+        }
+    }
+
+    /** 最近一次华为导出的同步结果。 */
+    public HuaweiExportImporter.Result lastHuaweiSync() {
+        return lastHuaweiSync;
+    }
+
+    /** 华为数据的规模统计，供 {@code describe_data_source} 展示。 */
+    public HuaweiExportImporter.StorageStats huaweiStats() {
+        return huaweiImporter.stats();
     }
 
     /**
@@ -190,18 +231,39 @@ public class TcxIncrementalImporter {
 
     /** 一个文件的完整写入：解析在前，事务内删除旧行 + 批量插入。 */
     private void importFile(SourceFile file, String hash, List<String> warnings) throws Exception {
-        List<ParsedRun> runs;
+        List<ParsedRun> parsed;
         try (var input = file.open()) {
-            runs = parser.parse(file.name(), input);
+            parsed = parser.parse(file.name(), input);
+        }
+
+        Set<String> declaredIds = new LinkedHashSet<>();
+        for (ParsedRun run : parsed) {
+            declaredIds.add(run.activity().id());
+            run.warnings().forEach(warning -> warnings.add(file.name() + ": " + warning));
+        }
+        if (declaredIds.size() != parsed.size()) {
+            throw new TcxDataException("文件内记录 id 重复: " + declaredIds);
+        }
+
+        // JSON 是超集：同一次跑步两边都有时，JSON 那行才带心率、步频、步数。
+        // 这里让位，不写入；库里可能残留的旧 TCX 行会在下面按 source_file 一并清掉。
+        List<Instant> huaweiStarts = huaweiImporter.huaweiRunStarts();
+        List<ParsedRun> runs = new ArrayList<>(parsed.size());
+        int yielded = 0;
+        for (ParsedRun run : parsed) {
+            if (coveredByHuawei(run.activity().startTimeUtc(), huaweiStarts)) {
+                yielded++;
+                continue;
+            }
+            runs.add(run);
+        }
+        if (yielded > 0) {
+            warnings.add(file.name() + ": " + yielded + " 次运动已有华为 JSON 记录（字段更全），TCX 让位");
         }
 
         Set<String> ids = new LinkedHashSet<>();
         for (ParsedRun run : runs) {
             ids.add(run.activity().id());
-            run.warnings().forEach(warning -> warnings.add(file.name() + ": " + warning));
-        }
-        if (ids.size() != runs.size()) {
-            throw new TcxDataException("文件内记录 id 重复: " + ids);
         }
         rejectIdsOwnedByOtherFiles(file.name(), ids);
 
@@ -287,11 +349,25 @@ public class TcxIncrementalImporter {
     private record StoredWeatherKey(String id, WeatherKey key) {
     }
 
+    /** TCX 活动是否已经由华为 JSON 记录覆盖（±2 分钟）。 */
+    private static boolean coveredByHuawei(Instant start, List<Instant> huaweiStarts) {
+        for (Instant candidate : huaweiStarts) {
+            if (Math.abs(Duration.between(candidate, start).getSeconds()) <= SAME_ACTIVITY_TOLERANCE_SECONDS) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * 同一个 id 只能属于一个来源文件。文件改名后旧行会留在库里，
      * 若直接覆盖等于静默删掉另一份记录，因此先查一遍归属。
      */
     private void rejectIdsOwnedByOtherFiles(String sourceFile, Set<String> ids) {
+        // 全部让位给 JSON 时 ids 为空，SQLite 不接受 IN ()，直接返回
+        if (ids.isEmpty()) {
+            return;
+        }
         List<String> foreign = jdbc.sql("""
                 SELECT id FROM run_activity
                 WHERE source_file <> :sourceFile AND id IN (:ids)

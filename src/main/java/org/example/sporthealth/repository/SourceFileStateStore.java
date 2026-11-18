@@ -28,6 +28,12 @@ public class SourceFileStateStore {
     private final JdbcClient jdbc;
     private final SqliteSchema schema;
 
+    /** 来源类别：TCX 单文件。 */
+    public static final String KIND_TCX = "tcx";
+
+    /** 来源类别：华为 JSON 导出。 */
+    public static final String KIND_HUAWEI = "huawei";
+
     public SourceFileStateStore(JdbcClient jdbc, SqliteSchema schema) {
         this.jdbc = jdbc;
         this.schema = schema;
@@ -63,16 +69,23 @@ public class SourceFileStateStore {
     /** 写入/覆盖一条状态；null 值表示该维度未知。 */
     public void save(String name, long size, long modifiedMillis, String hash,
                      boolean failed, String errorMessage) {
+        save(name, size, modifiedMillis, hash, failed, errorMessage, KIND_TCX);
+    }
+
+    /** 写入/覆盖一条状态，并记录来源类别（{@code tcx} / {@code huawei}）。 */
+    public void save(String name, long size, long modifiedMillis, String hash,
+                     boolean failed, String errorMessage, String kind) {
         schema.ensure();
         jdbc.sql("""
-                INSERT INTO source_file (source_file, size, modified_millis, content_hash, status, error_message, synced_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO source_file (source_file, size, modified_millis, content_hash, status, error_message, kind, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (source_file) DO UPDATE SET
                     size = excluded.size,
                     modified_millis = excluded.modified_millis,
                     content_hash = excluded.content_hash,
                     status = excluded.status,
                     error_message = excluded.error_message,
+                    kind = excluded.kind,
                     synced_at = excluded.synced_at
                 """)
                 .param(name)
@@ -81,34 +94,59 @@ public class SourceFileStateStore {
                 .param(hash)
                 .param(failed ? "FAILED" : "OK")
                 .param(errorMessage)
+                .param(kind)
                 .param(Instant.now().toString())
                 .update();
     }
 
-    /** 删除已不在数据目录里的文件状态，返回删除条数。 */
+    /**
+     * 删除某一类别下已不在数据目录里的文件状态，返回删除条数。
+     *
+     * <p>必须按 {@code kind} 收窄：TCX 扫描只认识 {@code *.tcx}，华为导出扫描只认识 JSON 树，
+     * 任何一方用「全表不在名单里就删」都会把对方的指纹清掉，下次同步变成 630MB 全量重导。
+     */
     public int deleteMissing(Set<String> existingNames) {
+        return deleteMissing(existingNames, KIND_TCX);
+    }
+
+    /** 按来源类别删除缺失文件的状态。 */
+    public int deleteMissing(Set<String> existingNames, String kind) {
         schema.ensure();
         if (existingNames.isEmpty()) {
             // 不接管「目录为空」：那多半是路径配错或挂载点没就绪，清空指纹会让下次同步全量重导
             return 0;
         }
-        return jdbc.sql("DELETE FROM source_file WHERE source_file NOT IN (:names)")
+        return jdbc.sql("DELETE FROM source_file WHERE kind = :kind AND source_file NOT IN (:names)")
+                .param("kind", kind)
                 .param("names", existingNames)
                 .update();
     }
 
     /** 来源文件已被删除、但库里仍保留历史活动的文件名。 */
     public List<String> orphanedFiles(Set<String> existingNames) {
+        return orphanedFiles(existingNames, KIND_TCX);
+    }
+
+    /** 按来源类别列出「源文件已不在、但业务行仍在」的文件名。 */
+    public List<String> orphanedFiles(Set<String> existingNames, String kind) {
         schema.ensure();
         if (existingNames.isEmpty()) {
-            return jdbc.sql("SELECT DISTINCT source_file FROM run_activity ORDER BY source_file")
+            return jdbc.sql("""
+                    SELECT DISTINCT source_file FROM run_activity
+                    WHERE source_file IN (SELECT source_file FROM source_file WHERE kind = :kind)
+                    ORDER BY source_file
+                    """)
+                    .param("kind", kind)
                     .query(String.class).list();
         }
         return jdbc.sql("""
-                SELECT DISTINCT source_file FROM run_activity
-                WHERE source_file NOT IN (:names)
-                ORDER BY source_file
+                SELECT DISTINCT a.source_file FROM run_activity a
+                JOIN source_file s ON s.source_file = a.source_file
+                WHERE s.kind = :kind
+                  AND a.source_file NOT IN (:names)
+                ORDER BY a.source_file
                 """)
+                .param("kind", kind)
                 .param("names", existingNames)
                 .query(String.class)
                 .list();
