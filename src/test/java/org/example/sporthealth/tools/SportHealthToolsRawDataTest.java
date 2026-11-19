@@ -178,7 +178,7 @@ class SportHealthToolsRawDataTest {
         assertEquals(Boolean.TRUE, result.get("hasMore"));
         Map<?, ?> row = (Map<?, ?>) ((List<?>) result.get("rows")).get(0);
         assertEquals(0, row.get("seq"));
-        assertEquals(5, row.get("pointIndex"), "rs 的 k 是轨迹点序号，没有毫秒时间戳");
+        assertEquals(5, row.get("pointIndex"), "rs 的 k 是相对起跑的秒数，没有毫秒时间戳");
         assertFalse(row.containsKey("timeMillis"));
         assertEquals(27.68, (Double) row.get("value"), 1e-9);
         assertEquals(9.96, (Double) row.get("speedKmh"), 1e-9, "v × 0.36 = km/h");

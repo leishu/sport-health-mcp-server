@@ -226,6 +226,7 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `get_run_detail` | `runId` `includeTrack?` `trackOffset?` `trackLimit?` | 单次完整详情：起止时间、时长、距离、平均配速/速度、爬升与下降、海拔范围、起终点坐标、该次跑步的天气 `weather`（起跑/结束时刻的气温、体感、湿度、降水、风向风速、天气现象）；华为来源另带心率/步频/步数/热量/华为运动类型码，以及 `summaryData` 的可用性（`available`/`bytes`，原文交给 `get_run_summary_data`，不再把 2.5 KB 转义 JSON 塞进详情），可选附带轨迹分页 |
 | `get_run_summary_data` | `runId` `fields?` `decode?` | 把华为 `summaryData` 原文摊开并换算单位：时长/距离/热量（原文毫秒、卡）、平均与最快配速、心率与步频、单公里分段 `kmSplits`（段配速、本段用时、累计用时、是否末段不足一公里）、心率区间分布、跑姿汇总（触地时间/垂直振幅/左右平衡）、训练效果与恢复时间、手机自报天气 `deviceWeather`。未建模字段用 `fields` 原样取，逗号分隔、支持 `a.b` 与 `a.*`（例如 `fields="bestPace,wearSportData.recovery_time"`），没匹配到的路径列入 `missingFields`。`-1`/`-101`/`3.4e38` 这类占位值转成缺省并在 `notes` 说明；`decode=false` 只返回原始字段。TCX 记录返回 `NO_DATA` |
 | `get_run_streams` | `runId` `type?` `offset?` `limit?` | 读 `track_stream`：华为导出里没进轨迹点的原始流。不传 `type` 返回目录（每类的行数、语义、单位、数值范围、首行样例），因为一次的 `rs` 可能有两千多行；传了 `type` 再分页取行（默认 200、最多 5000），数值字段转成数字，`rs` 额外给 `speedKmh`/`paceText`，`pm2` 给 `endDistanceMeters`/`paceText`。`pm2`↔`p-m`、`bpm2`↔`b-p-m` 是同一份采样的两种写法，传任一都会命中存在的那个（`type` 是实际取到的类型，两者不同时另给 `requestedType`） |
+| `get_running_dynamics` | `runId?` `startDate?` `endDate?` `groupBy?` `splitKm?` `offset?` `limit?` | 跑步动态（跑姿）：触地时间、垂直振幅、触地平衡（左右平衡）、步幅、步频。传 `runId` 看单次：`summary` + 按 `splitKm`（默认 1，最小 0.1）分段 `segments` + `halves`（前后半程与 `delta`，后半程减前半程）；不传 `runId` 按区间汇总：`coverage`（`dynamicsRuns` 多少条真带跑姿数据、`strideRuns`、覆盖率与一句读法）、`summary`（各项 `count`/`average`/`min`/`max`）、`trend`（`groupBy=month` 默认，可选 `week`，`none` 不出）、逐次记录分页。跑姿三项只有连接跑步动态传感器的记录才有；步幅由「距离 ÷ 步数」折算。`runId` 与日期互斥、`splitKm` 只用于单次、`groupBy` 只用于区间，混用返回 `INVALID_ARGUMENT` |
 | `get_run_route` | `runId` `offset?` `limit?` `format?` `maxPoints?` `includeSensors?` | 轨迹点分页（时间/纬度/经度/海拔，海拔与累计距离保留 2 位小数），每点另带 `heartRate`/`cadence`/`distanceMeters`（华为来源才有，TCX 为 `null`；`includeSensors=false` 时省略这三个键）；可输出 GeoJSON，此时传感器放在与 `geometry.coordinates` 等长同序的 `sensors` 平行数组里；`maxPoints` 降采样后会忽略 `offset`/`limit` |
 | `get_running_summary` | `startDate?` `endDate?` | 次数、总距离、总时长、总爬升、平均配速、最快/最长记录 |
 | `get_daily_running` | `startDate?` `endDate?` `groupBy?` | 按天/周/月拆分，只含有记录的周期，`day` 时额外返回每天一条 |
@@ -264,6 +265,7 @@ P0 新增的五项分析都只使用已有的 TCX 数据与已回填的天气，
 - **坡度修正配速 GAP**：用 Minetti 跑步能量代价公式计算坡度代价比 `Cr(grade)/Cr(0)`，`GAP = 实际配速 / 代价比`，坡度夹取到 `[-45%, 45%]`；净海拔变化取每段首尾海拔差。全程 GAP 用等效平路距离加权，而不是对分段 GAP 做算术平均。
 - **训练类型识别**：主判据是距离、时长、配速相对个人中位数与分段波动。长距离阈值取 `max(10 km, 1.5 × 个人中位距离)`；间歇/变速要求同时有至少 2 段明显快、2 段明显慢于中位配速，避免把长距离跑里的一次停顿误判成间歇；无 GPS 轨迹时置信度降为 `LOW`。华为来源的记录还有平均心率，会换算成区间（Z1~Z5）做交叉验证：静息心率取 `daily_vitals` 近 28 天均值，最大心率取数据集里观察到的最快值（只会低估，偏保守），两者差 ≥ 60 bpm 时用储备心率（Karvonen）百分比，否则退回占最大心率百分比；区间与配速一致则置信度上调一格，冲突则下调一格，配速像轻松跑但心率已进 `Z4` 时改判节奏跑。
 - **天气影响**：只读 `run_weather` 中 `status=OK` 的记录，优先使用起跑快照（缺失时退回结束快照）。分组内配速用「总时长 / 总距离」加权；样本少于 3 条时相关系数为 `null`，并在结论文本里提示样本不足。
+- **跑步动态（跑姿）**：触地时间 / 垂直振幅 / 触地平衡来自华为 `summaryData` 的跑姿块（`mAvgGroundContactTime`、`mExtendTrackDataMap.avg_v_osc`、`avg_gc_tb`），**只有连接过跑步动态传感器的记录才有**——本机数据里 154 次跑步有 63 次（40.9%），所以 `get_running_dynamics` 一定先报 `coverage`，否则「这半年没戴传感器」会被误读成「跑姿变好了」。单次的分段与前后半程必须用 `track_stream` 的 `rp`（每 5 秒一个采样，只有 `k` 与 `gct/vo/gtb`）：`k` 实测是**相对起跑的秒数**（63 次记录里 `max(k) / 总时长` 都在 0.998~1.0），不是轨迹点序号（轨迹点每 2 秒一个，序号只到时长的一半），所以要用 `TrackPath.distanceAtTime` 落回距离轴才能按公里切段。`rp` 里其余字段（腾空时间、摆臂、冲击加速度等）实测恒为 `-1`/`-101`，不做建模。步幅没有原始字段：整次用「总距离 ÷ 总步数」，分段/半程用「本段速度 × 60 ÷ 本段平均步频」（分段没有单独步数）。区间汇总是**每条记录一个样本**（先算每次的均值再统计），与单次里的采样均值可能差 0.1 左右；左右平衡以 50% 为均衡，但华为没公开这个数值对应哪只脚。
 
 ### 返回状态
 
@@ -361,7 +363,7 @@ TCX 文件只在**内容变化**时被解析一次，结果写进 SQLite；之�
 | --- | --- |
 | `run_activity` | 一次运动一行：摘要字段（时间、距离、配速、爬升、起终点坐标…）+ `source_file` + `content_hash` + `imported_at`；v8 起附带 `summary_data` 原文 |
 | `track_point` | 轨迹点，主键 `(run_id, seq)`，`WITHOUT ROWID`，一个活动的点物理连续 |
-| `track_stream` | 未进入轨迹点的原始流：`rs` 每 5 秒速度、`rp` 跑姿、`pm2` 单公里配速、`evt` 事件等，主键 `(run_id, stream_type, seq)` |
+| `track_stream` | 未进入轨迹点的原始流：`rs` 每 5 秒速度、`rp` 跑姿（每 5 秒一个的 `gct`/`vo`/`gtb`）、`pm2` 单公里配速、`evt` 事件等，主键 `(run_id, stream_type, seq)`；`rs`/`rp` 的 `k` 是相对起跑的秒数，`pm2` 的是终点轨迹点序号 |
 | `source_file` | 来源文件指纹：`size`、`modified_millis`、`content_hash`，增量同步的比对基准 |
 | `run_weather` | 每次跑步的起跑 / 结束两个时刻的天气，主键 `run_id`，由 open-meteo 回填 |
 | `health_metric` | 华为健康明细，一行一个采样点：动态心率、睡眠分期、体重、血氧、压力… |
@@ -616,11 +618,12 @@ JPA 在 WebFlux 上要配 R2DBC 才不阻塞，对只有两张表的场景属于
 ## 架构
 
 ```
-tools/SportHealthTools          # 24 个 @McpTool，负责参数校验与统一的 Map<String, Object> 返回结构
+tools/SportHealthTools          # 25 个 @McpTool，负责参数校验与统一的 Map<String, Object> 返回结构
         │
 service/RunAnalyticsService     # 区间汇总、按天拆分、个人最佳、对比、分段/GAP、最佳努力、海拔、停顿、趋势、比赛预测、ACWR、训练分类、id 解析
 service/RunLevelService         # 华为官方跑力：每日快照、五档配速、趋势、官方 vs Riegel 对照
         └── repository/RunLevelStore   # run_level 表：最近一天 / 指定日或之前 / 区间内；km/h → 配速在仓储层换算
+service/RunningDynamicsService  # 跑姿与步幅：summaryData 跑姿块做区间汇总，rp 流 + 轨迹做分段与前后半程
 service/AutoSyncScheduler       # 后台自动同步执行器：调用 reload()，失败只记日志、保留上一份快照
 config/AutoSyncConfiguration    # 注册 fixed-delay 任务；enabled=false 时不注册
         │
@@ -642,13 +645,14 @@ weather/WeatherBackfill         # 导入结束后补一轮天气：挑待补、�
 importer/SourceFileScanner      # 扫描 *.tcx，产出带 size/mtime 的 SourceFile
 importer/ContentHash            # SHA-256 指纹
 
-support/TrackPath               # 轨迹几何索引：累计距离 ↔ 时间 ↔ 海拔，分段/最佳努力/海拔共用
+support/TrackPath               # 轨迹几何索引：累计距离 ↔ 时间 ↔ 海拔（+ 步频），分段/最佳努力/海拔/跑姿共用
 support/WeatherImpactAnalyzer   # 天气影响分组统计（纯计算，不访问库或网络）
 domain/RacePrediction           # 比赛预测结果（参考成绩 + 各目标距离）
 domain/TrainingLoad             # 训练负荷 / ACWR 快照
 domain/RunClassification        # 单次训练类型识别结果
 domain/TrainingMix              # 区间训练类型构成
 domain/WeatherImpact            # 天气影响分组结果
+domain/RunningDynamics          # 单次跑姿/步幅汇总；DynamicsSegment 分段、RunningDynamicsDetail 详情、DynamicsSummary 区间统计
 ```
 
 - **启动阶段**：只建表，不解析。首次访问（或 `reload_data`）触发增量同步，然后把全部摘要装进内存快照。
@@ -720,6 +724,13 @@ JAVA_HOME=/path/to/jdk-21 mvn test
   ACWR 在只有 10 天数据时标 `LOW` 置信度并给出高风险提示；逐公里 GAP 与净海拔/坡度字段；
   长距离跑识别与训练类型构成；工具层 5 个新工具的返回结构与 `NO_DATA` 语义；
   真实 SQLite 下种 5 条天气行后温度/湿度/风速/干湿分组、加权配速与相关系数。
+- **跑步动态**（`RunningDynamicsServiceTest` / `SportHealthToolsRunningDynamicsTest`）：
+  `rp` 的 `k` 按秒换算成累计距离再分段（同一份采样放在 500 米切点前后会落到不同的段）、
+  前后半程差值为后半程减前半程、分段步幅按「速度 × 60 ÷ 步频」折算、
+  区间汇总按记录数而不是采样行数平均、缺项不计入统计（不返回 0 值）、周/月趋势的周期边界、
+  没有 summaryData 跑姿块时用采样均值兜底、没有轨迹时保留整次汇总但不给分段；
+  工具层覆盖度（1/3 带跑姿）、分页、`groupBy=none`、无跑姿记录的 `message`、
+  以及 `runId` 与日期、`splitKm`、`groupBy` 混用时的 `INVALID_ARGUMENT`。
 - **自动同步**（`AutoSyncSchedulerTest` / `AutoSyncPropertiesTest` / `AutoSyncConfigurationTest`）：
   执行器确实走仓储的 `reload()` 并读取新快照、同步失败只记日志不抛给调度线程；
   配置默认开启、Duration 格式绑定、非正间隔回落到默认值、`enabled=false` 可关闭；
@@ -756,6 +767,8 @@ JAVA_HOME=/path/to/jdk-21 mvn test
 | `warnings` 里有「天气回填本轮提前结束」 | 接口连续 3 次可重试失败后主动收尾，避免一次同步被拖到几分钟。这些记录没落行，下次同步自动重试 |
 | 天气一直是 `UNAVAILABLE` | 该时段超出数据源覆盖范围（太早的历史），或是室内跑步没有 GPS 坐标。属终态，不会重试 |
 | 天气温度和体感差很多 | 正常。`start_apparent_c` 是体感温度，风速大、湿度高时与气温差异明显 |
+| `get_running_dynamics` 里触地时间/垂直振幅/左右平衡是 `null` | 该次运动没连跑步动态传感器（心率带/跑姿传感器），华为不会补算。看 `coverage.dynamicsRuns` 确认是「没戴」还是「数据没导入」；步幅与步频不受影响 |
+| 跑姿分段里的 `sampleCount` 明显少于「本段用时 ÷ 5」 | `rp` 采样只在传感器连接期间产生（常见是开跑十几秒后才开始），前段会少几个点；整次均值仍以华为 `summaryData` 为准 |
 | 想彻底重建 | 停服务，删 `db-path` 指向的文件（含 `-wal`/`-shm`），重启后自动全量导入 |
 
 ---

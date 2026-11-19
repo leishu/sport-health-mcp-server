@@ -24,6 +24,8 @@ import org.example.sporthealth.config.HealthDataProperties;
 import org.example.sporthealth.domain.BestEfforts;
 import org.example.sporthealth.domain.Consistency;
 import org.example.sporthealth.domain.DailyRunSummary;
+import org.example.sporthealth.domain.DynamicsSegment;
+import org.example.sporthealth.domain.DynamicsSummary;
 import org.example.sporthealth.domain.ElevationProfile;
 import org.example.sporthealth.domain.OfficialRaceComparison;
 import org.example.sporthealth.domain.Page;
@@ -43,6 +45,8 @@ import org.example.sporthealth.domain.RunLookup;
 import org.example.sporthealth.domain.RunSplits;
 import org.example.sporthealth.domain.RunSummary;
 import org.example.sporthealth.domain.RunWeather;
+import org.example.sporthealth.domain.RunningDynamics;
+import org.example.sporthealth.domain.RunningDynamicsDetail;
 import org.example.sporthealth.domain.SplitCrossCheck;
 import org.example.sporthealth.domain.StopPoint;
 import org.example.sporthealth.domain.StopPoints;
@@ -61,6 +65,7 @@ import org.example.sporthealth.repository.RunRows;
 import org.example.sporthealth.repository.RunWeatherStore;
 import org.example.sporthealth.service.RunAnalyticsService;
 import org.example.sporthealth.service.RunLevelService;
+import org.example.sporthealth.service.RunningDynamicsService;
 import org.example.sporthealth.support.DateParser;
 import org.example.sporthealth.support.DateRange;
 import org.example.sporthealth.support.HuaweiStreamTypes;
@@ -118,6 +123,11 @@ public class SportHealthTools {
     private static final List<String> GROUP_VALUES = List.of("day", "week", "month");
     /** {@code get_training_trend} 的 {@code period} 允许值。 */
     private static final List<String> PERIOD_VALUES = List.of("week", "month");
+    /** {@code get_running_dynamics} 的 {@code groupBy} 允许值；{@code none} 表示不出趋势。 */
+    private static final List<String> DYNAMICS_GROUP_VALUES = List.of("month", "week", "none");
+    /** 跑姿记录列表的默认与最大返回条数。 */
+    private static final int DYNAMICS_ROW_DEFAULT = 50;
+    private static final int DYNAMICS_ROW_MAX = 200;
     private static final double DEFAULT_ELEVATION_BUCKET_METERS = 100d;
     private static final double DEFAULT_ELEVATION_SMOOTHING_METERS = 1d;
     /** 与区间中位配速相差超过这个百分比即视为离群。 */
@@ -140,6 +150,8 @@ public class SportHealthTools {
     private final WeatherBackfill weatherBackfill;
     /** 可选：同理，非 JDBC 仓储没有 {@code run_level} 表。官方跑力是增强信息，缺失不影响其它工具。 */
     private final RunLevelService runLevelService;
+    /** 跑姿/步幅分析；只需仓储，构造时可从 {@code repository} 兜底自建，单测不必额外注入。 */
+    private final RunningDynamicsService runningDynamics;
 
     /**
      * 不带官方跑力、也不带天气回填的构造方式，供只有 TCX 数据的内存仓储与单测使用。
@@ -163,19 +175,36 @@ public class SportHealthTools {
         this(analytics, repository, properties, weatherStore, null, runLevelService);
     }
 
-    @Autowired
     public SportHealthTools(RunAnalyticsService analytics,
                             HealthDataRepository repository,
                             HealthDataProperties properties,
                             RunWeatherStore weatherStore,
                             WeatherBackfill weatherBackfill,
                             RunLevelService runLevelService) {
+        this(analytics, repository, properties, weatherStore, weatherBackfill, runLevelService, null);
+    }
+
+    /**
+     * 完整构造方式。{@code runningDynamics} 允许为 {@code null}：它只依赖仓储，
+     * 传 null 时按 {@code repository} 自建，这样既有的单测构造方式不用改。
+     */
+    @Autowired
+    public SportHealthTools(RunAnalyticsService analytics,
+                            HealthDataRepository repository,
+                            HealthDataProperties properties,
+                            RunWeatherStore weatherStore,
+                            WeatherBackfill weatherBackfill,
+                            RunLevelService runLevelService,
+                            RunningDynamicsService runningDynamics) {
         this.analytics = analytics;
         this.repository = repository;
         this.properties = properties;
         this.weatherStore = weatherStore;
         this.weatherBackfill = weatherBackfill;
         this.runLevelService = runLevelService;
+        this.runningDynamics = runningDynamics == null
+                ? new RunningDynamicsService(repository)
+                : runningDynamics;
     }
 
     /** 区间内的记录列表，新的在前，支持过滤、排序与分页。 */
@@ -345,7 +374,8 @@ public class SportHealthTools {
                     + "华为官方单公里配速 pm2、事件 evt 等。不传 type 时返回该记录的流目录"
                     + "（行数、语义、单位、数值范围、首行样例），先看清有什么再取；"
                     + "传 type 后按 offset/limit 分页取行（默认 200 行，最多 5000）。"
-                    + "适合回答「后半程步频掉没掉」「触地时间多少」「每公里官方配速怎么算的」。")
+                    + "适合回答「后半程步频掉没掉」「每公里官方配速怎么算的」。"
+                    + "只想看跑姿的均值、分段与前后半程对比，用 get_running_dynamics，不用自己拉原始行。")
     public Map<String, Object> getRunStreams(
             @McpToolParam(description = "跑步记录 id，先用 list_runs 获取") String runId,
             @McpToolParam(description = "流类型：rs / rp / pm2 / p-m / bpm2 / evt …；不传只返回目录",
@@ -411,6 +441,317 @@ public class SportHealthTools {
         result.put("hasMore", page.hasMore());
         result.put("rows", page.items().stream().map(row -> toStreamRow(resolved, row)).toList());
         return result;
+    }
+
+    /**
+     * 跑姿与步幅：触地时间、垂直振幅、左右平衡、步幅、步频。
+     *
+     * <p>这条工具把「跑姿」从原始流（{@code get_run_streams} 的 {@code rp}）提升成可回答问题的指标：
+     * 触地时间/垂直振幅/左右平衡取华为 summaryData 的官方整次均值，步幅由「距离 ÷ 步数」折算，
+     * 步频直接取华为的平均步频。传 {@code runId} 看单次（按公里分段 + 前后半程对比），
+     * 不传则按日期区间汇总（覆盖度、均值与波动、按周/月趋势、逐次列表）。
+     *
+     * <p>跑姿三项只有连接过跑步动态传感器的记录才有，覆盖率必须显式给出，
+     * 否则调用方会把「这半年没戴传感器」误读成「跑姿变好了」。
+     */
+    @McpTool(name = "get_running_dynamics",
+            description = "查询跑步动态（跑姿）指标：平均触地时间、垂直振幅、触地平衡（左右平衡）、步幅与步频。"
+                    + "传 runId 看单次：整次均值 + 按 splitKm（默认 1 公里）分段 + 前后半程对比（halves.delta 为后半程减前半程）；"
+                    + "不传 runId 则按日期区间汇总：coverage（有多少次跑步真的带跑姿数据、覆盖率）、"
+                    + "summary（各项的平均/最小/最大）、trend（按 groupBy=month/week 聚合，none 不出）、"
+                    + "逐次记录列表与分页。"
+                    + "触地时间/垂直振幅/左右平衡只有连接跑步动态传感器的记录才有（没戴就没有，不是跑姿变差）；"
+                    + "步幅没有原始字段，用「总距离 ÷ 总步数」折算，分段/半程用「本段速度 × 60 ÷ 本段步频」。"
+                    + "用于回答“平均触地时间多少”“垂直振幅大不大”“左右平衡偏不偏”“步幅怎么样”“后半程跑姿有没有散”。")
+    public Map<String, Object> getRunningDynamics(
+            @McpToolParam(description = "跑步记录 id；传了只看这一次，不传则按区间汇总", required = false) String runId,
+            @McpToolParam(description = "开始日期，格式 yyyy-MM-dd；只在区间汇总时使用", required = false) String startDate,
+            @McpToolParam(description = "结束日期，格式 yyyy-MM-dd；只在区间汇总时使用", required = false) String endDate,
+            @McpToolParam(description = "区间趋势粒度：month（默认）、week，none 表示不返回趋势",
+                    required = false) String groupBy,
+            @McpToolParam(description = "单次模式的分段距离（公里），默认 1，最小 0.1；区间汇总不要传",
+                    required = false) Double splitKm,
+            @McpToolParam(description = "区间模式记录列表的偏移，默认 0", required = false) Integer offset,
+            @McpToolParam(description = "区间模式返回的记录条数，默认 50，最多 200", required = false) Integer limit) {
+        boolean single = runId != null && !runId.isBlank();
+        if (single && (startDate != null || endDate != null)) {
+            return invalidArgument("runId", runId,
+                    "传了 runId 就只查这一次记录，不要再传 startDate/endDate；要按区间汇总就别传 runId", null);
+        }
+        if (single && groupBy != null && !groupBy.isBlank()) {
+            return invalidArgument("groupBy", groupBy,
+                    "groupBy 只用于区间汇总（不传 runId 时）；单次详情本来就只有一个周期", DYNAMICS_GROUP_VALUES);
+        }
+        if (!single && splitKm != null) {
+            return invalidArgument("splitKm", splitKm,
+                    "splitKm 只用于单次详情（传了 runId 时）；区间汇总返回逐次记录，不切段", null);
+        }
+        if (splitKm != null && !validSplitKm(splitKm)) {
+            return invalidSplitKm(splitKm);
+        }
+        String group = normalizeDynamicsGroup(groupBy);
+        if (group == null) {
+            return invalidArgument("groupBy", groupBy,
+                    "无法识别的趋势粒度 \"" + groupBy + "\"，支持 month / week / none；不传按 month",
+                    DYNAMICS_GROUP_VALUES);
+        }
+        if (single) {
+            return runningDynamicsOfRun(runId, splitKm == null ? DEFAULT_SPLIT_KM : splitKm);
+        }
+        return runningDynamicsOfRange(startDate, endDate, group, orZero(offset), limit);
+    }
+
+    /** 单次详情：整次汇总 + 分段 + 前后半程。 */
+    private Map<String, Object> runningDynamicsOfRun(String runId, double splitKm) {
+        RunLookup lookup = analytics.lookup(runId);
+        if (lookup.isAmbiguous()) {
+            return ambiguous(runId, lookup);
+        }
+        if (!lookup.isFound()) {
+            return notFound(runId);
+        }
+        RunActivity run = lookup.run();
+        RunningDynamicsDetail detail = runningDynamics.detail(run, splitKm * 1000d);
+        if (!detail.run().hasAnyMetric()) {
+            return noData(run, "这条记录没有跑姿数据（触地时间/垂直振幅/左右平衡需要连接跑步动态传感器，"
+                    + "track_stream 里也没有 rp 流），也没有步数可以折算步幅");
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "OK");
+        result.put("scope", "run");
+        result.put("runId", detail.run().runId());
+        result.put("date", detail.run().date());
+        result.put("splitMeters", detail.splitMeters());
+        result.put("summary", dynamicsRow(detail.run()));
+        result.put("metrics", dynamicsMetricHints());
+        List<String> notes = new ArrayList<>();
+        if (!detail.run().hasPosture()) {
+            result.put("message", "这条记录没有触地时间/垂直振幅/左右平衡（需要连接跑步动态传感器），"
+                    + "能给的只有步幅与步频");
+            notes.add("步幅由「总距离 ÷ 总步数」折算，与跑姿传感器无关");
+        }
+        if (detail.segments().isEmpty()) {
+            notes.add("轨迹点不足（少于 2 个有效坐标），无法按距离分段；整次汇总仍然有效");
+        } else {
+            result.put("segments", detail.segments());
+            result.put("halves", dynamicsHalves(detail));
+            notes.add("按距离分段时，跑姿采样（每 5 秒一个）用轨迹插值换算成累计距离后归段，"
+                    + "段内没有采样的那一段三项为 null，不用邻近段顶替");
+            notes.add("分段步幅 = 本段速度 × 60 ÷ 本段平均步频；整次步幅用「总距离 ÷ 总步数」，两者口径略有差异");
+            notes.add("halves.delta 是后半程减前半程：触地时间变长、垂直振幅变大、步幅变小，"
+                    + "通常说明疲劳后动作开始变形");
+        }
+        result.put("notes", notes);
+        return result;
+    }
+
+    /** 区间汇总：覆盖度 + 均值波动 + 趋势 + 逐次列表。 */
+    private Map<String, Object> runningDynamicsOfRange(String startDate, String endDate,
+                                                       String group, int offset, Integer limit) {
+        DateRange range = analytics.resolveRange(startDate, endDate);
+        List<RunActivity> runs = analytics.runs(range);
+        if (runs.isEmpty()) {
+            return noData(range, null);
+        }
+        List<RunningDynamics> rows = runningDynamics.ofRuns(runs);
+        if (rows.isEmpty()) {
+            Map<String, Object> result = noData(range, "区间内 " + runs.size()
+                    + " 次跑步既没有跑姿数据（需要连接跑步动态传感器），也没有可折算步幅的步数");
+            result.put("totalRuns", runs.size());
+            return result;
+        }
+        DynamicsSummary summary = runningDynamics.summarize(rows);
+        int total = rows.size();
+        int from = Math.min(offset, total);
+        int size = dynamicsPageSize(limit);
+        List<RunningDynamics> page = rows.subList(from, Math.min(from + size, total));
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "OK");
+        result.put("scope", "range");
+        result.put("range", range.text());
+        result.put("totalRuns", runs.size());
+        result.put("coverage", dynamicsCoverage(runs.size(), summary));
+        result.put("summary", dynamicsSummary(summary));
+        result.put("metrics", dynamicsMetricHints());
+        if (!"none".equals(group)) {
+            result.put("groupBy", group);
+            result.put("trend", runningDynamics.trend(rows, group));
+        }
+        result.put("total", total);
+        result.put("offset", from);
+        result.put("limit", size);
+        result.put("hasMore", from + page.size() < total);
+        result.put("runs", page.stream().map(this::dynamicsRow).toList());
+
+        List<String> notes = new ArrayList<>();
+        notes.add("统计口径：先算每次跑步的均值，再对这些均值取平均与极值；长跑不会因为 5 秒一个采样点就压过短跑，"
+                + "所以与单次详情里的采样均值可能差 0.1 左右");
+        notes.add("summary 覆盖整个区间，不受 offset/limit 分页影响；total 是 `runs` 列表里的记录数"
+                + "（有跑姿或步幅的那些），totalRuns 是区间内全部跑步数");
+        notes.add("步幅没有直接字段，用「总距离 ÷ 总步数」折算，因此没有跑姿数据但带步数的记录也有步幅");
+        notes.add("触地平衡以左右各 50% 为均衡；华为没公开这个数值对应哪只脚，只看偏离 50 的幅度");
+        if (summary.postureRunCount() == 0) {
+            result.put("message", "区间内没有任何记录带触地时间/垂直振幅/左右平衡（需要连接跑步动态传感器），"
+                    + "只能给出步幅与步频");
+        }
+        result.put("notes", notes);
+        return result;
+    }
+
+    /** 覆盖率：多少条真的带跑姿数据，第一次/最后一次是哪天，以及一句该怎么读的结论。 */
+    private static Map<String, Object> dynamicsCoverage(int totalRuns, DynamicsSummary summary) {
+        Map<String, Object> coverage = new LinkedHashMap<>();
+        coverage.put("runs", totalRuns);
+        coverage.put("dynamicsRuns", summary.postureRunCount());
+        coverage.put("strideRuns", summary.strideRunCount());
+        coverage.put("dynamicsPercent", totalRuns == 0
+                ? null
+                : PaceFormat.round(summary.postureRunCount() * 100d / totalRuns, 1));
+        coverage.put("hint", dynamicsCoverageHint(totalRuns, summary.postureRunCount(), summary.strideRunCount()));
+        return coverage;
+    }
+
+    private static String dynamicsCoverageHint(int totalRuns, int postureRuns, int strideRuns) {
+        if (totalRuns == 0) {
+            return "区间内没有跑步记录。";
+        }
+        if (postureRuns == 0) {
+            return "区间内 " + totalRuns + " 次跑步都没有跑姿数据：触地时间/垂直振幅/左右平衡需要连接跑步动态传感器"
+                    + "并在运动时开启跑姿采集，没戴就是没有，不代表跑姿变差。步幅依赖步数，"
+                    + (strideRuns > 0 ? "仍有 " + strideRuns + " 次可算。" : "同样没有。");
+        }
+        if (postureRuns == totalRuns) {
+            return "区间内 " + totalRuns + " 次跑步全部带跑姿数据，可以直接看均值与趋势。";
+        }
+        return "区间内 " + totalRuns + " 次跑步有 " + postureRuns + " 次带跑姿数据（"
+                + PaceFormat.round(postureRuns * 100d / totalRuns, 1) + "%），其余记录只有步幅与步频；"
+                + "比较前后期跑姿时先确认两边都戴了传感器。";
+    }
+
+    /** 一项指标的分布转成 JSON，count 为 0 时返回 null（不返回 0 值冒充「没有偏差」）。 */
+    private static Map<String, Object> statMap(DynamicsSummary.MetricStat stat) {
+        if (stat == null || stat.count() == 0) {
+            return null;
+        }
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("count", stat.count());
+        map.put("average", stat.average());
+        map.put("min", stat.min());
+        map.put("max", stat.max());
+        return map;
+    }
+
+    private static Map<String, Object> dynamicsSummary(DynamicsSummary summary) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("runCount", summary.runCount());
+        map.put("postureRunCount", summary.postureRunCount());
+        map.put("strideRunCount", summary.strideRunCount());
+        putIfNotNull(map, "groundContactTimeMs", statMap(summary.groundContactTimeMs()));
+        putIfNotNull(map, "verticalOscillationCm", statMap(summary.verticalOscillationCm()));
+        putIfNotNull(map, "groundBalancePercent", statMap(summary.groundBalancePercent()));
+        putIfNotNull(map, "strideLengthMeters", statMap(summary.strideLengthMeters()));
+        putIfNotNull(map, "cadenceSpm", statMap(summary.cadenceSpm()));
+        return map;
+    }
+
+    /** 单次记录的字段摊平：缺的字段不占位，不用 0 冒充。 */
+    private Map<String, Object> dynamicsRow(RunningDynamics row) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("runId", row.runId());
+        map.put("date", row.date());
+        map.put("distanceKm", row.distanceKm());
+        map.put("paceSecondsPerKm", row.paceSecondsPerKm());
+        map.put("paceText", row.paceText());
+        putIfNotNull(map, "cadenceSpm", row.cadenceSpm());
+        putIfNotNull(map, "strideLengthMeters", row.strideLengthMeters());
+        putIfNotNull(map, "groundContactTimeMs", row.groundContactTimeMs());
+        putIfNotNull(map, "verticalOscillationCm", row.verticalOscillationCm());
+        putIfNotNull(map, "groundBalancePercent", row.groundBalancePercent());
+        if (row.sampleCount() > 0) {
+            map.put("sampleCount", row.sampleCount());
+        }
+        return map;
+    }
+
+    /** 前后半程对比：两条分段 + 差值（后半程 − 前半程，正数表示后半程更大）。 */
+    private static Map<String, Object> dynamicsHalves(RunningDynamicsDetail detail) {
+        DynamicsSegment first = detail.firstHalf();
+        DynamicsSegment second = detail.secondHalf();
+        if (first == null || second == null) {
+            return Map.of();
+        }
+        Map<String, Object> halve = new LinkedHashMap<>();
+        halve.put("first", first);
+        halve.put("second", second);
+        Map<String, Object> delta = new LinkedHashMap<>();
+        putDelta(delta, "paceSecondsPerKm", first.paceSecondsPerKm(), second.paceSecondsPerKm());
+        putDelta(delta, "groundContactTimeMs", first.groundContactTimeMs(), second.groundContactTimeMs());
+        putDelta(delta, "verticalOscillationCm",
+                first.verticalOscillationCm(), second.verticalOscillationCm());
+        putDelta(delta, "groundBalancePercent", first.groundBalancePercent(), second.groundBalancePercent());
+        putDelta(delta, "strideLengthMeters", first.strideLengthMeters(), second.strideLengthMeters());
+        putDelta(delta, "cadenceSpm", toDouble(first.cadenceSpm()), toDouble(second.cadenceSpm()));
+        halve.put("delta", delta);
+        return halve;
+    }
+
+    private static void putDelta(Map<String, Object> target, String key, Double first, Double second) {
+        if (first == null || second == null) {
+            return;
+        }
+        target.put(key, PaceFormat.round(second - first, 2));
+    }
+
+    private static Double toDouble(Integer value) {
+        return value == null ? null : value.doubleValue();
+    }
+
+    /** 跑姿指标的读法：单位、方向与常见范围。数值本身不判断「好/坏」，由读的人结合配速看。 */
+    private static Map<String, Object> dynamicsMetricHints() {
+        Map<String, Object> hints = new LinkedHashMap<>();
+        hints.put("groundContactTimeMs",
+                dynamicsHint("ms", "lower", "脚着地到离地的时间；配速相近时越短，跑步经济性越好。业余跑者常见 200~300 ms"));
+        hints.put("verticalOscillationCm",
+                dynamicsHint("cm", "lower", "跑步时身体上下起伏的幅度；越大越费能量，常见 6~12 cm"));
+        hints.put("groundBalancePercent",
+                dynamicsHint("%", "balanced", "左右脚触地时间占比，50 表示左右均衡；偏差超过 2 个百分点才值得留意"));
+        hints.put("strideLengthMeters",
+                dynamicsHint("m", "context", "步幅 = 距离 ÷ 步数；配速相近时步幅变大通常意味着步频偏低"));
+        hints.put("cadenceSpm",
+                dynamicsHint("步/分", "context", "步频；常见 160~190 步/分，与步幅互为倒数关系"));
+        return hints;
+    }
+
+    private static Map<String, Object> dynamicsHint(String unit, String betterWhen, String meaning) {
+        Map<String, Object> hint = new LinkedHashMap<>();
+        hint.put("unit", unit);
+        hint.put("betterWhen", betterWhen);
+        hint.put("meaning", meaning);
+        return hint;
+    }
+
+    /** {@code groupBy} 归一化：不传按 month；认不出返回 null，交给调用方报 INVALID_ARGUMENT。 */
+    private static String normalizeDynamicsGroup(String groupBy) {
+        if (groupBy == null || groupBy.isBlank()) {
+            return "month";
+        }
+        String key = groupBy.trim().toLowerCase(Locale.ROOT);
+        return DYNAMICS_GROUP_VALUES.contains(key) ? key : null;
+    }
+
+    /** 跑姿列表的分页大小：非正数按默认值，超出上限按上限（与其它列表工具一致）。 */
+    private static int dynamicsPageSize(Integer limit) {
+        if (limit == null || limit <= 0) {
+            return DYNAMICS_ROW_DEFAULT;
+        }
+        return Math.min(limit, DYNAMICS_ROW_MAX);
+    }
+
+    private static void putIfNotNull(Map<String, Object> target, String key, Object value) {
+        if (value != null) {
+            target.put(key, value);
+        }
     }
 
     /** 流目录：按类型聚合行数、数值范围与首行样例，先看清有什么再决定取哪个。 */

@@ -23,10 +23,12 @@ public final class HuaweiStreamTypes {
     private static final Map<String, Kind> KINDS = new LinkedHashMap<>();
 
     static {
-        KINDS.put("rs", new Kind("每 5 秒一次的速度采样，k 是轨迹点序号而不是时间",
+        KINDS.put("rs", new Kind("每 5 秒一次的速度采样；k 是相对起跑的秒数（不是轨迹点序号：轨迹点每 2 秒一个，"
+                + "序号只到总时长的一半，而 190 次记录里 max(k)/总时长都在 0.987~1.0）",
                 "v 的单位约 0.1 m/s（×0.36 得 km/h，实测与活动平均速度吻合）", null));
-        KINDS.put("rp", new Kind("跑姿采样：触地时间 gct(ms)、垂直振幅 vo(cm)、左右平衡 gtb(%)、"
-                + "腾空时间与摆臂等；-1 / -101 表示该机型未采集", "混合，见字段名后缀", null));
+        KINDS.put("rp", new Kind("跑姿采样（每 5 秒一个）：触地时间 gct(ms)、垂直振幅 vo(cm)、左右平衡 gtb(%)，"
+                + "k 与 rs 一样是相对起跑的秒数；其余字段实测恒为 -1 / -101（该机型未采集）",
+                "混合，见字段名后缀", null));
         KINDS.put("pad", new Kind("语义未确认：按毫秒时间戳采样，v 在 0~38 之间", "未确认", null));
         KINDS.put("pm2", new Kind("华为官方单公里配速：d 是段终点距离(米)、n 是终点轨迹点序号、"
                 + "p 是该段配速(秒/公里)", "秒/公里", "p-m"));

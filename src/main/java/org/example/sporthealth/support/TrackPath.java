@@ -35,9 +35,10 @@ public final class TrackPath {
      * @param latitude       纬度，缺坐标时为 null
      * @param longitude      经度，缺坐标时为 null
      * @param altitudeMeters 海拔（米），缺失时为 null
+     * @param cadence        该时刻步频（步/分），缺失时为 null（TCX 来源没有这个字段）
      */
     public record Node(double distanceMeters, double seconds,
-                       Double latitude, Double longitude, Double altitudeMeters) {
+                       Double latitude, Double longitude, Double altitudeMeters, Integer cadence) {
     }
 
     private final List<Node> nodes;
@@ -81,7 +82,8 @@ public final class TrackPath {
             double seconds = Math.max(0d, Duration.between(origin, point.timestamp()).toMillis() / 1000d);
 
             if (!point.hasPosition()) {
-                nodes.add(new Node(distanceMeters, seconds, null, null, point.altitudeMeters()));
+                nodes.add(new Node(distanceMeters, seconds, null, null,
+                        point.altitudeMeters(), point.cadence()));
                 continue;
             }
 
@@ -91,7 +93,7 @@ public final class TrackPath {
                         point.latitude(), point.longitude());
             }
             Node node = new Node(distanceMeters, seconds,
-                    point.latitude(), point.longitude(), point.altitudeMeters());
+                    point.latitude(), point.longitude(), point.altitudeMeters(), point.cadence());
             nodes.add(node);
 
             // 同一坐标重复出现时距离不增长，插值轴只保留最后一个点（时间/海拔更新）。
@@ -152,6 +154,67 @@ public final class TrackPath {
     }
 
     /**
+     * 时间（秒）对应的累计距离（米）。{@link #timeAtDistance} 的反函数，越界自动夹取到首尾。
+     *
+     * <p>跑姿流（{@code rp}）的 {@code k} 是相对起跑的秒数而不是轨迹点序号，要靠这个把每个
+     * 采样点落到距离轴上，才能按公里切开。缺坐标的点距离不增长，插值时按秒数比例取前后两点。
+     */
+    public double distanceAtTime(double seconds) {
+        if (nodes.isEmpty()) {
+            return 0d;
+        }
+        if (seconds <= nodes.get(0).seconds()) {
+            return nodes.get(0).distanceMeters();
+        }
+        Node last = nodes.get(nodes.size() - 1);
+        if (seconds >= last.seconds()) {
+            return last.distanceMeters();
+        }
+        int index = lastIndexAtOrBefore(seconds);
+        Node from = nodes.get(index);
+        Node to = nodes.get(index + 1);
+        double span = to.seconds() - from.seconds();
+        if (span <= EPSILON) {
+            return to.distanceMeters();
+        }
+        return interpolate(from.distanceMeters(), to.distanceMeters(),
+                (seconds - from.seconds()) / span);
+    }
+
+    /**
+     * {@code [fromMeters, toMeters]} 区间内的平均步频（步/分），按每个采样点覆盖的时长加权；
+     * 没有步频数据时返回 {@code null}。
+     *
+     * <p>用时间加权而不是算术平均：采样间隔不均匀时（GPS 丢点、停顿），算术平均会让
+     * 密集段（通常是停顿附近）的权重虚高。
+     */
+    public Integer averageCadenceBetween(double fromMeters, double toMeters) {
+        double start = Math.clamp(fromMeters, 0d, totalDistanceMeters);
+        double end = Math.clamp(toMeters, start, totalDistanceMeters);
+        double weighted = 0d;
+        double weightSeconds = 0d;
+        for (int i = 0; i < nodes.size(); i++) {
+            Node node = nodes.get(i);
+            if (node.cadence() == null || node.cadence() <= 0) {
+                continue;
+            }
+            if (node.distanceMeters() < start - EPSILON || node.distanceMeters() > end + EPSILON) {
+                continue;
+            }
+            double weight = 1d;
+            if (i + 1 < nodes.size()) {
+                double next = nodes.get(i + 1).seconds() - node.seconds();
+                if (next > EPSILON) {
+                    weight = next;
+                }
+            }
+            weighted += node.cadence() * weight;
+            weightSeconds += weight;
+        }
+        return weightSeconds <= 0d ? null : (int) Math.round(weighted / weightSeconds);
+    }
+
+    /**
      * 累计距离对应的海拔（米）。两侧都有值时线性插值，只有一侧时取该侧，完全没有时返回 null。
      */
     public Double altitudeAtDistance(double distanceMeters) {
@@ -202,8 +265,22 @@ public final class TrackPath {
         return altitudes;
     }
 
-    private int floorIndex(double distanceMeters) {
+    /** 最后一个 {@code seconds} 不超过给定值的点；时间轴单调不减，可直接二分。 */
+    private int lastIndexAtOrBefore(double seconds) {
         int low = 0;
+        int high = nodes.size() - 1;
+        while (low < high) {
+            int mid = (low + high + 1) >>> 1;
+            if (nodes.get(mid).seconds() <= seconds) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        return Math.min(low, nodes.size() - 2);
+    }
+
+    private int floorIndex(double distanceMeters) {        int low = 0;
         int high = distanceNodes.size() - 1;
         while (low < high) {
             int mid = (low + high + 1) >>> 1;

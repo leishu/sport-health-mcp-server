@@ -261,6 +261,20 @@ public final class HuaweiSummaryData {
     }
 
     /**
+     * 只取跑姿汇总（触地时间、垂直振幅、左右平衡、腾空时间等），供跑姿分析批量调用。
+     *
+     * <p>{@link #decode} 会把整段原文都摊开（配速 map、心率区间、训练效果……），
+     * 一次分析几十条记录时没必要；没有采集跑姿的记录返回空 Map。
+     */
+    public static Map<String, Object> posture(String summaryData) {
+        Map<String, Object> raw = parse(summaryData);
+        if (raw.isEmpty()) {
+            return Map.of();
+        }
+        return posture(raw, map(raw.get("mExtendTrackDataMap")));
+    }
+
+    /**
      * 跑姿汇总。{@code -1} / {@code -101} 是「该机型或该次运动没采集」的占位，
      * 一律转成缺省，避免把 -101 毫米当成数据读。
      */
