@@ -1,6 +1,7 @@
 package org.example.sporthealth.repository;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayOutputStream;
@@ -18,6 +19,7 @@ import org.apache.poi.ss.usermodel.Sheet;
 
 import org.example.sporthealth.config.HealthDataProperties;
 import org.example.sporthealth.config.WeatherProperties;
+import org.example.sporthealth.domain.RunActivity;
 import org.example.sporthealth.domain.RunDataset;
 import org.example.sporthealth.domain.TrackPoint;
 import org.example.sporthealth.importer.SourceFileScanner;
@@ -131,6 +133,51 @@ class HuaweiExportImporterTest {
         assertEquals(128, points.get(0).heartRate());
         assertEquals(180, points.get(0).cadence());
         assertTrue(points.get(0).latitude() < 39.905708, "落库坐标应为 WGS-84");
+    }
+
+    /** 心率、步频、步数、热量、运动类型码要从库里一路带到 {@link RunActivity}，而不是只躺在表中。 */
+    @Test
+    void activityCarriesHuaweiMetrics() {
+        RunActivity run = repository().dataset().activities().stream()
+                .filter(activity -> activity.id().endsWith("-101"))
+                .findFirst()
+                .orElseThrow();
+
+        assertEquals(130, run.avgHeartRate().intValue());
+        assertEquals(152, run.maxHeartRate().intValue());
+        assertEquals(101, run.minHeartRate().intValue(), "JSON 里有 minHeartRate");
+        assertEquals(181, run.avgCadence().intValue(), "summaryData.avgStepRate 是步频");
+        assertEquals(7300, run.totalSteps().intValue());
+        assertEquals(516.0, run.totalCaloriesKcal(), 0.001, "cal 落库时除以 1000");
+        assertEquals(258, run.sportTypeCode().intValue());
+        assertEquals(4, run.subType().intValue());
+        assertTrue(run.summaryData().contains("\"bestPace\":338.5"), run.summaryData());
+    }
+
+    /** TCX 来源的记录没有这些字段，保持 null 而不是 0，避免“心率 0”这种假数据。 */
+    @Test
+    void tcxActivityHasNoHuaweiMetrics() {
+        // 只留 TCX：把华为导出的目录整个挪走再同步
+        Path huaweiDir = dataDir.resolve("HUAWEI_HEALTH");
+        try {
+            Files.move(huaweiDir, tempDir.resolve("HUAWEI_HEALTH.moved"));
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
+
+        RunActivity run = repository().dataset().activities().get(0);
+
+        assertEquals("20261025户外跑步", run.id(), "少了 JSON，TCX 那条重新由自己占位");
+        assertNull(run.avgHeartRate());
+        assertNull(run.maxHeartRate());
+        assertNull(run.minHeartRate());
+        assertNull(run.avgCadence());
+        assertNull(run.totalSteps());
+        assertNull(run.totalCaloriesKcal());
+        assertNull(run.recordId());
+        assertNull(run.sportTypeCode());
+        assertNull(run.subType());
+        assertNull(run.summaryData());
     }
 
     @Test

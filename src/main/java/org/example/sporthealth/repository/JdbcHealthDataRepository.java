@@ -43,7 +43,9 @@ public class JdbcHealthDataRepository implements HealthDataRepository {
                    duration_seconds, distance_meters, climb_meters, descent_meters,
                    route_type, route_type_text, track_point_count, avg_speed_kmh, avg_pace_seconds,
                    start_latitude, start_longitude, end_latitude, end_longitude,
-                   min_altitude_meters, max_altitude_meters, source_file, creator
+                   min_altitude_meters, max_altitude_meters, source_file, creator,
+                   avg_heart_rate, max_heart_rate, min_heart_rate, avg_cadence,
+                   total_steps, total_calories_kcal, record_id, sport_type_code, sub_type, summary_data
             FROM run_activity
             WHERE sport_family = 'RUN'
             ORDER BY start_time DESC
@@ -80,7 +82,17 @@ public class JdbcHealthDataRepository implements HealthDataRepository {
             RunRows.real(rs, "min_altitude_meters"),
             RunRows.real(rs, "max_altitude_meters"),
             rs.getString("source_file"),
-            rs.getString("creator"));
+            rs.getString("creator"),
+            RunRows.integer(rs, "avg_heart_rate"),
+            RunRows.integer(rs, "max_heart_rate"),
+            RunRows.integer(rs, "min_heart_rate"),
+            RunRows.integer(rs, "avg_cadence"),
+            RunRows.integer(rs, "total_steps"),
+            RunRows.real(rs, "total_calories_kcal"),
+            rs.getString("record_id"),
+            RunRows.integer(rs, "sport_type_code"),
+            RunRows.integer(rs, "sub_type"),
+            rs.getString("summary_data"));
 
     private static final RowMapper<TrackRow> TRACK_MAPPER = (rs, rowNum) -> new TrackRow(
             rs.getInt("seq"),
@@ -164,6 +176,16 @@ public class JdbcHealthDataRepository implements HealthDataRepository {
     /** 华为数据的规模（运动、健康指标、分钟活动），供 {@code describe_data_source} 展示。 */
     public HuaweiExportImporter.StorageStats healthStats() {
         return importer.huaweiStats();
+    }
+
+    /**
+     * 库里全部运动记录数（含步行等非跑步项目），与只含 {@code sport_family='RUN'} 的跑步条数并列展示。
+     *
+     * <p>不能用华为导出的运动数顶替：TCX 独有、没被 JSON 接管的记录不在那个统计里。
+     */
+    public int workoutCount() {
+        current();
+        return jdbc.sql("SELECT COUNT(*) FROM run_activity").query(Integer.class).optional().orElse(0);
     }
 
     private Snapshot current() {

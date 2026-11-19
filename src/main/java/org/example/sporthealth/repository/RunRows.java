@@ -59,7 +59,17 @@ public class RunRows {
             Double minAltitudeMeters,
             Double maxAltitudeMeters,
             String sourceFile,
-            String creator) {
+            String creator,
+            Integer avgHeartRate,
+            Integer maxHeartRate,
+            Integer minHeartRate,
+            Integer avgCadence,
+            Integer totalSteps,
+            Double totalCaloriesKcal,
+            String recordId,
+            Integer sportTypeCode,
+            Integer subType,
+            String summaryData) {
     }
 
     /** 本次同步的统计，用于日志与 {@code reload_data} 的可观测输出。 */
@@ -101,7 +111,17 @@ public class RunRows {
                 row.minAltitudeMeters(),
                 row.maxAltitudeMeters(),
                 row.sourceFile(),
-                row.creator());
+                row.creator(),
+                row.avgHeartRate(),
+                row.maxHeartRate(),
+                row.minHeartRate(),
+                row.avgCadence(),
+                row.totalSteps(),
+                row.totalCaloriesKcal(),
+                row.recordId(),
+                row.sportTypeCode(),
+                row.subType(),
+                row.summaryData());
     }
 
     static String text(LocalDate value) {

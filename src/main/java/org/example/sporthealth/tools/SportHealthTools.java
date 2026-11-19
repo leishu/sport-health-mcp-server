@@ -112,6 +112,8 @@ public class SportHealthTools {
     /** 区间内的记录列表，新的在前，支持过滤、排序与分页。 */
     @McpTool(name = "list_runs",
             description = "按日期区间列出跑步记录，返回每次跑步的距离、时长、配速、爬升与轨迹点数。"
+                    + "华为来源的记录还带平均/最高/最低心率、平均步频、步数、热量与华为运动类型码，"
+                    + "TCX 来源的记录这些字段为 null。"
                     + "支持按运动类型、距离、配速、星期过滤，并按距离/时长/配速/爬升排序。"
                     + "不传日期时默认返回数据集中全部记录。用于回答“我最近跑了哪些”“有哪些长距离跑”。")
     public Map<String, Object> listRuns(
@@ -152,8 +154,10 @@ public class SportHealthTools {
     @McpTool(name = "get_run_detail",
             description = "查看某一次跑步的完整详情，包含起止时间、总时长、距离、平均配速、平均速度、累计爬升与下降、"
                     + "海拔范围、起终点坐标，以及这次跑步起跑与结束时刻的天气（气温、体感温度、湿度、降水量、"
-                    + "风向风速、天气现象）；可选按页返回 GPS 轨迹点。runId 先用 list_runs 获取。"
-                    + "用于回答“这次跑步的天气怎么样”“那天多少度”。")
+                    + "风向风速、天气现象）；华为来源的记录还带平均/最高/最低心率、平均步频、步数、热量、"
+                    + "华为运动类型码与 summaryData 原文（JSON，未建模字段可直接读）。"
+                    + "可选按页返回 GPS 轨迹点。runId 先用 list_runs 获取。"
+                    + "用于回答“这次跑步的天气怎么样”“那天多少度”“这次心率多少”。")
     public Map<String, Object> getRunDetail(
             @McpToolParam(description = "跑步记录 id，例如 20261025户外跑步") String runId,
             @McpToolParam(description = "是否返回轨迹点，默认 false", required = false) Boolean includeTrack,
@@ -185,16 +189,30 @@ public class SportHealthTools {
         return result;
     }
 
-    /** 只取轨迹点，适合分析路线或绘制地图；轨迹按需解析后缓存。 */
+    /**
+     * 只取轨迹点，适合分析路线或绘制地图；轨迹按需解析后缓存。
+     *
+     * <p>逐点心率、步频、累计距离来自华为导出（TCX 没有这些字段，恒为 {@code null}）。默认返回，
+     * 用来回答「这段上坡心率多少」「后半程步频掉没掉」；只画地图时可以传 {@code includeSensors=false}
+     * 退回纯位置数据以缩小返回体积。
+     *
+     * <p>GeoJSON 的坐标只能是数字，传感器数据放在顶级 {@code sensors} 块里，是与
+     * {@code geometry.coordinates} 等长、同序的平行数组（无坐标的点会被过滤，两个数组始终对齐）。
+     */
     @McpTool(name = "get_run_route",
-            description = "分页读取某次跑步的 GPS 轨迹点（时间、纬度、经度、海拔），用于分析路线、配速变化或绘制轨迹。"
-                    + "支持 format=geojson 直接返回 LineString，或用 maxPoints 降采样控制返回体积，避免一次拉取上千个点。")
+            description = "分页读取某次跑步的 GPS 轨迹点：时间、纬度、经度、海拔，以及逐点心率 heartRate、"
+                    + "步频 cadence、累计距离 distanceMeters（后三者仅华为来源的记录有，TCX 来源为 null）。"
+                    + "用于分析路线、配速变化、坡段心率或后半程步频漂移，也可绘制轨迹。"
+                    + "支持 format=geojson 直接返回 LineString（传感器放在与坐标等长的 sensors 平行数组里），"
+                    + "或用 maxPoints 降采样控制返回体积，避免一次拉取上千个点；只画地图时可传 includeSensors=false 缩小体积。")
     public Map<String, Object> getRunRoute(
             @McpToolParam(description = "跑步记录 id") String runId,
             @McpToolParam(description = "分页偏移，默认 0；使用 maxPoints 时忽略", required = false) Integer offset,
             @McpToolParam(description = "返回条数，默认 200，最多 5000；使用 maxPoints 时忽略", required = false) Integer limit,
             @McpToolParam(description = "返回格式：points（默认）或 geojson", required = false) String format,
-            @McpToolParam(description = "降采样到最多多少个点；设置后忽略 offset/limit", required = false) Integer maxPoints) {
+            @McpToolParam(description = "降采样到最多多少个点；设置后忽略 offset/limit", required = false) Integer maxPoints,
+            @McpToolParam(description = "是否返回逐点心率/步频/累计距离，默认 true；只要位置数据时传 false",
+                    required = false) Boolean includeSensors) {
         RunLookup lookup = analytics.lookup(runId);
         if (lookup.isAmbiguous()) {
             return ambiguous(runId, lookup);
@@ -207,11 +225,13 @@ public class SportHealthTools {
         if (route.isEmpty()) {
             return noGps(run.id(), "没有可用的轨迹点");
         }
+        boolean withSensors = includeSensors == null || includeSensors;
 
         if ("geojson".equalsIgnoreCase(format)) {
             List<TrackPoint> sampled = downsample(route, maxPoints);
-            List<List<Double>> coordinates = sampled.stream()
-                    .filter(TrackPoint::hasPosition)
+            // 先过滤再映射，保证 sensors 的平行数组与 coordinates 一一对齐
+            List<TrackPoint> located = sampled.stream().filter(TrackPoint::hasPosition).toList();
+            List<List<Double>> coordinates = located.stream()
                     .map(point -> {
                         List<Double> coordinate = new ArrayList<>(3);
                         coordinate.add(point.longitude());
@@ -230,6 +250,9 @@ public class SportHealthTools {
             result.put("runId", run.id());
             result.put("date", run.date());
             result.put("pointCount", coordinates.size());
+            if (withSensors) {
+                result.put("sensors", sensorSeries(located));
+            }
             result.put("geometry", geometry);
             return result;
         }
@@ -245,7 +268,7 @@ public class SportHealthTools {
         result.put("status", "OK");
         result.put("runId", run.id());
         result.put("date", run.date());
-        result.putAll(toRoutePage(page));
+        result.putAll(toRoutePage(page, withSensors));
         return result;
     }
 
@@ -858,24 +881,41 @@ public class SportHealthTools {
         return result;
     }
 
-    /** 数据源自检入口：文件、条数、日期范围、来源、RouteType、解析告警与数据质量。 */
+    /**
+     * 数据源自检入口：文件、条数、日期范围、来源、RouteType、解析告警与数据质量。
+     *
+     * <p>两个计数口径必须分开看：{@code runningCount} 只含 {@code sport_family='RUN'}（跑步分析的对象），
+     * {@code allWorkoutCount} 是库里全部运动记录（含步行等其它项目）。同理
+     * {@code runSourceFileCount} 是跑步记录的来源文件去重数，与 {@code storage.scannedTcxFiles}
+     * （本次扫描的 TCX 文件数）、{@code storage.health.scannedHuaweiFiles}（本次扫描的华为导出文件数）
+     * 都不是一回事。
+     */
     @McpTool(name = "describe_data_source",
-            description = "查看当前数据源状态：数据目录、已加载的 TCX 文件、跑步记录总数、覆盖日期范围、"
-                    + "累计距离、解析告警分类以及数据质量检查（0 距离、缺配速/坐标/海拔、重复 Activity Id、"
-                    + "配速离群、重复时间戳）。数据看起来不对时先调用它排查；重复时间戳需要解析全部轨迹，首次调用稍慢。")
+            description = "查看当前数据源状态：数据目录；跑步记录数 runningCount（只含 RUN）与全部运动记录数 "
+                    + "allWorkoutCount（含步行等其它项目）；跑步记录的来源文件 runSourceFiles / "
+                    + "runSourceFileCount（去重后的文件名，不等于磁盘上的文件数——TCX 与华为导出 JSON/xls/xlsx "
+                    + "的实际扫描数见 storage）；覆盖日期范围、累计距离、解析告警分类以及数据质量检查"
+                    + "（0 距离、缺配速/坐标/海拔、重复 Activity Id、配速离群、重复时间戳；"
+                    + "全部为空且无告警时 quality.clean 为 true）。"
+                    + "数据看起来不对时先调用它排查；重复时间戳需要解析全部轨迹，首次调用稍慢。")
     public Map<String, Object> describeDataSource() {
         RunDataset dataset = repository.dataset();
         List<RunActivity> activities = dataset.activities();
+        Map<String, Object> storage = storageInfo(healthInfo());
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "OK");
         result.put("dataDir", dataset.dataDir());
         result.put("zoneId", properties.zoneId());
         result.put("loadedAt", formatDateTime(dataset.loadedAt()));
-        result.put("fileCount", dataset.sourceFiles().size());
-        result.put("runCount", dataset.runCount());
-        result.put("files", dataset.sourceFiles());
+        result.put("runningCount", dataset.runCount());
+        Integer allWorkouts = allWorkoutCount();
+        if (allWorkouts != null) {
+            result.put("allWorkoutCount", allWorkouts);
+        }
+        result.put("runSourceFileCount", dataset.sourceFiles().size());
+        result.put("runSourceFiles", dataset.sourceFiles());
         result.put("warnings", dataset.warnings());
-        result.put("storage", storageInfo());
+        result.put("storage", storage);
 
         if (!activities.isEmpty()) {
             result.put("firstDate", activities.stream().map(RunActivity::date).min(java.util.Comparator.naturalOrder()).orElse(null));
@@ -892,21 +932,36 @@ public class SportHealthTools {
         return result;
     }
 
-    /** 重新扫描并增量同步，旧轨迹缓存随之丢弃。 */
+    /** 重新扫描并增量同步 TCX 与华为导出（JSON/xls/xlsx），随后触发天气回填；旧轨迹缓存随之丢弃。 */
     @McpTool(name = "reload_data",
-            description = "重新扫描数据目录，把新增或内容变化的 TCX 文件增量同步进 SQLite，无需重启服务。"
-                    + "未变化的文件按 size/mtime/sha256 跳过，不会重复解析；源文件已删除的历史记录会保留。")
+            description = "重新扫描数据目录，把新增或内容变化的 TCX 与华为导出文件（JSON/xls/xlsx）增量同步进 "
+                    + "SQLite，并在写完后触发一轮天气回填，无需重启服务。未变化的文件按 size/mtime/sha256 跳过，"
+                    + "不会重复解析；源文件已删除的历史记录会保留。")
     public Map<String, Object> reloadData() {
         repository.reload();
         RunDataset dataset = repository.dataset();
         Map<String, Object> result = new LinkedHashMap<>();
+        StringBuilder message = new StringBuilder("已增量同步：跑步 ").append(dataset.runCount()).append(" 条");
         result.put("status", "OK");
-        result.put("message", "已同步 " + dataset.runCount() + " 条跑步记录，来源文件 "
-                + dataset.sourceFiles().size() + " 个");
-        result.put("runCount", dataset.runCount());
+        result.put("runningCount", dataset.runCount());
+        Integer allWorkouts = allWorkoutCount();
+        if (allWorkouts != null) {
+            result.put("allWorkoutCount", allWorkouts);
+            message.append("、全部运动 ").append(allWorkouts).append(" 条");
+        }
+        message.append("；已触发天气回填，扫描与变更明细见 storage");
+        result.put("message", message.toString());
         result.put("warnings", dataset.warnings());
-        result.put("storage", storageInfo());
+        result.put("storage", storageInfo(healthInfo()));
         return result;
+    }
+
+    /** 库里全部运动记录数（含步行等非跑步项目）；仓储不是 JDBC 版时返回 {@code null}。 */
+    private Integer allWorkoutCount() {
+        if (repository instanceof JdbcHealthDataRepository jdbcRepository) {
+            return jdbcRepository.workoutCount();
+        }
+        return null;
     }
 
     /**
@@ -914,8 +969,10 @@ public class SportHealthTools {
      *
      * <p>只在仓储实现为 JDBC 版时给出明细，其它实现（含测试中的内存实现）返回 {@code null}，
      * 保证工具层不依赖具体仓储类型。
+     *
+     * @param health 华为导出的规模，由调用方预先取好（见 {@link #healthInfo()}）；{@code null} 时不加该块
      */
-    private Map<String, Object> storageInfo() {
+    private Map<String, Object> storageInfo(Map<String, Object> health) {
         if (!(repository instanceof JdbcHealthDataRepository jdbcRepository)) {
             return null;
         }
@@ -923,34 +980,44 @@ public class SportHealthTools {
         Map<String, Object> storage = new LinkedHashMap<>();
         storage.put("type", "sqlite");
         storage.put("dbPath", properties.dbPath());
-        storage.put("scannedFiles", sync.scanned());
-        storage.put("importedFiles", sync.imported());
-        storage.put("unchangedFiles", sync.unchanged());
+        // 明确口径：这三个数只统计本次扫描到的 TCX 文件，华为导出的是 health 下的 scannedHuaweiFiles 等
+        storage.put("scannedTcxFiles", sync.scanned());
+        storage.put("importedTcxFiles", sync.imported());
+        storage.put("unchangedTcxFiles", sync.unchanged());
         storage.put("syncedAt", formatDateTime(sync.syncedAt()));
         storage.put("missingSourceFiles", sync.missingSourceFiles());
         Map<String, Object> weather = weatherInfo();
         if (weather != null) {
             storage.put("weather", weather);
         }
-        Map<String, Object> health = healthInfo(jdbcRepository);
         if (health != null) {
             storage.put("health", health);
         }
         return storage;
     }
 
+    /** 华为导出的规模；仓储不是 JDBC 版时返回 {@code null}。 */
+    private Map<String, Object> healthInfo() {
+        if (!(repository instanceof JdbcHealthDataRepository jdbcRepository)) {
+            return null;
+        }
+        return healthInfo(jdbcRepository);
+    }
+
     /**
-     * 华为 JSON 导出的规模：运动、健康指标、分钟活动各有多少行。
+     * 华为导出的规模：华为来源的运动（全部 / 跑步 / 其它）、健康指标、分钟活动、Excel 明细各有多少行。
      *
      * <p>这些表不参与跑步分析，但用户需要能确认「全量导出确实进库了」，
-     * 所以挂在存储状态里，而不是单独开一个工具。
+     * 所以挂在存储状态里，而不是单独开一个工具。{@code scannedHuaweiFiles} 等三个计数
+     * 是本次同步扫描到的华为导出文件（JSON / xls / xlsx）数，与 {@code storage.scannedTcxFiles} 不是同一个口径。
      */
     private Map<String, Object> healthInfo(JdbcHealthDataRepository repository) {
         try {
             HuaweiExportImporter.StorageStats stats = repository.healthStats();
             HuaweiExportImporter.Result sync = repository.lastHuaweiSync();
             Map<String, Object> health = new LinkedHashMap<>();
-            health.put("workouts", stats.workouts());
+            // 这三个数是「华为来源」的运动数，与被 JSON 接管的 TCX 记录一起构成顶层的 allWorkoutCount
+            health.put("huaweiWorkouts", stats.workouts());
             health.put("runningWorkouts", stats.runningWorkouts());
             health.put("otherWorkouts", stats.otherWorkouts());
             health.put("healthMetrics", stats.healthMetrics());
@@ -968,9 +1035,9 @@ public class SportHealthTools {
             health.put("trackStreams", stats.trackStreams());
             health.put("firstMetricDate", stats.firstMetricDate());
             health.put("lastMetricDate", stats.lastMetricDate());
-            health.put("scannedFiles", sync.scanned());
-            health.put("importedFiles", sync.imported());
-            health.put("unchangedFiles", sync.unchanged());
+            health.put("scannedHuaweiFiles", sync.scanned());
+            health.put("importedHuaweiFiles", sync.imported());
+            health.put("unchangedHuaweiFiles", sync.unchanged());
             health.put("mergedDuplicateWorkouts", sync.mergedDuplicates());
             return health;
         } catch (RuntimeException e) {
@@ -1034,31 +1101,49 @@ public class SportHealthTools {
         return result;
     }
 
+    /**
+     * 数据质量体检：每一项都是一份 id 列表，空列表代表该项通过。
+     *
+     * <p>{@code clean} 对所有检查项取合取，只要有一项非空就为 false——它是「能不能放心用」的
+     * 单一开关，必须和下面的明细严格一致。之前漏掉了 {@code duplicateActivityIds} 与
+     * {@code missingAltitudeRunIds}，会输出 clean=true 而这两项非空的矛盾结果，
+     * 调用方只信 clean 的话就漏检了。
+     */
     private Map<String, Object> quality(RunDataset dataset) {
         List<RunActivity> activities = dataset.activities();
-        Map<String, Object> quality = new LinkedHashMap<>();
-        quality.put("warningCount", dataset.warnings().size());
-        quality.put("warningCategories", warningCategories(dataset.warnings()));
-        quality.put("zeroDistanceRunIds", ids(activities, run -> run.distanceMeters() <= 0));
-        quality.put("missingPaceRunIds", ids(activities, run -> run.avgPaceSecondsPerKm() == null));
-        quality.put("noGpsRunIds", ids(activities, run -> run.startLatitude() == null));
-        quality.put("missingAltitudeRunIds", ids(activities, run -> run.minAltitudeMeters() == null));
-        Map<String, Long> duplicates = activities.stream()
+        List<String> zeroDistance = ids(activities, run -> run.distanceMeters() <= 0);
+        List<String> missingPace = ids(activities, run -> run.avgPaceSecondsPerKm() == null);
+        List<String> noGps = ids(activities, run -> run.startLatitude() == null);
+        List<String> missingAltitude = ids(activities, run -> run.minAltitudeMeters() == null);
+        Map<String, Long> activityIdCounts = activities.stream()
                 .map(RunActivity::activityId)
                 .filter(Objects::nonNull)
                 .collect(Collectors.groupingBy(id -> id, LinkedHashMap::new, Collectors.counting()));
-        quality.put("duplicateActivityIds", duplicates.entrySet().stream()
+        List<String> duplicateActivityIds = activityIdCounts.entrySet().stream()
                 .filter(entry -> entry.getValue() > 1)
                 .map(Map.Entry::getKey)
-                .toList());
-        quality.put("paceOutliers", paceOutliers(activities));
-        quality.put("duplicateTimestampRunIds", duplicateTimestampRunIds(activities));
+                .toList();
+        List<Map<String, Object>> outliers = paceOutliers(activities);
+        List<String> duplicateTimestamps = duplicateTimestampRunIds(activities);
+
+        Map<String, Object> quality = new LinkedHashMap<>();
+        quality.put("warningCount", dataset.warnings().size());
+        quality.put("warningCategories", warningCategories(dataset.warnings()));
+        quality.put("zeroDistanceRunIds", zeroDistance);
+        quality.put("missingPaceRunIds", missingPace);
+        quality.put("noGpsRunIds", noGps);
+        quality.put("missingAltitudeRunIds", missingAltitude);
+        quality.put("duplicateActivityIds", duplicateActivityIds);
+        quality.put("paceOutliers", outliers);
+        quality.put("duplicateTimestampRunIds", duplicateTimestamps);
         boolean clean = dataset.warnings().isEmpty()
-                && ((List<?>) quality.get("zeroDistanceRunIds")).isEmpty()
-                && ((List<?>) quality.get("missingPaceRunIds")).isEmpty()
-                && ((List<?>) quality.get("noGpsRunIds")).isEmpty()
-                && ((List<?>) quality.get("paceOutliers")).isEmpty()
-                && ((List<?>) quality.get("duplicateTimestampRunIds")).isEmpty();
+                && zeroDistance.isEmpty()
+                && missingPace.isEmpty()
+                && noGps.isEmpty()
+                && missingAltitude.isEmpty()
+                && duplicateActivityIds.isEmpty()
+                && outliers.isEmpty()
+                && duplicateTimestamps.isEmpty();
         quality.put("clean", clean);
         return quality;
     }
@@ -1203,6 +1288,17 @@ public class SportHealthTools {
         row.put("maxAltitudeMeters", run.maxAltitudeMeters());
         row.put("sourceFile", run.sourceFile());
         row.put("creator", run.creator());
+        // 华为导出独有：TCX 来源的记录这里全是 null
+        row.put("avgHeartRate", run.avgHeartRate());
+        row.put("maxHeartRate", run.maxHeartRate());
+        row.put("minHeartRate", run.minHeartRate());
+        row.put("avgCadence", run.avgCadence());
+        row.put("totalSteps", run.totalSteps());
+        row.put("totalCaloriesKcal", run.totalCaloriesKcal());
+        row.put("recordId", run.recordId());
+        row.put("sportTypeCode", run.sportTypeCode());
+        row.put("subType", run.subType());
+        row.put("summaryData", run.summaryData());
         return row;
     }
 
@@ -1238,21 +1334,59 @@ public class SportHealthTools {
         row.put("routeType", run.routeType());
         row.put("routeTypeText", run.routeTypeText());
         row.put("trackPointCount", run.trackPointCount());
+        // 华为导出独有：TCX 来源的记录这里全是 null。summaryData 约 2.5 KB，只放在详情里
+        row.put("avgHeartRate", run.avgHeartRate());
+        row.put("maxHeartRate", run.maxHeartRate());
+        row.put("minHeartRate", run.minHeartRate());
+        row.put("avgCadence", run.avgCadence());
+        row.put("totalSteps", run.totalSteps());
+        row.put("totalCaloriesKcal", run.totalCaloriesKcal());
+        row.put("recordId", run.recordId());
+        row.put("sportTypeCode", run.sportTypeCode());
+        row.put("subType", run.subType());
         return row;
     }
 
     private Map<String, Object> toRoutePage(Page<TrackPoint> page) {
+        return toRoutePage(page, true);
+    }
+
+    private Map<String, Object> toRoutePage(Page<TrackPoint> page, boolean includeSensors) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("total", page.total());
         result.put("offset", page.offset());
         result.put("limit", page.limit());
         result.put("hasMore", page.hasMore());
-        result.put("points", page.items().stream().map(this::toRoutePoint).toList());
+        result.put("points", page.items().stream().map(point -> toRoutePoint(point, includeSensors)).toList());
         return result;
     }
 
-    /** 轨迹点的对外结构：海拔按米保留 2 位小数，压掉导出文件里的浮点噪声；经纬度保持原精度。 */
-    private Map<String, Object> toRoutePoint(TrackPoint point) {
+    /**
+     * GeoJSON 的传感器数据：与坐标等长、同序的平行数组。
+     *
+     * <p>{@code alignedWith} 是给消费方的显式提示——LineString 的坐标里塞不下第四个维度，
+     * 只能靠下标对应，说清楚比让人猜更省事。
+     */
+    private Map<String, Object> sensorSeries(List<TrackPoint> points) {
+        Map<String, Object> sensors = new LinkedHashMap<>();
+        sensors.put("alignedWith", "geometry.coordinates");
+        sensors.put("heartRate", points.stream().map(TrackPoint::heartRate).toList());
+        sensors.put("cadence", points.stream().map(TrackPoint::cadence).toList());
+        sensors.put("distanceMeters", points.stream()
+                .map(point -> point.distanceMeters() == null
+                        ? null
+                        : PaceFormat.round(point.distanceMeters(), 2))
+                .toList());
+        return sensors;
+    }
+
+    /**
+     * 轨迹点的对外结构：海拔与累计距离按米保留 2 位小数，压掉导出文件里的浮点噪声；经纬度保持原精度。
+     *
+     * <p>心率/步频/累计距离恒为键存在的形式（无数据给 {@code null}），这样消费方不用先判断键在不在；
+     * {@code includeSensors=false} 时才整体省略这三个键。
+     */
+    private Map<String, Object> toRoutePoint(TrackPoint point, boolean includeSensors) {
         Map<String, Object> row = new LinkedHashMap<>();
         row.put("timestamp", formatDateTime(point.timestamp()));
         row.put("latitude", point.latitude());
@@ -1260,6 +1394,13 @@ public class SportHealthTools {
         row.put("altitudeMeters", point.altitudeMeters() == null
                 ? null
                 : PaceFormat.round(point.altitudeMeters(), 2));
+        if (includeSensors) {
+            row.put("heartRate", point.heartRate());
+            row.put("cadence", point.cadence());
+            row.put("distanceMeters", point.distanceMeters() == null
+                    ? null
+                    : PaceFormat.round(point.distanceMeters(), 2));
+        }
         return row;
     }
 

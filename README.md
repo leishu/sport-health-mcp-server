@@ -141,7 +141,7 @@ SQLite 结构已从版本 0 升级到 1
   - 缺经纬度的轨迹点仍保留（时间和海拔有用），坐标输出 `null`。
 - **容错**：单个文件解析失败只记入 `warnings` 并跳过，不影响其它文件。
 - **安全**：DOM 解析关闭 DTD、外部实体与外部 Schema（XXE 防护）。
-- **轨迹点输出**：`get_run_route` / `get_run_detail(includeTrack=true)` 返回的海拔保留 2 位小数，经纬度保持原精度；累计爬升、海拔剖面等统计仍基于原始值计算。
+- **轨迹点输出**：`get_run_route` / `get_run_detail(includeTrack=true)` 返回的海拔与累计距离保留 2 位小数，经纬度保持原精度；累计爬升、海拔剖面等统计仍基于原始值计算。逐点心率、步频、累计距离来自华为导出，按时间就近匹配到轨迹点，TCX 来源为 `null`。
 - **距离口径**：分段、最佳努力、海拔剖面、路线等轨迹类分析使用有效坐标上的 haversine 累计距离，返回里的 `gpsDistanceKm` 可能与 `Lap/DistanceMeters` 略有差异（采样与汇总来源不同）；缺坐标的点不推进距离，只保留时间与海拔。
 
 ### 解析告警
@@ -179,7 +179,7 @@ SQLite 结构已从版本 0 升级到 1
 | `duplicateActivityIds` | TCX `Activity/Id` 重复，可能是同一活动被导出多次 |
 | `paceOutliers` | 与区间中位配速偏差 ≥25% 的记录，附 `deviationPercent`；少于 3 条记录不判定 |
 | `duplicateTimestampRunIds` | 同一记录内存在重复时间戳，会让分段/最佳努力的插值失真 |
-| `clean` | 告警、0 距离、缺配速、缺起跑坐标、配速离群、重复时间戳全部为空时为 `true`；缺海拔与重复 Activity Id 只作提示，不参与判定 |
+| `clean` | 全部检查项都为空且 `warningCount = 0` 时为 `true`：告警、0 距离、缺配速、缺起跑坐标、缺海拔、重复 Activity Id、配速离群、重复时间戳，一项非空即 `false` |
 
 `duplicateTimestampRunIds` 需要逐条读取轨迹，首次调用稍慢，之后命中轨迹缓存。
 
@@ -221,10 +221,10 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 
 | 工具 | 参数 | 说明 |
 | --- | --- | --- |
-| `describe_data_source` | — | 数据目录、已加载文件、记录数、日期范围、来源、RouteType、解析告警分类、`storage`（库路径与本次同步统计），以及 quality 块（0 距离、缺配速/坐标/海拔、重复 Activity Id、配速离群、重复时间戳） |
-| `list_runs` | `startDate?` `endDate?` `sport?` `min/maxDistanceKm?` `min/maxPaceSecondsPerKm?` `weekday?` `sortBy?` `offset?` `limit?` | 区间内的记录（新的在前，分页），含距离/时长/配速/爬升 |
-| `get_run_detail` | `runId` `includeTrack?` `trackOffset?` `trackLimit?` | 单次完整详情：起止时间、时长、距离、平均配速/速度、爬升与下降、海拔范围、起终点坐标、该次跑步的天气 `weather`（起跑/结束时刻的气温、体感、湿度、降水、风向风速、天气现象），可选附带轨迹分页 |
-| `get_run_route` | `runId` `offset?` `limit?` `format?` `maxPoints?` | 轨迹点分页（时间/纬度/经度/海拔，海拔保留 2 位小数），可输出 GeoJSON；`maxPoints` 降采样后会忽略 `offset`/`limit` |
+| `describe_data_source` | — | 数据目录；跑步记录数 `runningCount`（只含 RUN）与全部运动记录数 `allWorkoutCount`（含步行等其它项目）；跑步记录的来源文件 `runSourceFileCount` / `runSourceFiles`（去重文件名，不等于磁盘文件数）；日期范围、来源、RouteType、解析告警分类、`storage`（库路径、`scannedTcxFiles`/`importedTcxFiles`/`unchangedTcxFiles` 本次 TCX 同步统计、`health` 华为导出规模），以及 quality 块（0 距离、缺配速/坐标/海拔、重复 Activity Id、配速离群、重复时间戳） |
+| `list_runs` | `startDate?` `endDate?` `sport?` `min/maxDistanceKm?` `min/maxPaceSecondsPerKm?` `weekday?` `sortBy?` `offset?` `limit?` | 区间内的记录（新的在前，分页），含距离/时长/配速/爬升；华为来源的记录另带 `avgHeartRate`/`maxHeartRate`/`minHeartRate`/`avgCadence`/`totalSteps`/`totalCaloriesKcal`/`recordId`/`sportTypeCode`/`subType`（TCX 来源为 `null`，不返回 `summaryData`） |
+| `get_run_detail` | `runId` `includeTrack?` `trackOffset?` `trackLimit?` | 单次完整详情：起止时间、时长、距离、平均配速/速度、爬升与下降、海拔范围、起终点坐标、该次跑步的天气 `weather`（起跑/结束时刻的气温、体感、湿度、降水、风向风速、天气现象）；华为来源另带心率/步频/步数/热量/华为运动类型码与 `summaryData` 原文（约 2.5 KB JSON），可选附带轨迹分页 |
+| `get_run_route` | `runId` `offset?` `limit?` `format?` `maxPoints?` `includeSensors?` | 轨迹点分页（时间/纬度/经度/海拔，海拔与累计距离保留 2 位小数），每点另带 `heartRate`/`cadence`/`distanceMeters`（华为来源才有，TCX 为 `null`；`includeSensors=false` 时省略这三个键）；可输出 GeoJSON，此时传感器放在与 `geometry.coordinates` 等长同序的 `sensors` 平行数组里；`maxPoints` 降采样后会忽略 `offset`/`limit` |
 | `get_running_summary` | `startDate?` `endDate?` | 次数、总距离、总时长、总爬升、平均配速、最快/最长记录 |
 | `get_daily_running` | `startDate?` `endDate?` `groupBy?` | 按天/周/月拆分，只含有记录的周期，`day` 时额外返回每天一条 |
 | `get_personal_bests` | `startDate?` `endDate?` `category?` | `category`：`all`（默认）/`distance`/`pace`/`duration`/`climb`/`best1k`/`best5k`；后两项为区间内最快的 1 公里、5 公里（需解析轨迹） |
@@ -240,7 +240,7 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `classify_run` | `runId` | 识别训练类型：轻松跑、长距离跑、节奏跑、间歇/变速跑、比赛/测试跑、恢复跑。基于距离、时长、配速相对个人中位数与分段波动，返回判定依据与置信度（无 GPS 时降为 LOW） |
 | `get_training_mix` | `startDate?` `endDate?` | 区间内的训练类型构成：各类型的次数、距离、距离占比，并逐条列出分类结果。逐条分类会按需解析轨迹，首次调用稍慢 |
 | `get_weather_impact` | `startDate?` `endDate?` `minDistanceKm?` | 只读已回填的 `run_weather`，按起跑气温、湿度、风速、有无降水分组，返回每组次数、加权平均配速、相对整体基线的快慢秒数，以及气温与配速的 Pearson 相关系数。不联网，没有天气时提示先 `reload_data` |
-| `reload_data` | — | 导出新文件后做增量同步：按 `(文件名, size, mtime, sha256)` 只解析变化的文件，无需重启 |
+| `reload_data` | — | 增量同步：按 `(文件名, size, mtime, sha256)` 只解析变化的 TCX 与华为导出文件（JSON / xls / xlsx），写完后触发天气回填，无需重启 |
 
 ### list_runs 过滤与排序
 

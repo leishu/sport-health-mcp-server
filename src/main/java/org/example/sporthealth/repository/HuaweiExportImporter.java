@@ -209,7 +209,7 @@ public class HuaweiExportImporter {
     /**
      * 本次同步的统计。
      *
-     * @param scanned           扫描到的 JSON 文件数
+     * @param scanned           本次扫描到的华为导出文件数（JSON / xls / xlsx）
      * @param imported          本次真正解析并写入的文件数
      * @param unchanged         指纹命中、未读取内容的文件数
      * @param mergedDuplicates 因与 TCX 记录重合而由 JSON 接管的运动数

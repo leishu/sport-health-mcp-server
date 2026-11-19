@@ -83,6 +83,25 @@ class JdbcHealthDataRepositoryTest {
     }
 
     @Test
+    void workoutCountCoversNonRunningActivities() {
+        JdbcHealthDataRepository repository = repository();
+        repository.dataset();
+        // 一次步行：不进跑步快照（sport_family != RUN），但必须算进「全部运动」
+        jdbc().sql("""
+                        INSERT INTO run_activity (id, activity_id, sport, sport_family, run_date, start_time,
+                            end_time, start_time_utc, duration_seconds, distance_meters, track_point_count,
+                            source_file, content_hash, imported_at, source_kind)
+                        VALUES ('walk-1', 'walk-1', 'WALKING', 'WALK', '2026-11-01', '2026-11-01T07:00:00',
+                            '2026-11-01T07:20:00', '2026-10-31T23:00:00Z', 1200, 1500, 0,
+                            'walk.json', 'hash-walk', '2026-11-01T08:00:00Z', 'huawei')
+                        """)
+                .update();
+
+        assertEquals(1, repository.dataset().runCount(), "跑步口径只含 sport_family='RUN'");
+        assertEquals(2, repository.workoutCount(), "全部运动口径要把步行算进来");
+    }
+
+    @Test
     void secondSyncSkipsUnchangedFilesAndStaysIdempotent() {
         JdbcHealthDataRepository first = repository();
         first.dataset();
