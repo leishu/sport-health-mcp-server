@@ -128,6 +128,42 @@ class SportHealthToolsWeatherImpactTest {
 
         assertEquals("NO_DATA", result.get("status"));
         assertTrue(result.get("detail").toString().contains("reload_data"));
+
+        // NO_DATA 时最需要覆盖率：是「区间内本来没有跑步」还是「有跑步但天气全缺」，处理方式完全不同
+        Map<String, Object> coverage = map(result.get("weatherCoverage"));
+        assertNotNull(coverage, "缺数据时必须说明覆盖率，而不是只回一句没有数据");
+        assertEquals(5, coverage.get("totalRuns"));
+        assertEquals(0, coverage.get("ok"));
+        assertEquals(5, coverage.get("missing"));
+        assertEquals(5, coverage.get("notFetched"));
+        assertTrue(coverage.get("hint").toString().contains("sync_weather"),
+                "要指向新工具而不是让人再跑一次全量同步: " + coverage.get("hint"));
+    }
+
+    /** 覆盖率要能把「缺失」拆开：抓取失败可以重试，数据源无该时段重试无效，两者不能混为一谈。 */
+    @Test
+    void coverageSplitsMissingRunsByReason() {
+        JdbcHealthDataRepository repository = repository();
+        repository.dataset();
+        insertWeather("20261025户外跑步", 18d, 60d, 8d, 0d);
+        insertWeather("20261027户外跑步", 22d, 70d, 12d, 0d);
+        insertWeather("20261028户外跑步", 25d, 80d, 15d, 0d);
+        insertWeatherWithStatus("20261101户外跑步", "FAILED");
+        // 20261103 压根没有天气行
+
+        Map<String, Object> result = tools(repository).getWeatherImpact(null, null, null);
+
+        assertEquals("OK", result.get("status"));
+        assertEquals(3, result.get("sampleSize"), "只有 OK 且带快照的记录进样本");
+        Map<String, Object> coverage = map(result.get("weatherCoverage"));
+        assertEquals(5, coverage.get("totalRuns"));
+        assertEquals(3, coverage.get("ok"));
+        assertEquals(2, coverage.get("missing"));
+        assertEquals(1, coverage.get("failed"));
+        assertEquals(0, coverage.get("unavailable"));
+        assertEquals(1, coverage.get("notFetched"));
+        assertEquals(60d, (Double) coverage.get("coveragePercent"), 0.01);
+        assertTrue(coverage.get("hint").toString().contains("sync_weather"));
     }
 
     @Test
@@ -152,6 +188,11 @@ class SportHealthToolsWeatherImpactTest {
                 .filter(bucket -> label.equals(bucket.label()))
                 .findFirst()
                 .orElseThrow(() -> new AssertionError("没有分组：" + label));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> map(Object value) {
+        return (Map<String, Object>) value;
     }
 
     private SportHealthTools tools(JdbcHealthDataRepository repository) {
@@ -180,6 +221,19 @@ class SportHealthToolsWeatherImpactTest {
                 .param(windSpeedKmh)
                 .param(Instant.parse("2026-11-04T00:00:00Z").toString())
                 .param(Instant.parse("2026-11-04T00:00:00Z").toEpochMilli())
+                .update();
+    }
+
+    /** 只标一条状态行、不带快照：用于验证「失败/无数据」在覆盖率里的归类。 */
+    private void insertWeatherWithStatus(String runId, String status) {
+        jdbc().sql("""
+                INSERT INTO run_weather (run_id, provider, fetched_at, fetched_epoch_millis, status, error_message)
+                VALUES (?, 'open-meteo', ?, ?, ?, '模拟失败')
+                """)
+                .param(runId)
+                .param(Instant.parse("2026-11-04T00:00:00Z").toString())
+                .param(Instant.parse("2026-11-04T00:00:00Z").toEpochMilli())
+                .param(status)
                 .update();
     }
 

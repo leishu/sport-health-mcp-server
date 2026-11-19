@@ -63,6 +63,7 @@ import org.example.sporthealth.support.DateParser;
 import org.example.sporthealth.support.DateRange;
 import org.example.sporthealth.support.PaceFormat;
 import org.example.sporthealth.support.WeatherImpactAnalyzer;
+import org.example.sporthealth.weather.WeatherBackfill;
 import org.example.sporthealth.weather.WeatherCodes;
 import org.example.sporthealth.weather.WindDirections;
 import org.springframework.ai.mcp.annotation.McpTool;
@@ -109,17 +110,31 @@ public class SportHealthTools {
     private final HealthDataProperties properties;
     /** 可选：非 JDBC 仓储（单测里的内存实现）没有 {@code run_weather} 表，此时为 null。 */
     private final RunWeatherStore weatherStore;
+    /** 可选：同理，非 JDBC 仓储没有天气表，也就没有可触发的回填。 */
+    private final WeatherBackfill weatherBackfill;
     /** 可选：同理，非 JDBC 仓储没有 {@code run_level} 表。官方跑力是增强信息，缺失不影响其它工具。 */
     private final RunLevelService runLevelService;
 
     /**
-     * 不带官方跑力的构造方式，供只有 TCX 数据的内存仓储与单测使用。
+     * 不带官方跑力、也不带天气回填的构造方式，供只有 TCX 数据的内存仓储与单测使用。
      */
     public SportHealthTools(RunAnalyticsService analytics,
                             HealthDataRepository repository,
                             HealthDataProperties properties,
                             RunWeatherStore weatherStore) {
-        this(analytics, repository, properties, weatherStore, null);
+        this(analytics, repository, properties, weatherStore, null, null);
+    }
+
+    /**
+     * 不带天气回填的构造方式：天气只读（{@code get_run_detail} 的天气块、覆盖率），
+     * {@code sync_weather} 返回 {@code NO_DATA} 而不是炸掉。
+     */
+    public SportHealthTools(RunAnalyticsService analytics,
+                            HealthDataRepository repository,
+                            HealthDataProperties properties,
+                            RunWeatherStore weatherStore,
+                            RunLevelService runLevelService) {
+        this(analytics, repository, properties, weatherStore, null, runLevelService);
     }
 
     @Autowired
@@ -127,11 +142,13 @@ public class SportHealthTools {
                             HealthDataRepository repository,
                             HealthDataProperties properties,
                             RunWeatherStore weatherStore,
+                            WeatherBackfill weatherBackfill,
                             RunLevelService runLevelService) {
         this.analytics = analytics;
         this.repository = repository;
         this.properties = properties;
         this.weatherStore = weatherStore;
+        this.weatherBackfill = weatherBackfill;
         this.runLevelService = runLevelService;
     }
 
@@ -335,7 +352,7 @@ public class SportHealthTools {
             return weatherStore.find(runId).<Object>map(this::weatherBlock).orElseGet(() -> {
                 Map<String, Object> missing = new LinkedHashMap<>();
                 missing.put("status", "MISSING");
-                missing.put("message", "这条记录还没有回填天气，调用 reload_data 同步一次后即可补齐");
+                missing.put("message", "这条记录还没有回填天气，调用 sync_weather 补一轮即可（只补天气，不重导数据）");
                 return missing;
             });
         } catch (RuntimeException e) {
@@ -1014,11 +1031,16 @@ public class SportHealthTools {
     /**
      * 天气影响分析：把已有 {@code run_weather} 数据按温度/湿度/风速/降水分组，比较配速差异。
      * 不触发天气抓取，只读已经回填的行；没有天气数据时提示先同步。
+     *
+     * <p>输出里的 {@code weatherCoverage} 是「天气到底齐不齐」的唯一入口：分组结果的样本数
+     * 只统计同时具备配速与天气的跑步，样本少时如果不说清总量与缺口，调用方只能猜是数据少还是天气没补上。
      */
     @McpTool(name = "get_weather_impact",
             description = "分析天气对配速的影响：按起跑气温、湿度、风速、有无降水分组，返回每组的次数、"
                     + "加权平均配速、相对整体基线的快慢秒数，以及气温与配速的相关系数。"
-                    + "只使用已经回填的天气数据，不会联网；没有天气时先调用 reload_data。"
+                    + "同时返回 weatherCoverage（区间内跑步总数、拿到天气的条数、缺失条数及其原因拆分、覆盖率），"
+                    + "天气不足时据此判断要不要先补数据。只使用已经回填的天气数据，不会联网；"
+                    + "缺天气时调用 sync_weather 补一轮即可，不需要重导数据。"
                     + "用于回答“我热天是不是掉速”“下雨天跑得慢多少”。")
     public Map<String, Object> getWeatherImpact(
             @McpToolParam(description = "开始日期，格式 yyyy-MM-dd，默认取数据最早一天", required = false) String startDate,
@@ -1033,10 +1055,13 @@ public class SportHealthTools {
             return result;
         }
         double minDistance = minDistanceKm != null && minDistanceKm > 0 ? minDistanceKm : 0d;
+        List<RunActivity> runs = analytics.runs(range);
         WeatherImpact impact;
+        Map<String, Object> coverage;
         try {
-            impact = WeatherImpactAnalyzer.analyze(range, analytics.runs(range),
-                    weatherStore.findAll(), minDistance);
+            List<RunWeather> weatherRows = weatherStore.findAll();
+            impact = WeatherImpactAnalyzer.analyze(range, runs, weatherRows, minDistance);
+            coverage = weatherCoverage(runs, weatherRows);
         } catch (RuntimeException e) {
             log.warn("天气影响分析失败", e);
             Map<String, Object> result = new LinkedHashMap<>();
@@ -1046,13 +1071,17 @@ public class SportHealthTools {
             return result;
         }
         if (impact.sampleSize() == 0) {
-            return noData(range, impact.text());
+            // NO_DATA 恰恰最需要覆盖率：是「本来就没有跑步」还是「有跑步但天气全缺」，处理方式完全不同
+            Map<String, Object> result = noData(range, impact.text());
+            result.put("weatherCoverage", coverage);
+            return result;
         }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "OK");
         result.put("range", range.text());
         result.put("totalRuns", impact.totalRuns());
         result.put("sampleSize", impact.sampleSize());
+        result.put("weatherCoverage", coverage);
         result.put("baselinePaceSecondsPerKm", impact.baselinePaceSecondsPerKm());
         result.put("baselinePaceText", impact.baselinePaceText());
         result.put("temperatureBuckets", impact.temperatureBuckets());
@@ -1063,6 +1092,73 @@ public class SportHealthTools {
         result.put("temperaturePaceCorrelation", impact.temperaturePaceCorrelation());
         result.put("text", impact.text());
         return result;
+    }
+
+    /**
+     * 区间内的天气覆盖率：总跑步数、拿到天气的条数、缺失条数与原因拆分。
+     *
+     * <p>口径与 {@link WeatherImpactAnalyzer} 一致：只认 {@code status = OK} 的行，
+     * 而 {@code RunWeather.ok(...)} 落行时一定带快照，所以「状态 OK」与「有可用快照」等价。
+     *
+     * <p>{@code missing} = 总数 - OK，缺失再拆成三类，因为处理方式不同：
+     * {@code failed} 可以重试（{@code sync_weather}）、{@code unavailable} 是数据源没这个时段
+     * （重试无效）、{@code notFetched} 是压根还没回填过。
+     *
+     * <p>不受 {@code minDistanceKm} 影响：天气齐不齐是数据完整性问题，不该被分析过滤条件改变。
+     */
+    private static Map<String, Object> weatherCoverage(List<RunActivity> runs, List<RunWeather> weatherRows) {
+        Map<String, RunWeather> byRunId = new LinkedHashMap<>();
+        for (RunWeather row : weatherRows) {
+            if (row != null && row.runId() != null) {
+                byRunId.put(row.runId(), row);
+            }
+        }
+        int ok = 0;
+        int failed = 0;
+        int unavailable = 0;
+        int notFetched = 0;
+        for (RunActivity run : runs) {
+            RunWeather row = byRunId.get(run.id());
+            if (row == null) {
+                notFetched++;
+                continue;
+            }
+            switch (row.status()) {
+                case OK -> ok++;
+                case FAILED -> failed++;
+                case UNAVAILABLE -> unavailable++;
+            }
+        }
+        int total = runs.size();
+        int missing = total - ok;
+        Map<String, Object> coverage = new LinkedHashMap<>();
+        coverage.put("totalRuns", total);
+        coverage.put("ok", ok);
+        coverage.put("missing", missing);
+        coverage.put("failed", failed);
+        coverage.put("unavailable", unavailable);
+        coverage.put("notFetched", notFetched);
+        coverage.put("coveragePercent", total == 0 ? null : PaceFormat.round(ok * 100d / total, 1));
+        coverage.put("hint", coverageHint(total, ok, missing, failed, unavailable, notFetched));
+        return coverage;
+    }
+
+    /** 覆盖率的结论：直接告诉调用方「要不要补、补了有没有用」。 */
+    private static String coverageHint(int total, int ok, int missing, int failed, int unavailable, int notFetched) {
+        if (total == 0) {
+            return "区间内没有跑步记录，无从统计天气覆盖。";
+        }
+        if (missing == 0) {
+            return "区间内 " + total + " 次跑步全部有天气数据。";
+        }
+        if (ok == 0) {
+            return "区间内 " + total + " 次跑步都没有可用天气（失败 " + failed + "、无数据 " + unavailable
+                    + "、未回填 " + notFetched + "）。先调用 sync_weather 联网补一轮；"
+                    + "它只补天气、不重导数据，失败时会在返回里给出原因。";
+        }
+        return "区间内 " + total + " 次跑步有 " + ok + " 次拿到天气，" + missing + " 次缺失（失败 " + failed
+                + "、无数据 " + unavailable + "、未回填 " + notFetched + "）。"
+                + "失败的记录可用 sync_weather 立刻重试；UNAVAILABLE 表示数据源没有该时段数据，重试无效。";
     }
 
     /**
@@ -1116,13 +1212,18 @@ public class SportHealthTools {
         return result;
     }
 
-    /** 重新扫描并增量同步 TCX 与华为导出（JSON/xls/xlsx），随后触发天气回填；旧轨迹缓存随之丢弃。 */
+    /** 重新扫描并增量同步 TCX 与华为导出（JSON/xls/xlsx），默认随后触发天气回填；旧轨迹缓存随之丢弃。 */
     @McpTool(name = "reload_data",
             description = "重新扫描数据目录，把新增或内容变化的 TCX 与华为导出文件（JSON/xls/xlsx）增量同步进 "
-                    + "SQLite，并在写完后触发一轮天气回填，无需重启服务。未变化的文件按 size/mtime/sha256 跳过，"
-                    + "不会重复解析；源文件已删除的历史记录会保留。")
-    public Map<String, Object> reloadData() {
-        repository.reload();
+                    + "SQLite，无需重启服务。未变化的文件按 size/mtime/sha256 跳过，不会重复解析；"
+                    + "源文件已删除的历史记录会保留。默认在写完后顺带触发一轮天气回填；"
+                    + "只想同步跑步数据、不想被天气请求的网络超时拖住时传 weather=false，"
+                    + "之后再单独调用 sync_weather 补天气。")
+    public Map<String, Object> reloadData(
+            @McpToolParam(description = "是否顺带回填天气，默认 true；传 false 时整段同步不发起任何网络请求",
+                    required = false) Boolean weather) {
+        boolean withWeather = weather == null || weather;
+        repository.reload(withWeather);
         RunDataset dataset = repository.dataset();
         Map<String, Object> result = new LinkedHashMap<>();
         StringBuilder message = new StringBuilder("已增量同步：跑步 ").append(dataset.runCount()).append(" 条");
@@ -1133,11 +1234,110 @@ public class SportHealthTools {
             result.put("allWorkoutCount", allWorkouts);
             message.append("、全部运动 ").append(allWorkouts).append(" 条");
         }
-        message.append("；已触发天气回填，扫描与变更明细见 storage");
+        message.append(withWeather
+                ? "；已触发天气回填，扫描与变更明细见 storage"
+                : "；已跳过天气回填（weather=false），需要时调用 sync_weather，扫描与变更明细见 storage");
         result.put("message", message.toString());
+        result.put("weatherRequested", withWeather);
         result.put("warnings", dataset.warnings());
         result.put("storage", storageInfo(healthInfo()));
         return result;
+    }
+
+    /**
+     * 单独补一轮天气，不重导数据、不重建快照。
+     *
+     * <p>存在的理由：{@code reload_data} 的全量扫描 + 天气 HTTP 调用捆在一起，
+     * 端点不可达时一次调用要等到多个超时，MCP 客户端大概率先断开；而天气失败又需要尽快重试
+     * （默认的 7 天冷却只会让 3 条失败记录一直空着）。这个工具只做「补齐天气」这一件事，
+     * 而且默认忽略冷却——手动调用本身就是「现在就去试一次」的明确意图。
+     *
+     * <p>失败不会影响任何跑步数据：每条记录单独落状态，{@code run_weather} 里
+     * {@code FAILED} 的行下次还能再试，{@code UNAVAILABLE} 表示数据源没有该时段数据（终态）。
+     */
+    @McpTool(name = "sync_weather",
+            description = "只补天气：为还没有天气的跑步记录调用 open-meteo 抓取起跑/结束时刻的天气并写入本地库，"
+                    + "不重导跑步数据、不重建快照。返回本轮成功 ok、无数据 unavailable、失败 failed、"
+                    + "缺坐标 noLocation、延后 deferred 的条数以及失败原因 problems，"
+                    + "并附带同步后的整体覆盖率 coverage。默认会立即重试上次失败的记录（忽略冷却期），"
+                    + "用于 reload_data(weather=false) 之后单独补天气，或失败后马上重试。"
+                    + "用于回答“补一下天气”“天气怎么还没数据”。")
+    public Map<String, Object> syncWeather(
+            @McpToolParam(description = "是否立即重试上次抓取失败的记录（忽略 retry-failed-after-days 冷却），默认 true",
+                    required = false) Boolean retryFailed) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        if (weatherBackfill == null || weatherStore == null) {
+            result.put("status", "NO_DATA");
+            result.put("message", "当前仓储没有天气表，无法补天气；天气只存在于 SQLite 数据源下。");
+            return result;
+        }
+        if (!weatherBackfill.enabled()) {
+            result.put("status", "DISABLED");
+            result.put("message", "天气回填已被配置关闭（sport.weather.enabled=false），"
+                    + "改回 true 并重启后再调用 sync_weather。");
+            return result;
+        }
+        boolean force = retryFailed == null || retryFailed;
+        long startedAt = System.nanoTime();
+        WeatherBackfill.Result run;
+        try {
+            run = weatherBackfill.run(Instant.now(), force);
+        } catch (RuntimeException e) {
+            log.warn("手动补天气失败", e);
+            result.put("status", "FAILED");
+            result.put("message", "补天气时出错：" + e.getMessage() + "；跑步数据不受影响。");
+            result.put("coverage", weatherInfo());
+            return result;
+        }
+        result.put("status", "OK");
+        result.put("retriedFailed", force);
+        result.put("ok", run.ok());
+        result.put("unavailable", run.unavailable());
+        result.put("failed", run.failed());
+        result.put("noLocation", run.noLocation());
+        result.put("deferred", run.deferred());
+        result.put("attempted", run.attempted());
+        result.put("total", run.total());
+        result.put("problems", run.problems());
+        result.put("retryableProblems", run.retryableProblems());
+        result.put("elapsedMillis", (System.nanoTime() - startedAt) / 1_000_000);
+        result.put("message", syncWeatherText(run, force));
+        result.put("coverage", weatherInfo());
+        return result;
+    }
+
+    /**
+     * 一轮补天气的结论。
+     *
+     * <p>三种「什么也没做」要分开说：没有候选（全部已是终态）、被短路延后、以及失败的记录。
+     * 只回一句「完成」会让调用方以为天气已经齐了。
+     */
+    private static String syncWeatherText(WeatherBackfill.Result run, boolean retriedFailed) {
+        if (run.total() == 0) {
+            return "没有需要补天气的跑步记录：全部记录都已是 OK 或 UNAVAILABLE（数据源无该时段数据）。"
+                    + "若仍有记录显示无天气，用 get_weather_impact 的 weatherCoverage 确认缺失原因。";
+        }
+        StringBuilder text = new StringBuilder("本轮处理 ").append(run.total()).append(" 条：成功 ")
+                .append(run.ok()).append("、无数据 ").append(run.unavailable())
+                .append("、失败 ").append(run.failed()).append("、缺坐标 ").append(run.noLocation())
+                .append("、延后 ").append(run.deferred());
+        if (run.failed() > 0) {
+            text.append("。失败的记录保留 FAILED 状态，下次 sync_weather 会再试");
+            if (!retriedFailed) {
+                text.append("（本次遵守冷却期，刚失败的记录要等 retry-failed-after-days 天后才会被选中）");
+            }
+            if (!run.retryableProblems().isEmpty()) {
+                text.append("；原因：").append(run.retryableProblems().get(0));
+            }
+            text.append("。");
+        }
+        if (run.deferred() > 0) {
+            text.append("。接口连续失败，本轮提前收尾，延后的记录没有落行，下次同步自动重试。");
+        }
+        if (run.unavailable() > 0) {
+            text.append("。UNAVAILABLE 表示 open-meteo 没有该时段数据（或记录缺坐标），重试无效。");
+        }
+        return text.toString();
     }
 
     /** 库里全部运动记录数（含步行等非跑步项目）；仓储不是 JDBC 版时返回 {@code null}。 */

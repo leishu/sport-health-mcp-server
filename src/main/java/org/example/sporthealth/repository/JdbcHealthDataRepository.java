@@ -243,7 +243,12 @@ public class JdbcHealthDataRepository implements HealthDataRepository {
 
     @Override
     public synchronized void reload() {
-        this.snapshot = load();
+        reload(true);
+    }
+
+    @Override
+    public synchronized void reload(boolean withWeather) {
+        this.snapshot = load(withWeather);
     }
 
     /** 最近一次同步的统计，{@code reload_data} 与 {@code describe_data_source} 用来展示导入细节。 */
@@ -288,8 +293,16 @@ public class JdbcHealthDataRepository implements HealthDataRepository {
     }
 
     private Snapshot load() {
+        return load(true);
+    }
+
+    /**
+     * @param withWeather 是否在增量同步后补天气。首次装载与后台自动同步都要补，保持原有行为；
+     *                    只有 {@code reload_data(weather=false)} 会传 {@code false}
+     */
+    private Snapshot load(boolean withWeather) {
         schema.ensure();
-        lastSync = importer.sync();
+        lastSync = importer.sync(withWeather);
 
         List<ActivityRow> rows = jdbc.sql(SELECT_ACTIVITIES).query(ACTIVITY_MAPPER).list();
         List<RunActivity> activities = new ArrayList<>(rows.size());

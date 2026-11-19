@@ -72,13 +72,31 @@ public class WeatherBackfill {
         this.properties = properties;
     }
 
+    /** 开关状态：关掉时 {@link #run} 会直接返回全 0，工具层需要据此给出明确提示。 */
+    public boolean enabled() {
+        return properties.enabled();
+    }
+
     /**
-     * 回填一轮。
+     * 回填一轮，遵守失败冷却。
      *
      * @param now 当前时刻，测试可注入固定时钟
      * @return 本轮统计；未启用时返回全 0
      */
     public Result run(Instant now) {
+        return run(now, false);
+    }
+
+    /**
+     * 回填一轮。
+     *
+     * @param now 当前时刻，测试可注入固定时钟
+     * @param retryFailed {@code true} 时连冷却期内的 {@code FAILED} 记录也立刻重试。
+     *                    手动触发的同步（{@code sync_weather}）用它：用户明确要求补天气时，
+     *                    让「7 天冷却」把它挡回去只会让人以为工具坏了。
+     * @return 本轮统计；未启用时返回全 0
+     */
+    public Result run(Instant now, boolean retryFailed) {
         // 孤儿行清理不联网，也不该被 enabled 开关挡住：记录已经被重导删除，行留着只会污染覆盖率
         int orphans = store.deleteOrphans();
         if (orphans > 0) {
@@ -87,7 +105,10 @@ public class WeatherBackfill {
         if (!properties.enabled()) {
             return Result.skipped();
         }
-        Instant retryBefore = now.minusSeconds(properties.retryFailedAfterDays() * 86_400L);
+        // 冷却边界取 now 本身：FAILED 行的 fetched_epoch_millis 一定早于本轮，等价于「全部失败行都重试」
+        Instant retryBefore = retryFailed
+                ? now
+                : now.minusSeconds(properties.retryFailedAfterDays() * 86_400L);
         List<PendingRun> pending = store.pending(retryBefore, properties.maxRunsPerSync());
         if (pending.isEmpty()) {
             return Result.skipped();

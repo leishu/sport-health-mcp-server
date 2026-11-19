@@ -313,6 +313,84 @@ class WeatherBackfillTest {
                 String.valueOf(row.get("error_message")));
     }
 
+    /**
+     * 手动同步（{@code sync_weather}）忽略冷却：失败的记录立刻重试，不用等 7 天。
+     *
+     * <p>没有这一条，用户看到 FAILED 后手动补一轮会「什么都没发生」——{@code pending}
+     * 被冷却挡在外面，返回全 0，看起来跟工具坏了没区别。
+     */
+    @Test
+    void forcedRetryIgnoresTheCooldown() {
+        server.enqueue(new MockResponse().setResponseCode(503));
+        WeatherBackfill backfill = backfill(weather(7, 50, 92));
+        repository(weather(7, 50, 92), backfill).dataset();
+        assertEquals(RunWeather.Status.FAILED.name(), weatherRow().get("status"));
+
+        // 把失败行的时间戳归零，之后用 now 精确控制时间轴（同冷却用例的理由）
+        jdbc().sql("UPDATE run_weather SET fetched_epoch_millis = ?, fetched_at = ?")
+                .param(RUN_START.toEpochMilli())
+                .param(RUN_START.toString())
+                .update();
+        int requestsAfterFirst = server.getRequestCount();
+
+        WeatherBackfill.Result withinCooldown = backfill.run(RUN_START.plusSeconds(86_400));
+        assertEquals(0, withinCooldown.attempted(), "对照组：普通 run 在冷却期内不选候选");
+        assertEquals(requestsAfterFirst, server.getRequestCount());
+
+        respondDaily("2026-10-24");
+        WeatherBackfill.Result forced = backfill.run(RUN_START.plusSeconds(86_400), true);
+
+        assertEquals(1, forced.ok(), "强制重试应当立刻成功：attempted=" + forced.attempted()
+                + " failed=" + forced.failed() + " problems=" + forced.problems());
+        assertEquals(requestsAfterFirst + 1, server.getRequestCount(), "强制重试必须真的发一次请求");
+        assertEquals(RunWeather.Status.OK.name(), weatherRow().get("status"));
+    }
+
+    /**
+     * {@code reload(weather=false)} 只同步数据、不碰网络。
+     *
+     * <p>端点是黑洞时，一次 {@code reload_data} 会被「3 次超时」拖住几十秒，
+     * MCP 客户端通常先断开；用户只想把新数据导进来时必须能跳过天气。
+     */
+    @Test
+    void reloadWithoutWeatherSkipsTheNetworkEntirely() {
+        respondDaily("2026-10-24");
+        JdbcHealthDataRepository repository = repository(weather(7, 50, 92));
+
+        repository.reload(false);
+
+        assertEquals(0, server.getRequestCount(), "weather=false 不得发起任何请求");
+        assertEquals(0, count("run_weather"), "跳过天气就不该落行");
+        assertEquals(1, repository.dataset().runCount(), "跑步数据照常入库");
+
+        // 之后再单独补：这次才会联网
+        repository.reload(true);
+        assertEquals(1, server.getRequestCount());
+        assertEquals(RunWeather.Status.OK.name(), weatherRow().get("status"));
+    }
+
+    /**
+     * 只给跑步记录补天气：{@code run_activity} 里还有步行等其它运动，它们不该消耗配额，
+     * 也不该算进「总跑步数」——否则覆盖率的分母会大于 {@code describe_data_source.runningCount}。
+     */
+    @Test
+    void nonRunningActivitiesAreNeitherBackfilledNorCounted() {
+        schema();
+        Instant startUtc = Instant.parse("2026-10-24T02:00:00Z");
+        insertRun("跑步", startUtc, 1800, 39.90, 116.18, 39.90, 116.18);
+        insertRun("步行", startUtc.plusSeconds(3600), 1800, 39.91, 116.19, 39.91, 116.19);
+        jdbc().sql("UPDATE run_activity SET sport_family = 'WALK' WHERE id = '步行'").update();
+        respondDaily("2026-10-24");
+
+        WeatherBackfill.Result result = backfill(weather(7, 50, 92)).run(startUtc);
+
+        assertEquals(1, result.total(), "只有跑步记录参与回填");
+        assertEquals(1, count("run_weather"), "步行不落天气行");
+        RunWeatherStore.Stats stats = new RunWeatherStore(jdbc()).stats();
+        assertEquals(1, stats.totalRuns(), "总跑步数不含步行");
+        assertEquals(1, stats.ok());
+    }
+
     @Test
     void statsReportCoverage() {
         respondDaily("2026-10-24");

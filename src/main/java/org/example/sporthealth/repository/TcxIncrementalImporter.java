@@ -113,6 +113,16 @@ public class TcxIncrementalImporter {
 
     /** 扫描数据目录并把变化写入库，返回本次同步的统计。 */
     public SyncResult sync() {
+        return sync(true);
+    }
+
+    /**
+     * 扫描数据目录并把变化写入库。
+     *
+     * @param withWeather 是否在导入结束后补一轮天气。{@code false} 时整段同步不碰网络，
+     *                    用于「只想把数据同步进来」的场景（补天气另有 {@code sync_weather}）
+     */
+    public SyncResult sync(boolean withWeather) {
         schema.ensure();
         List<String> warnings = new ArrayList<>();
 
@@ -174,7 +184,11 @@ public class TcxIncrementalImporter {
 
         // 天气回填放在导入事务全部结束之后：HTTP 调用不能占用池里唯一的连接。
         // 失败只进 warnings，绝不影响已经写好的跑步数据。
-        appendWeather(syncedAt, warnings);
+        if (withWeather) {
+            appendWeather(syncedAt, warnings);
+        } else {
+            log.info("本次同步跳过了天气回填（weather=false），需要时用 sync_weather 单独补");
+        }
 
         return new SyncResult(files.size(), imported, unchanged, orphaned, warnings, syncedAt);
     }

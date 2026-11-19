@@ -42,8 +42,9 @@ public class RunWeatherStore {
                    COALESCE(r.end_longitude, r.start_longitude)   AS end_longitude
             FROM run_activity r
             LEFT JOIN run_weather w ON w.run_id = r.id
-            WHERE w.run_id IS NULL
-               OR (w.status = 'FAILED' AND w.fetched_epoch_millis < :retryBeforeMillis)
+            WHERE r.sport_family = 'RUN'
+              AND (w.run_id IS NULL
+                   OR (w.status = 'FAILED' AND w.fetched_epoch_millis < :retryBeforeMillis))
             ORDER BY r.start_time_utc DESC
             LIMIT :limit
             """;
@@ -182,9 +183,13 @@ public class RunWeatherStore {
     }
 
     /**
-     * 统计各状态条数，供 {@code describe_data_source} 与日志使用。
+     * 统计各状态条数，供 {@code describe_data_source}、{@code sync_weather} 与日志使用。
      *
-     * <p>只统计还存在于 {@code run_activity} 的天气行：孤儿行来自历史遗留（记录被重导删除），
+     * <p><b>只统计跑步记录</b>（{@code sport_family = 'RUN'}）：与 {@link #pending} 的口径一致。
+     * {@code run_activity} 里还有步行等其它运动，把它们的天气行算进来会让「总跑步数」虚高，
+     * 覆盖率对不上 {@code describe_data_source} 的 {@code runningCount}。
+     *
+     * <p>同时只统计还存在于 {@code run_activity} 的天气行：孤儿行来自历史遗留（记录被重导删除），
      * 算进来会让 {@code ok} 大于 {@code totalRuns}，覆盖率超过 100%。
      */
     public Stats stats() {
@@ -192,6 +197,7 @@ public class RunWeatherStore {
                         SELECT w.status, COUNT(*) AS cnt
                         FROM run_weather w
                         JOIN run_activity r ON r.id = w.run_id
+                        WHERE r.sport_family = 'RUN'
                         GROUP BY w.status
                         """)
                 .query((rs, rowNum) -> new StatusCount(rs.getString("status"), rs.getInt("cnt")))
@@ -209,11 +215,13 @@ public class RunWeatherStore {
                 }
             }
         }
-        int totalRuns = jdbc.sql("SELECT COUNT(*) FROM run_activity").query(Integer.class).single();
+        int totalRuns = jdbc.sql("SELECT COUNT(*) FROM run_activity WHERE sport_family = 'RUN'")
+                .query(Integer.class).single();
         String lastFetchedAt = jdbc.sql("""
                         SELECT MAX(w.fetched_at)
                         FROM run_weather w
                         JOIN run_activity r ON r.id = w.run_id
+                        WHERE r.sport_family = 'RUN'
                         """)
                 .query(String.class).optional()
                 .orElse(null);

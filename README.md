@@ -240,8 +240,9 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `get_training_load` | `endDate?` `metric?` | 训练负荷与 ACWR：7 天急性、28 天慢性、`ACWR = 急性 / (慢性/4)`、周跑量增幅、连续训练天数、休息日、单调性与 Strain，并给出调整建议。`metric` 可选 `distance`（默认，公里）或 `duration`（分钟）；数据覆盖不足时明确标注置信度 |
 | `classify_run` | `runId` | 识别训练类型：轻松跑、长距离跑、节奏跑、间歇/变速跑、比赛/测试跑、恢复跑。基于距离、时长、配速相对个人中位数与分段波动，并用平均心率所在区间（Z1~Z5）交叉验证，返回判定依据、心率区间与置信度（无 GPS 时降为 LOW） |
 | `get_training_mix` | `startDate?` `endDate?` | 区间内的训练类型构成：各类型的次数、距离、距离占比，并逐条列出分类结果。逐条分类会按需解析轨迹，首次调用稍慢 |
-| `get_weather_impact` | `startDate?` `endDate?` `minDistanceKm?` | 只读已回填的 `run_weather`，按起跑气温、湿度、风速、有无降水分组，返回每组次数、加权平均配速、相对整体基线的快慢秒数，以及气温与配速的 Pearson 相关系数。不联网，没有天气时提示先 `reload_data` |
-| `reload_data` | — | 增量同步：按 `(文件名, size, mtime, sha256)` 只解析变化的 TCX 与华为导出文件（JSON / xls / xlsx），写完后触发天气回填，无需重启 |
+| `get_weather_impact` | `startDate?` `endDate?` `minDistanceKm?` | 只读已回填的 `run_weather`，按起跑气温、湿度、风速、有无降水分组，返回每组次数、加权平均配速、相对整体基线的快慢秒数，以及气温与配速的 Pearson 相关系数。另带 `weatherCoverage`：区间内跑步总数、拿到天气的条数、缺失条数与原因拆分（`failed`/`unavailable`/`notFetched`）、覆盖率与一句结论。不联网，缺天气时提示调 `sync_weather` |
+| `sync_weather` | `retryFailed?` | 只补天气：为还没有天气的跑步记录联网抓取起跑/结束时刻的天气，**不重导数据、不重建快照**。返回本轮 `ok`/`unavailable`/`failed`/`noLocation`/`deferred` 条数、失败原因 `problems` 与同步后的整体覆盖率 `coverage`。`retryFailed` 默认 `true`，即忽略 `retry-failed-after-days` 冷却、立刻重试上次失败的记录；`sport.weather.enabled=false` 时返回 `DISABLED` |
+| `reload_data` | `weather?` | 增量同步：按 `(文件名, size, mtime, sha256)` 只解析变化的 TCX 与华为导出文件（JSON / xls / xlsx），无需重启。`weather` 默认 `true`，写完顺带补一轮天气；传 `false` 时整段同步不发起任何网络请求，天气留给 `sync_weather` |
 
 ### list_runs 过滤与排序
 
@@ -429,7 +430,9 @@ sqlite3 data/sport-health.db "SELECT source_file, size, modified_millis, substr(
 ### 天气回填（open-meteo）
 
 每次同步（首次加载、`reload_data` 或后台自动同步）在**跑步数据全部写完之后**补一轮天气：取起跑和结束两个时刻的气温、体感温度、
-相对湿度、降水量、风速、风向、天气代码，写进 `run_weather`。
+相对湿度、降水量、风速、风向、天气代码，写进 `run_weather`。只处理 `sport_family='RUN'` 的记录——
+`run_activity` 里还有步行等其它运动，它们既不该消耗接口配额，也不该混进覆盖率的分母。
+`reload_data(weather=false)` 会跳过这一步，把「同步数据」和「补天气」彻底解耦。
 
 **为什么只补缺失的**：`OK` 和 `UNAVAILABLE` 都是终态，只有「没有行」和「`FAILED` 且超过冷却期」才会被选中。
 所以同步可以反复调，不会重复消耗配额。
@@ -486,11 +489,40 @@ sqlite3 data/sport-health.db "SELECT source_file, size, modified_millis, substr(
 
 口径：`observedAt` 是参与插值的**整点**，不是跑步时刻本身；任一指标缺值一律 `null`，不会当成 0 度；某个时刻整份快照都没有时该时刻直接是 `null`。`status` 除 `OK` 外还有三种：`UNAVAILABLE`（缺坐标、
 超出存档覆盖范围）与 `FAILED`（抓取失败待重试）会带上 `errorMessage` 说明原因；还没回填过则是
-`MISSING`，提示调用一次 `reload_data` 即可补齐。
+`MISSING`，提示调用一次 `sync_weather` 即可补齐。
+
+**单独补天气**：`sync_weather` 只做「补齐天气」这一件事——不重导数据、不重建快照，可以反复调。
+它存在的理由是把两件事拆开：`reload_data` 把「全量扫描 + 天气 HTTP」捆在一起，端点不可达时一次调用要等满多个超时，
+MCP 客户端大概率先断开；而失败的记录又需要尽快重试（默认冷却 `retry-failed-after-days` 天）。
+
+```json
+{
+  "status": "OK", "retriedFailed": true,
+  "ok": 3, "unavailable": 0, "failed": 0, "noLocation": 0, "deferred": 0,
+  "attempted": 3, "total": 3, "problems": [], "retryableProblems": [],
+  "elapsedMillis": 1240,
+  "coverage": { "totalRuns": 154, "ok": 154, "missing": 0, "coveragePercent": 100.0, "...": "..." }
+}
+```
+
+- `retryFailed` 默认 `true`：手动调用本身就不该被 7 天冷却挡回去，否则用户看到 `FAILED` 后点一次「补天气」却什么都没发生。
+- `total = 0` 表示**没有候选**（全部记录都是 `OK`/`UNAVAILABLE` 终态），不是失败。
+- 关闭开关（`sport.weather.enabled=false`）时返回 `status = DISABLED`，而不是假装成功。
+- 只处理 `sport_family = 'RUN'` 的记录：`run_activity` 里的步行等运动不消耗配额，也不进覆盖率的分母。
 
 **聚合看天气影响**：`get_weather_impact` 只读已经落库的天气行，按起跑气温、湿度、风速、有无降水分组，
-返回每组的次数、加权平均配速与相对整体基线的快慢秒数。它不会触发抓取，所以没有数据时
-先调 `reload_data`。
+返回每组的次数、加权平均配速与相对整体基线的快慢秒数。它不会触发抓取，所以输出里带 `weatherCoverage`：
+区间内跑步总数、拿到天气的条数、缺失条数与原因拆分（`failed` 可重试 / `unavailable` 数据源无该时段 /
+`notFetched` 还没回填）、覆盖率与一句结论。样本数明显小于总数时，看这一块就知道该不该补数据：
+
+```json
+"weatherCoverage": {
+  "totalRuns": 154, "ok": 151, "missing": 3,
+  "failed": 3, "unavailable": 0, "notFetched": 0,
+  "coveragePercent": 98.1,
+  "hint": "区间内 154 次跑步有 151 次拿到天气，3 次缺失（失败 3、无数据 0、未回填 0）。失败的记录可用 sync_weather 立刻重试；UNAVAILABLE 表示数据源没有该时段数据，重试无效。"
+}
+```
 
 **孤儿行清理**：`run_weather` 没有外键，记录被重导删除时天气行会留在表里。导入时删「本次解析后
 消失的 id」，以及「id 没变但起跑时刻 / 时长 / 起终点坐标变了」的记录——前者是记录没了，

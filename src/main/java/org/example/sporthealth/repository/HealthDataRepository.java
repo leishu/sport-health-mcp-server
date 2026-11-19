@@ -14,6 +14,18 @@ public interface HealthDataRepository {
     /** 重新扫描并解析数据目录。 */
     void reload();
 
+    /**
+     * 重新扫描并同步，可选择是否顺带补一轮天气。
+     *
+     * <p>只有 JDBC 仓储会做天气回填，其它实现（TCX 内存仓储、测试替身）没有天气表，
+     * 默认实现忽略这个参数、退化为 {@link #reload()}。
+     *
+     * @param withWeather {@code false} 时整段同步不发起任何 HTTP 请求，天气留给 {@code sync_weather}
+     */
+    default void reload(boolean withWeather) {
+        reload();
+    }
+
     /** 指定记录的完整轨迹点，找不到时返回空列表。 */
     List<TrackPoint> route(String runId);
 
