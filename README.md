@@ -230,7 +230,7 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `get_running_summary` | `startDate?` `endDate?` | 次数、总距离、总时长、总爬升、平均配速、最快/最长记录 |
 | `get_daily_running` | `startDate?` `endDate?` `groupBy?` | 按天/周/月拆分，只含有记录的周期，`day` 时额外返回每天一条 |
 | `get_personal_bests` | `startDate?` `endDate?` `category?` `distancesKm?` | `category`：`all`（默认）/`distance`/`pace`/`duration`/`climb`，或距离类别 `best1k`/`best3k`/`best5k`/`best10k`/`half`/`marathon`（别名：`5k`、`半马`、`全马`…）。`distancesKm` 直接指定最佳努力的目标距离，默认 `[1,5]`，例如 `[1,5,10,21.0975,42.195]`；结果按 `best1k`/`best10k`/`bestHalf`/`bestMarathon` 命名，区间内跑不到的目标列在 `unavailableDistancesKm` |
-| `compare_runs` | `baseRunId` `otherRunId` `includeSplits?` | 距离/时长/配速差异 + 一句话结论，可选附带两次的分段 |
+| `compare_runs` | `baseRunId` `otherRunId` `includeSplits?` `splitKm?` | 距离/时长/配速差异 + 一句话结论，可选附带两次的分段（`splitKm` 默认 1，与 `get_run_splits` 同口径；缺 GPS 的那次会列在 `splits.noGpsRunIds`） |
 | `get_run_splits` | `runId` `splitKm?` | 沿轨迹按固定距离（默认 1 公里）分段：配速、用时、本段爬升、净海拔变化、平均坡度、坡度修正配速（GAP）、最快/最慢段、前后半程对比、负分段、配速标准差，并返回 `gpsDistanceKm` 与全程 GAP 汇总。华为来源的记录另带 `vendorSplits`（华为官方单公里配速，来自 `track_stream` 的 `pm2`）与 `splitCrossCheck`（两边按段对齐后的平均/最大配速差与结论） |
 | `get_best_efforts` | `runId` `distancesKm?` | 单次跑步内 1K/5K 等目标距离的最佳用时与折算配速（默认 `[1,5]`），附 `gpsDistanceKm`，超出本次距离的目标列入 `unavailableTargetsMeters` |
 | `get_training_trend` | `period?` `count?` `endDate?` | 连续周/月趋势（`count` 默认 4、最多 52），含跑量与配速相对上一周期的变化 |

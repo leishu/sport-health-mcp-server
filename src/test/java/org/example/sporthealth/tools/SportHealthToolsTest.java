@@ -16,6 +16,7 @@ import java.util.Map;
 import org.example.sporthealth.config.HealthDataProperties;
 import org.example.sporthealth.domain.RunActivity;
 import org.example.sporthealth.domain.RunDataset;
+import org.example.sporthealth.domain.RunSplit;
 import org.example.sporthealth.domain.SplitCrossCheck;
 import org.example.sporthealth.domain.TrackPoint;
 import org.example.sporthealth.domain.TrackStream;
@@ -145,6 +146,39 @@ class SportHealthToolsTest {
         assertNotNull(summaryData, "详情要说明 summaryData 有没有");
         assertEquals(Boolean.FALSE, summaryData.get("available"), "TCX 记录没有 summaryData");
         assertNotNull(summaryData.get("reason"));
+    }
+
+    /** compare_runs 的分段必须和 get_run_splits 用同一把尺子：splitKm 生效、回显 splitMeters、非法值回落 1 公里。 */
+    @Test
+    void compareRunsHonoursSplitKm() {
+        Map<String, Object> list = tools.listRuns(null, null, null, null, null, null, null,
+                null, null, 0, 2);
+        List<?> runs = (List<?>) list.get("runs");
+        String baseId = (String) ((Map<?, ?>) runs.get(0)).get("id");
+        String otherId = (String) ((Map<?, ?>) runs.get(1)).get("id");
+
+        Map<?, ?> defaultSplits = (Map<?, ?>) tools.compareRuns(baseId, otherId, true, null).get("splits");
+        assertEquals(1000d, splitMetersOf(defaultSplits), "不传 splitKm 时按 1 公里切");
+        List<?> oneKm = (List<?>) defaultSplits.get("base");
+        assertFalse(oneKm.isEmpty(), "TCX 样本有 GPS 轨迹");
+
+        Map<?, ?> fiveSplits = (Map<?, ?>) tools.compareRuns(baseId, otherId, true, 5d).get("splits");
+        assertEquals(5000d, splitMetersOf(fiveSplits));
+        List<?> fiveKm = (List<?>) fiveSplits.get("base");
+        assertFalse(fiveKm.isEmpty());
+        assertTrue(fiveKm.size() < oneKm.size(), "5 公里分段数应少于 1 公里");
+        assertEquals(5d, ((RunSplit) fiveKm.get(0)).distanceKm(), 1e-9);
+
+        // 0 / 负数等于没传，不能抛异常也不能切出 0 长度分段
+        assertEquals(1000d, splitMetersOf((Map<?, ?>) tools.compareRuns(baseId, otherId, true, 0d).get("splits")));
+        assertEquals(1000d, splitMetersOf((Map<?, ?>) tools.compareRuns(baseId, otherId, true, -2d).get("splits")));
+
+        // includeSplits=false 时即使传了 splitKm 也不该顺手把轨迹算一遍
+        assertFalse(tools.compareRuns(baseId, otherId, false, 5d).containsKey("splits"));
+    }
+
+    private static double splitMetersOf(Map<?, ?> splits) {
+        return ((Number) splits.get("splitMeters")).doubleValue();
     }
 
     @Test

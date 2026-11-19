@@ -979,11 +979,13 @@ public class SportHealthTools {
     /** 两次对比，结论直接回读给用户；任一 id 多义时返回 AMBIGUOUS。 */
     @McpTool(name = "compare_runs",
             description = "对比两次跑步的距离、时长与配速差异，并给出一句话结论（谁更快、快多少）。"
-                    + "includeSplits=true 时附带每公里分段，便于看配速分布。两次记录 id 都用 list_runs 获取。")
+                    + "includeSplits=true 时附带分段配速（默认每 1 公里，可用 splitKm 调整），便于看配速分布。"
+                    + "两次记录 id 都用 list_runs 获取。")
     public Map<String, Object> compareRuns(
             @McpToolParam(description = "基准跑步记录 id") String baseRunId,
             @McpToolParam(description = "对比跑步记录 id") String otherRunId,
-            @McpToolParam(description = "是否附带两次的每公里分段，默认 false", required = false) Boolean includeSplits) {
+            @McpToolParam(description = "是否附带两次的分段配速，默认 false", required = false) Boolean includeSplits,
+            @McpToolParam(description = "分段距离（公里），默认 1，仅 includeSplits=true 时生效", required = false) Double splitKm) {
         RunLookup baseLookup = analytics.lookup(baseRunId);
         if (baseLookup.isAmbiguous()) {
             return ambiguous(baseRunId, baseLookup);
@@ -1010,12 +1012,33 @@ public class SportHealthTools {
         result.put("base", toRunRow(base));
         result.put("other", toRunRow(other));
         if (Boolean.TRUE.equals(includeSplits)) {
+            double stepMeters = splitMeters(splitKm);
+            RunSplits baseSplits = analytics.splits(base, stepMeters);
+            RunSplits otherSplits = analytics.splits(other, stepMeters);
             Map<String, Object> splits = new LinkedHashMap<>();
-            splits.put("base", analytics.splits(base, 1000d).splits());
-            splits.put("other", analytics.splits(other, 1000d).splits());
+            // 键名与 get_run_splits 对齐，调用方用同一个字段就能核对两组结果的分段口径
+            splits.put("splitMeters", stepMeters);
+            splits.put("base", baseSplits.splits());
+            splits.put("other", otherSplits.splits());
+            // 没有 GPS 轨迹的那次仍然返回空数组，但要明确是哪一次缺，避免被当成「配速为 0」
+            List<String> noGps = new ArrayList<>(2);
+            if (baseSplits.splits().isEmpty()) {
+                noGps.add(base.id());
+            }
+            if (otherSplits.splits().isEmpty()) {
+                noGps.add(other.id());
+            }
+            if (!noGps.isEmpty()) {
+                splits.put("noGpsRunIds", noGps);
+            }
             result.put("splits", splits);
         }
         return result;
+    }
+
+    /** 分段距离统一口径：非正数或未传都回落到 DEFAULT_SPLIT_KM，compare_runs 与 get_run_splits 共用。 */
+    private static double splitMeters(Double splitKm) {
+        return splitKm != null && splitKm > 0 ? splitKm * 1000d : DEFAULT_SPLIT_KM * 1000d;
     }
 
     /** 每公里（或自定义距离）分段配速。 */
@@ -1037,7 +1060,7 @@ public class SportHealthTools {
             return notFound(runId);
         }
         RunActivity run = lookup.run();
-        double splitMeters = splitKm != null && splitKm > 0 ? splitKm * 1000d : DEFAULT_SPLIT_KM * 1000d;
+        double splitMeters = splitMeters(splitKm);
         RunSplits splits = analytics.splits(run, splitMeters);
         if (splits.splits().isEmpty()) {
             return noGps(run.id(), "没有可用的 GPS 轨迹，无法计算分段配速");
