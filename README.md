@@ -48,7 +48,7 @@ JAVA_HOME=/path/to/jdk-21 java -jar target/sport-health-mcp-server-1.0.0.jar
 
 ```
 SQLite 数据库文件: /home/you/sport-health-mcp-server/data/sport-health.db
-Registered tools: 21
+Registered tools: 24
 Netty started on port 8080 (http)
 ```
 
@@ -223,7 +223,9 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | --- | --- | --- |
 | `describe_data_source` | — | 数据目录；跑步记录数 `runningCount`（只含 RUN）与全部运动记录数 `allWorkoutCount`（含步行等其它项目）；跑步记录的来源文件 `runSourceFileCount` / `runSourceFiles`（去重文件名，不等于磁盘文件数）；日期范围、来源、RouteType、解析告警分类、`storage`（库路径、`scannedTcxFiles`/`importedTcxFiles`/`unchangedTcxFiles` 本次 TCX 同步统计、`health` 华为导出规模），以及 quality 块（0 距离、缺配速/坐标/海拔、重复 Activity Id、配速离群、重复时间戳） |
 | `list_runs` | `startDate?` `endDate?` `sport?` `min/maxDistanceKm?` `min/maxPaceSecondsPerKm?` `weekday?` `sortBy?` `offset?` `limit?` | 区间内的记录（新的在前，分页），含距离/时长/配速/爬升；华为来源的记录另带 `avgHeartRate`/`maxHeartRate`/`minHeartRate`/`avgCadence`/`totalSteps`/`totalCaloriesKcal`/`recordId`/`sportTypeCode`/`subType`（TCX 来源为 `null`，不返回 `summaryData`） |
-| `get_run_detail` | `runId` `includeTrack?` `trackOffset?` `trackLimit?` | 单次完整详情：起止时间、时长、距离、平均配速/速度、爬升与下降、海拔范围、起终点坐标、该次跑步的天气 `weather`（起跑/结束时刻的气温、体感、湿度、降水、风向风速、天气现象）；华为来源另带心率/步频/步数/热量/华为运动类型码与 `summaryData` 原文（约 2.5 KB JSON），可选附带轨迹分页 |
+| `get_run_detail` | `runId` `includeTrack?` `trackOffset?` `trackLimit?` | 单次完整详情：起止时间、时长、距离、平均配速/速度、爬升与下降、海拔范围、起终点坐标、该次跑步的天气 `weather`（起跑/结束时刻的气温、体感、湿度、降水、风向风速、天气现象）；华为来源另带心率/步频/步数/热量/华为运动类型码，以及 `summaryData` 的可用性（`available`/`bytes`，原文交给 `get_run_summary_data`，不再把 2.5 KB 转义 JSON 塞进详情），可选附带轨迹分页 |
+| `get_run_summary_data` | `runId` `fields?` `decode?` | 把华为 `summaryData` 原文摊开并换算单位：时长/距离/热量（原文毫秒、卡）、平均与最快配速、心率与步频、单公里分段 `kmSplits`（段配速、本段用时、累计用时、是否末段不足一公里）、心率区间分布、跑姿汇总（触地时间/垂直振幅/左右平衡）、训练效果与恢复时间、手机自报天气 `deviceWeather`。未建模字段用 `fields` 原样取，逗号分隔、支持 `a.b` 与 `a.*`（例如 `fields="bestPace,wearSportData.recovery_time"`），没匹配到的路径列入 `missingFields`。`-1`/`-101`/`3.4e38` 这类占位值转成缺省并在 `notes` 说明；`decode=false` 只返回原始字段。TCX 记录返回 `NO_DATA` |
+| `get_run_streams` | `runId` `type?` `offset?` `limit?` | 读 `track_stream`：华为导出里没进轨迹点的原始流。不传 `type` 返回目录（每类的行数、语义、单位、数值范围、首行样例），因为一次的 `rs` 可能有两千多行；传了 `type` 再分页取行（默认 200、最多 5000），数值字段转成数字，`rs` 额外给 `speedKmh`/`paceText`，`pm2` 给 `endDistanceMeters`/`paceText`。`pm2`↔`p-m`、`bpm2`↔`b-p-m` 是同一份采样的两种写法，传任一都会命中存在的那个（`type` 是实际取到的类型，两者不同时另给 `requestedType`） |
 | `get_run_route` | `runId` `offset?` `limit?` `format?` `maxPoints?` `includeSensors?` | 轨迹点分页（时间/纬度/经度/海拔，海拔与累计距离保留 2 位小数），每点另带 `heartRate`/`cadence`/`distanceMeters`（华为来源才有，TCX 为 `null`；`includeSensors=false` 时省略这三个键）；可输出 GeoJSON，此时传感器放在与 `geometry.coordinates` 等长同序的 `sensors` 平行数组里；`maxPoints` 降采样后会忽略 `offset`/`limit` |
 | `get_running_summary` | `startDate?` `endDate?` | 次数、总距离、总时长、总爬升、平均配速、最快/最长记录 |
 | `get_daily_running` | `startDate?` `endDate?` `groupBy?` | 按天/周/月拆分，只含有记录的周期，`day` 时额外返回每天一条 |
@@ -598,7 +600,7 @@ JPA 在 WebFlux 上要配 R2DBC 才不阻塞，对只有两张表的场景属于
 ## 架构
 
 ```
-tools/SportHealthTools          # 21 个 @McpTool，负责参数校验与统一的 Map<String, Object> 返回结构
+tools/SportHealthTools          # 24 个 @McpTool，负责参数校验与统一的 Map<String, Object> 返回结构
         │
 service/RunAnalyticsService     # 区间汇总、按天拆分、个人最佳、对比、分段/GAP、最佳努力、海拔、停顿、趋势、比赛预测、ACWR、训练分类、id 解析
 service/RunLevelService         # 华为官方跑力：每日快照、五档配速、趋势、官方 vs Riegel 对照

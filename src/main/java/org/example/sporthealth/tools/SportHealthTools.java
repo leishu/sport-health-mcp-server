@@ -8,6 +8,7 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.DoubleSummaryStatistics;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -46,6 +47,7 @@ import org.example.sporthealth.domain.SplitCrossCheck;
 import org.example.sporthealth.domain.StopPoint;
 import org.example.sporthealth.domain.StopPoints;
 import org.example.sporthealth.domain.TrackPoint;
+import org.example.sporthealth.domain.TrackStream;
 import org.example.sporthealth.domain.TrainingLoad;
 import org.example.sporthealth.domain.TrainingMix;
 import org.example.sporthealth.domain.TrainingTrend;
@@ -61,6 +63,8 @@ import org.example.sporthealth.service.RunAnalyticsService;
 import org.example.sporthealth.service.RunLevelService;
 import org.example.sporthealth.support.DateParser;
 import org.example.sporthealth.support.DateRange;
+import org.example.sporthealth.support.HuaweiStreamTypes;
+import org.example.sporthealth.support.HuaweiSummaryData;
 import org.example.sporthealth.support.PaceFormat;
 import org.example.sporthealth.support.WeatherImpactAnalyzer;
 import org.example.sporthealth.weather.WeatherBackfill;
@@ -91,6 +95,8 @@ import org.springframework.stereotype.Component;
 public class SportHealthTools {
 
     private static final int MAX_ROUTE_LIMIT = 5000;
+    /** {@code rs} 流的 {@code v} 实测单位是 0.1 m/s，乘 0.36 得到 km/h（与活动平均速度吻合）。 */
+    private static final double RS_SPEED_TO_KMH = 0.36d;
     private static final double DEFAULT_SPLIT_KM = 1d;
     private static final double DEFAULT_ELEVATION_BUCKET_METERS = 100d;
     private static final double DEFAULT_ELEVATION_SMOOTHING_METERS = 1d;
@@ -198,7 +204,8 @@ public class SportHealthTools {
             description = "查看某一次跑步的完整详情，包含起止时间、总时长、距离、平均配速、平均速度、累计爬升与下降、"
                     + "海拔范围、起终点坐标，以及这次跑步起跑与结束时刻的天气（气温、体感温度、湿度、降水量、"
                     + "风向风速、天气现象）；华为来源的记录还带平均/最高/最低心率、平均步频、步数、热量、"
-                    + "华为运动类型码与 summaryData 原文（JSON，未建模字段可直接读）。"
+                    + "华为运动类型码，以及 summaryData 的可用性（原文交给 get_run_summary_data，"
+                    + "未进轨迹点的原始流交给 get_run_streams）。"
                     + "可选按页返回 GPS 轨迹点。runId 先用 list_runs 获取。"
                     + "用于回答“这次跑步的天气怎么样”“那天多少度”“这次心率多少”。")
     public Map<String, Object> getRunDetail(
@@ -230,6 +237,310 @@ public class SportHealthTools {
             result.put("route", toRoutePage(detail.route()));
         }
         return result;
+    }
+
+    /**
+     * 华为 {@code summaryData} 的结构化视图。
+     *
+     * <p>{@code get_run_detail} 只说明「这条记录带 summaryData」，2.5 KB 原文里
+     * {@code bestPace}、{@code britishPaceMap}、跑姿汇总这些字段没人接手，等于白存。
+     * 这里把实测确认过的字段换算成带单位的值，剩下没建模的仍可按 {@code fields} 取原文。
+     *
+     * <p>换算只做确认过的那部分：{@code britishPaceMap}/{@code bpm2} 与 pm2 恒差
+     * 204~224 秒，语义未确认，原样保留并写进 {@code notes}，不冒充配速。
+     */
+    @McpTool(name = "get_run_summary_data",
+            description = "读取某次跑步的华为 summaryData（导出原文，约 2.5 KB JSON）并做单位换算："
+                    + "时长/距离/热量、平均与最快配速、心率与步频、单公里分段 kmSplits（每段配速、"
+                    + "本段用时、累计用时）、心率区间分布、跑姿汇总（触地时间、垂直振幅、左右平衡）、"
+                    + "训练效果与恢复时间，以及手机自己记的天气 deviceWeather。"
+                    + "未建模字段用 fields 取原文，逗号分隔，支持 a.b 与 a.*，例如 "
+                    + "fields=\"bestPace,wearSportData.recovery_time,mExtendTrackDataMap.hrZ1\"。"
+                    + "带 -1/-101/3.4e38 的占位值会转成缺省，并在 notes 里说明原因。"
+                    + "TCX 来源的记录没有这个字段，返回 NO_DATA。")
+    public Map<String, Object> getRunSummaryData(
+            @McpToolParam(description = "跑步记录 id，先用 list_runs 获取") String runId,
+            @McpToolParam(description = "只取哪些原始字段，逗号分隔，支持 a.b 与 a.*；不传返回全部",
+                    required = false) String fields,
+            @McpToolParam(description = "是否返回 decoded 换算块，默认 true", required = false) Boolean decode) {
+        RunLookup lookup = analytics.lookup(runId);
+        if (lookup.isAmbiguous()) {
+            return ambiguous(runId, lookup);
+        }
+        if (!lookup.isFound()) {
+            return notFound(runId);
+        }
+        RunActivity run = lookup.run();
+        String text = run.summaryData();
+        if (text == null || text.isBlank()) {
+            return noData(run, "这条记录没有华为 summaryData（TCX 来源的导出不含这个字段），"
+                    + "可改用 get_run_detail / get_run_splits 的已建模字段");
+        }
+        Map<String, Object> raw = HuaweiSummaryData.parse(text);
+        if (raw.isEmpty()) {
+            return noData(run, "summaryData 不是合法 JSON，无法解析");
+        }
+        List<String> missing = new ArrayList<>();
+        Map<String, Object> selected = HuaweiSummaryData.select(raw, fields, missing);
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "OK");
+        result.put("runId", run.id());
+        result.put("date", run.date());
+        result.put("source", "huawei.summaryData");
+        result.put("bytes", text.length());
+        result.put("fieldCount", raw.size());
+        result.put("fields", selected);
+        if (decode == null || decode) {
+            List<String> notes = new ArrayList<>();
+            result.put("decoded", HuaweiSummaryData.decode(raw, notes));
+            result.put("notes", notes);
+        }
+        if (!missing.isEmpty()) {
+            result.put("missingFields", missing);
+            result.put("availableFields", List.copyOf(raw.keySet()));
+        }
+        return result;
+    }
+
+    /**
+     * 暴露 {@code track_stream}：{@code detailData} 里没有逐点时间结构、因而不进轨迹点的采样。
+     *
+     * <p>不传 {@code type} 时只给目录（有哪些流、多少行、什么语义、数值范围、首行样例），
+     * 因为一次跑步的 {@code rs} 可能有 2600 多行，直接全吐出来没有意义。传了 {@code type}
+     * 再分页取行，行内的数值字段统一转成数字，{@code rs} 额外给出换算后的速度。
+     *
+     * <p>{@code pm2} 与 {@code p-m}（{@code bpm2} 与 {@code b-p-m}）是同一次采样的两种写法，
+     * 传任一种都会命中存在的那个：{@code type} 是实际取到的类型，两者不同时另给
+     * {@code requestedType} 与 {@code typeNote}。
+     */
+    @McpTool(name = "get_run_streams",
+            description = "读取某次跑步的原始流 track_stream：华为导出里未进轨迹点的采样，"
+                    + "包括每 5 秒速度 rs、跑姿 rp（触地时间 gct、垂直振幅 vo、左右平衡 gtb）、"
+                    + "华为官方单公里配速 pm2、事件 evt 等。不传 type 时返回该记录的流目录"
+                    + "（行数、语义、单位、数值范围、首行样例），先看清有什么再取；"
+                    + "传 type 后按 offset/limit 分页取行（默认 200 行，最多 5000）。"
+                    + "适合回答「后半程步频掉没掉」「触地时间多少」「每公里官方配速怎么算的」。")
+    public Map<String, Object> getRunStreams(
+            @McpToolParam(description = "跑步记录 id，先用 list_runs 获取") String runId,
+            @McpToolParam(description = "流类型：rs / rp / pm2 / p-m / bpm2 / evt …；不传只返回目录",
+                    required = false) String type,
+            @McpToolParam(description = "分页偏移，默认 0", required = false) Integer offset,
+            @McpToolParam(description = "返回行数，默认 200，最多 5000", required = false) Integer limit) {
+        RunLookup lookup = analytics.lookup(runId);
+        if (lookup.isAmbiguous()) {
+            return ambiguous(runId, lookup);
+        }
+        if (!lookup.isFound()) {
+            return notFound(runId);
+        }
+        RunActivity run = lookup.run();
+        List<TrackStream> all = repository.streams(run.id(), null);
+        if (all.isEmpty()) {
+            return noData(run, "这条记录没有原始流（TCX 来源不产生 track_stream，"
+                    + "或华为导出里本来就没有这些采样）");
+        }
+        String requested = HuaweiStreamTypes.canonical(type);
+        if (requested == null || requested.isEmpty()) {
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("status", "OK");
+            result.put("runId", run.id());
+            result.put("date", run.date());
+            result.put("totalRows", all.size());
+            result.put("streams", streamCatalog(all));
+            result.put("hint", "先看 type，再传 type 取具体行（例如 type=\"rs\"），分页用 offset/limit");
+            return result;
+        }
+
+        String resolved = resolveStreamType(all, requested);
+        List<TrackStream> rows = all.stream()
+                .filter(row -> resolved.equals(HuaweiStreamTypes.canonical(row.streamType())))
+                .toList();
+        if (rows.isEmpty()) {
+            Map<String, Object> result = noData(run, "没有 " + requested + " 这类流");
+            result.put("availableTypes", all.stream()
+                    .map(row -> HuaweiStreamTypes.canonical(row.streamType()))
+                    .distinct()
+                    .toList());
+            return result;
+        }
+
+        Page<TrackStream> page = Page.of(rows, orZero(offset), routePageSize(limit));
+        HuaweiStreamTypes.Kind kind = HuaweiStreamTypes.of(resolved);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "OK");
+        result.put("runId", run.id());
+        result.put("date", run.date());
+        result.put("type", resolved);
+        if (!resolved.equals(requested)) {
+            result.put("requestedType", requested);
+            result.put("typeNote", requested + " 与 " + resolved + " 是同一次采样的两种写法，已取 " + resolved);
+        }
+        result.put("meaning", kind.meaning());
+        if (kind.unit() != null) {
+            result.put("unit", kind.unit());
+        }
+        result.put("total", page.total());
+        result.put("offset", page.offset());
+        result.put("limit", page.limit());
+        result.put("hasMore", page.hasMore());
+        result.put("rows", page.items().stream().map(row -> toStreamRow(resolved, row)).toList());
+        return result;
+    }
+
+    /** 流目录：按类型聚合行数、数值范围与首行样例，先看清有什么再决定取哪个。 */
+    private List<Map<String, Object>> streamCatalog(List<TrackStream> all) {
+        Map<String, List<TrackStream>> grouped = new LinkedHashMap<>();
+        for (TrackStream row : all) {
+            grouped.computeIfAbsent(HuaweiStreamTypes.canonical(row.streamType()), key -> new ArrayList<>())
+                    .add(row);
+        }
+        List<Map<String, Object>> catalog = new ArrayList<>(grouped.size());
+        grouped.forEach((type, rows) -> {
+            HuaweiStreamTypes.Kind kind = HuaweiStreamTypes.of(type);
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("type", type);
+            entry.put("rows", rows.size());
+            entry.put("meaning", kind.meaning());
+            if (kind.unit() != null) {
+                entry.put("unit", kind.unit());
+            }
+            if (kind.equivalent() != null) {
+                entry.put("equivalentType", kind.equivalent());
+            }
+            DoubleSummaryStatistics values = rows.stream()
+                    .map(TrackStream::value)
+                    .filter(Objects::nonNull)
+                    .mapToDouble(Double::doubleValue)
+                    .summaryStatistics();
+            if (values.getCount() > 0) {
+                Map<String, Object> valueRange = new LinkedHashMap<>();
+                valueRange.put("min", PaceFormat.round(values.getMin(), 3));
+                valueRange.put("avg", PaceFormat.round(values.getAverage(), 3));
+                valueRange.put("max", PaceFormat.round(values.getMax(), 3));
+                entry.put("valueRange", valueRange);
+            }
+            entry.put("firstSeq", rows.get(0).seq());
+            entry.put("lastSeq", rows.get(rows.size() - 1).seq());
+            entry.put("sample", toStreamRow(type, rows.get(0)));
+            catalog.add(entry);
+        });
+        return catalog;
+    }
+
+    /**
+     * 请求的类型不存在时退回等价写法（{@code pm2} ↔ {@code p-m}），都没有则原样返回，
+     * 由调用方给出 NO_DATA 与可选类型清单。
+     */
+    private static String resolveStreamType(List<TrackStream> all, String requested) {
+        java.util.Set<String> present = all.stream()
+                .map(row -> HuaweiStreamTypes.canonical(row.streamType()))
+                .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
+        if (present.contains(requested)) {
+            return requested;
+        }
+        String equivalent = HuaweiStreamTypes.equivalent(requested);
+        return equivalent != null && present.contains(equivalent) ? equivalent : requested;
+    }
+
+    /**
+     * 一行原始流：数值字段转成数字，去掉重复的 {@code tp}；
+     * {@code pm2}/{@code p-m} 另给段终点距离，{@code p-m}/{@code b-p-m} 的复合键拆回点序号。
+     */
+    private Map<String, Object> toStreamRow(String type, TrackStream row) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("seq", row.seq());
+        if (row.timeMillis() != null) {
+            out.put("time", formatDateTime(Instant.ofEpochMilli(row.timeMillis())));
+            out.put("timeMillis", row.timeMillis());
+        }
+        Map<String, Object> fields = streamFields(row);
+        boolean flatPace = "p-m".equals(type) || "b-p-m".equals(type);
+        Integer pointIndex = row.pointIndex();
+        if (pointIndex != null) {
+            if (flatPace && pointIndex >= 10_000) {
+                // p-m 的 k 是「距离米 × 10000 + 点序号」的复合键，拆开才有意义
+                out.put("trackPointIndex", pointIndex % 10_000);
+            } else {
+                out.put("pointIndex", pointIndex);
+            }
+        }
+        if (row.value() != null) {
+            out.put("value", PaceFormat.round(row.value(), 3));
+        }
+        if (!fields.isEmpty()) {
+            out.put("fields", fields);
+        }
+        switch (type) {
+            case "rs" -> {
+                if (row.value() != null) {
+                    // 用未取整的值算配速，避免 9.96 km/h 这种中间结果把秒数推偏 1 秒
+                    double speedKmh = row.value() * RS_SPEED_TO_KMH;
+                    out.put("speedKmh", PaceFormat.round(speedKmh, 2));
+                    out.put("paceText", PaceFormat.pace(speedKmh > 0 ? 3600d / speedKmh : null));
+                }
+            }
+            case "pm2", "p-m" -> {
+                Double endMeters = streamNumber(row.fields().get("d"));
+                if (endMeters == null && flatPace && pointIndex != null && pointIndex >= 10_000) {
+                    endMeters = (double) (pointIndex / 10_000);
+                }
+                if (endMeters != null) {
+                    out.put("endDistanceMeters", PaceFormat.round(endMeters, 1));
+                }
+                out.put("paceText", PaceFormat.pace(row.value()));
+            }
+            default -> {
+                // 其它流的字段含义未确认，只给原值
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 流字段的原文都是字符串；能转成数字的就转，避免消费方再解析一遍。
+     *
+     * <p>与 {@code value}/{@code pointIndex}/{@code time} 完全重复的键会被去掉
+     * （{@code v}/{@code p} 与 {@code value}、{@code k}/{@code n} 与点序号、{@code st} 与时间戳）：
+     * 一次跑步的 {@code rs} 有五百多行，每行多背三个重复字段纯属噪声。
+     */
+    private static Map<String, Object> streamFields(TrackStream row) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        row.fields().forEach((key, value) -> {
+            if ("tp".equals(key)) {
+                return;
+            }
+            Double number = streamNumber(value);
+            if (isRedundantField(key, number, row)) {
+                return;
+            }
+            out.put(key, number == null ? value : number);
+        });
+        return out;
+    }
+
+    private static boolean isRedundantField(String key, Double number, TrackStream row) {
+        if (number == null) {
+            return false;
+        }
+        return switch (key) {
+            case "v", "p" -> row.value() != null && Math.abs(number - row.value()) < 1e-6;
+            case "k", "n" -> row.pointIndex() != null && Math.abs(number - row.pointIndex()) < 1e-6;
+            case "st" -> row.timeMillis() != null && Math.abs(number - row.timeMillis()) < 1e-6;
+            default -> false;
+        };
+    }
+
+    private static Double streamNumber(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            double parsed = Double.parseDouble(value.trim());
+            return Double.isFinite(parsed) ? parsed : null;
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     /**
@@ -1699,7 +2010,19 @@ public class SportHealthTools {
         row.put("recordId", run.recordId());
         row.put("sportTypeCode", run.sportTypeCode());
         row.put("subType", run.subType());
-        row.put("summaryData", run.summaryData());
+        // 原文约 2.5 KB 且是一整个转义字符串，塞进详情只会挤占上下文；
+        // 这里只给「有没有、多大、去哪儿取」，内容交给 get_run_summary_data
+        Map<String, Object> summaryData = new LinkedHashMap<>();
+        String text = run.summaryData();
+        boolean available = text != null && !text.isBlank();
+        summaryData.put("available", available);
+        if (available) {
+            summaryData.put("bytes", text.length());
+            summaryData.put("tool", "get_run_summary_data");
+        } else {
+            summaryData.put("reason", "TCX 来源没有这个字段，或该次运动未带 summaryData");
+        }
+        row.put("summaryData", summaryData);
         return row;
     }
 

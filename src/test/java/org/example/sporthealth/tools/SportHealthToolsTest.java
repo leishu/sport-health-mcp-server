@@ -136,12 +136,15 @@ class SportHealthToolsTest {
             assertTrue(row.containsKey(key), "列表行缺少字段 " + key);
             org.junit.jupiter.api.Assertions.assertNull(row.get(key), "TCX 记录的 " + key + " 应为 null");
         }
-        // summaryData 约 2.5 KB，只在详情里给，列表不返回
+        // summaryData 约 2.5 KB，列表与详情都不再返回原文，只给一个指向专用工具的指针
         assertFalse(row.containsKey("summaryData"));
 
         Map<?, ?> detail = (Map<?, ?>) tools.getRunDetail((String) row.get("id"), false, null, null)
                 .get("activity");
-        assertTrue(detail.containsKey("summaryData"), "详情要给出 summaryData，便于读未建模字段");
+        Map<?, ?> summaryData = (Map<?, ?>) detail.get("summaryData");
+        assertNotNull(summaryData, "详情要说明 summaryData 有没有");
+        assertEquals(Boolean.FALSE, summaryData.get("available"), "TCX 记录没有 summaryData");
+        assertNotNull(summaryData.get("reason"));
     }
 
     @Test
