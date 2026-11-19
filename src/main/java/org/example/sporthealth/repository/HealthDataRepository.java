@@ -30,4 +30,14 @@ public interface HealthDataRepository {
         // 非 SQLite 仓储（TCX 内存仓储、测试替身）不保存这类流，默认没有
         return List.of();
     }
+
+    /**
+     * 近期静息心率（次/分），用于把运动心率换算成储备心率百分比；没有数据时返回 {@code null}。
+     *
+     * <p>只有华为导出才有 {@code daily_vitals}，TCX 仓储与测试替身拿不到，默认返回 null，
+     * 分析层会退化成「占最大心率百分比」的口径，不会因此报错。
+     */
+    default Double restingHeartRate() {
+        return null;
+    }
 }

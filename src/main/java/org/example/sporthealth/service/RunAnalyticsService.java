@@ -78,6 +78,24 @@ public class RunAnalyticsService {
     private static final double DEFAULT_STOP_SECONDS = 30d;
     private static final double DEFAULT_STOP_DISPLACEMENT_METERS = 30d;
 
+    /**
+     * 心率区间边界：前两套分别对应「储备心率百分比」与「占最大心率百分比」，
+     * 各自是 Z1~Z5 的上限，最后一段不设上限。
+     *
+     * <p>储备心率口径（Karvonen）更贴近个体差异，是本项目的首选；拿不到静息心率时
+     * （TCX 仓储、缺 {@code daily_vitals}）才退回占最大心率百分比。
+     */
+    private static final double[] HRR_ZONE_UPPER = {60d, 70d, 80d, 90d};
+    private static final double[] HRMAX_ZONE_UPPER = {65d, 75d, 85d, 92d};
+    private static final String[] HR_ZONE_CODES = {"Z1", "Z2", "Z3", "Z4", "Z5"};
+    private static final String[] HR_ZONE_TEXTS = {"恢复区", "有氧耐力区", "节奏区", "阈值区", "无氧区"};
+
+    /** 静息心率与最大心率至少要差 60 bpm，储备心率口径的分母才有意义。 */
+    private static final int MIN_HEART_RATE_RESERVE = 60;
+
+    /** 「配速像轻松跑、心率却已到阈值区」的改写门槛：Z4 的下标。 */
+    private static final int ZONE_INDEX_THRESHOLD = 3;
+
     /** 华为单公里配速所在的流类型与来源标记。 */
     private static final String STREAM_TYPE_PM2 = "pm2";
     private static final String VENDOR_SOURCE_HUAWEI = "HUAWEI_PM2";
@@ -1159,14 +1177,18 @@ public class RunAnalyticsService {
     }
 
     /**
-     * 单次跑步的训练类型识别。没有心率，规则基于距离、时长、配速相对个人中位数与分段波动。
+     * 单次跑步的训练类型识别。
+     *
+     * <p>主判据是距离、时长、配速相对个人中位数与分段波动；华为来源的记录还有平均心率，
+     * 会换算成心率区间做交叉验证（见 {@link #heartRateView}）。
      */
     public RunClassification classify(RunActivity run) {
         List<RunActivity> all = repository.dataset().activities();
-        return classify(run, baselinePace(all), medianDistanceKm(all));
+        return classify(run, baselinePace(all), medianDistanceKm(all), heartRateBaseline(all));
     }
 
-    private RunClassification classify(RunActivity run, double baselinePace, double medianDistanceKm) {
+    private RunClassification classify(RunActivity run, double baselinePace, double medianDistanceKm,
+                                       HeartRateBaseline heartRateBaseline) {
         RunSplits splits = splits(run, DEFAULT_SPLIT_METERS);
         boolean hasGps = !splits.splits().isEmpty();
         double distanceKm = PaceFormat.round(run.distanceMeters() / 1000d, 2);
@@ -1239,13 +1261,189 @@ public class RunAnalyticsService {
             reasons.add("缺少 GPS 轨迹，仅按距离/时长/配速分类");
         }
 
+        // 心率只做交叉验证，不改距离/配速口径下的判断；唯一的例外是「配速像轻松跑、
+        // 但平均心率已经进入阈值区以上」——这时配速多半被天气或疲劳拖慢，实际强度是节奏以上。
+        HrSample heartRate = heartRateSample(run, heartRateBaseline);
+        if (heartRate != null && "EASY".equals(type) && distanceKm >= 5d && heartRate.zoneIndex() >= ZONE_INDEX_THRESHOLD) {
+            type = "TEMPO";
+            confidence = "MEDIUM";
+            reasons.add("平均心率已达 " + heartRate.zoneLabel() + "，配速却接近个人中位，实际强度更接近节奏跑");
+        }
+
+        RunClassification.HeartRate hrView = heartRateView(heartRate, type, typeText(type));
+        if (hrView != null) {
+            reasons.add(hrView.text());
+            switch (hrView.signal()) {
+                case "SUPPORT" -> confidence = raiseConfidence(confidence);
+                case "CONFLICT" -> {
+                    confidence = lowerConfidence(confidence);
+                    reasons.add("心率与配速信号不一致，可能受天气、坡度、疲劳或心率漂移影响，置信度下调");
+                }
+                default -> {
+                    // NEUTRAL：心率区间对这次判定既不支持也不反对，不动置信度
+                }
+            }
+        }
+
         String typeText = typeText(type);
         String text = run.id() + " 判定为" + typeText + "（" + confidence + "）";
         return new RunClassification(run.id(), run.date(), type, typeText, confidence, reasons,
                 distanceKm, pace, PaceFormat.pace(pace),
                 baselinePace > 0 ? PaceFormat.round(baselinePace, 1) : null,
                 PaceFormat.pace(baselinePace > 0 ? baselinePace : null),
-                stdDev, gapPace, PaceFormat.pace(gapPace), text);
+                stdDev, gapPace, PaceFormat.pace(gapPace), text, hrView);
+    }
+
+    /**
+     * 心率基准：静息心率取仓储里近 28 天的均值，最大心率取数据集里观察到的最快值。
+     *
+     * <p>没有真实 {@code HRmax} 测量值（年龄未知、也没做过最大心率测试），所以这里用的是
+     * 「历史最高心率」——它只会低估不会高估，算出的百分比因此偏保守，不会把轻松跑说成阈值跑。
+     */
+    private record HeartRateBaseline(Double restingHeartRate, Integer maxHeartRateReference) {
+
+        boolean hasReference() {
+            return maxHeartRateReference != null && maxHeartRateReference > 0;
+        }
+
+        boolean usableReserve() {
+            return restingHeartRate != null && restingHeartRate > 0 && hasReference()
+                    && maxHeartRateReference - restingHeartRate >= MIN_HEART_RATE_RESERVE;
+        }
+    }
+
+    /** 一次跑步的心率换算结果，还没结合训练类型，所以不含结论与措辞。 */
+    private record HrSample(Integer avgHeartRate,
+                            Integer maxHeartRate,
+                            Integer restingHeartRate,
+                            Integer maxHeartRateReference,
+                            String percentBasis,
+                            double percent,
+                            int zoneIndex) {
+
+        String zoneCode() {
+            return HR_ZONE_CODES[zoneIndex];
+        }
+
+        String zoneText() {
+            return HR_ZONE_TEXTS[zoneIndex];
+        }
+
+        String zoneLabel() {
+            return zoneCode() + " " + zoneText();
+        }
+
+        /** 峰值心率占最大心率基准的百分比；没有最高心率时为 null。 */
+        Double peakPercentOfMax() {
+            if (maxHeartRate == null || maxHeartRate <= 0
+                    || maxHeartRateReference == null || maxHeartRateReference <= 0) {
+                return null;
+            }
+            return maxHeartRate * 100d / maxHeartRateReference;
+        }
+    }
+
+    private HeartRateBaseline heartRateBaseline(List<RunActivity> all) {
+        Integer observedMax = all.stream()
+                .map(RunActivity::maxHeartRate)
+                .filter(Objects::nonNull)
+                .filter(value -> value > 0)
+                .max(Comparator.naturalOrder())
+                .orElse(null);
+        return new HeartRateBaseline(repository.restingHeartRate(), observedMax);
+    }
+
+    /** 把平均心率换算成区间；没有心率、也没有基准时返回 null，让调用方保持原判定。 */
+    private HrSample heartRateSample(RunActivity run, HeartRateBaseline baseline) {
+        Integer avg = run.avgHeartRate();
+        if (avg == null || avg <= 0 || baseline == null || !baseline.hasReference()) {
+            return null;
+        }
+        int maxReference = baseline.maxHeartRateReference();
+        boolean reserve = baseline.usableReserve();
+        double percent = reserve
+                ? (avg - baseline.restingHeartRate()) * 100d
+                        / (maxReference - baseline.restingHeartRate())
+                : avg * 100d / maxReference;
+        // 心率带偶尔会飘到 200+ 或跌到 40，百分比夹在 0~110 之间，避免出现荒唐的区间。
+        percent = Math.max(0d, Math.min(percent, 110d));
+        double[] upperBounds = reserve ? HRR_ZONE_UPPER : HRMAX_ZONE_UPPER;
+        int zoneIndex = 0;
+        while (zoneIndex < upperBounds.length && percent >= upperBounds[zoneIndex]) {
+            zoneIndex++;
+        }
+        Integer restingHeartRate = reserve ? (int) Math.round(baseline.restingHeartRate()) : null;
+        return new HrSample(avg, run.maxHeartRate(), restingHeartRate,
+                maxReference, reserve ? "HRR" : "HRMAX", PaceFormat.round(percent, 1), zoneIndex);
+    }
+
+    /**
+     * 心率是否支持当前类型判定。
+     *
+     * <p>轻松/恢复/长距离只看平均心率所在区间；间歇与比赛额外看峰值：间歇跑有大量恢复段，
+     * 平均心率被稀释到 Z2 是常态，真正说明强度的是「有没有顶到接近最大心率」。
+     *
+     * @param zoneIndex        平均心率所在区间下标（0 = Z1）
+     * @param peakPercentOfMax 本次最高心率占最大心率基准的百分比，无最高心率时为 null
+     */
+    static String heartRateSignal(String type, int zoneIndex, Double peakPercentOfMax) {
+        boolean highPeak = peakPercentOfMax != null && peakPercentOfMax >= 93d;
+        boolean midPeak = peakPercentOfMax != null && peakPercentOfMax >= 86d;
+        return switch (type) {
+            case "INTERVAL" -> zoneIndex >= 3 || highPeak ? "SUPPORT"
+                    : zoneIndex == 2 || midPeak ? "NEUTRAL" : "CONFLICT";
+            case "RACE" -> zoneIndex >= 3 || (zoneIndex == 2 && highPeak) ? "SUPPORT"
+                    : zoneIndex == 2 ? "NEUTRAL" : "CONFLICT";
+            case "TEMPO" -> zoneIndex == 2 || zoneIndex == 3 ? "SUPPORT"
+                    : zoneIndex == 1 || zoneIndex == 4 ? "NEUTRAL" : "CONFLICT";
+            case "LONG_RUN" -> zoneIndex <= 2 ? "SUPPORT" : "CONFLICT";
+            case "RECOVERY" -> zoneIndex == 0 ? "SUPPORT" : zoneIndex == 1 ? "NEUTRAL" : "CONFLICT";
+            default -> zoneIndex <= 1 ? "SUPPORT" : zoneIndex == 2 ? "NEUTRAL" : "CONFLICT";
+        };
+    }
+
+    private static RunClassification.HeartRate heartRateView(HrSample sample, String type, String typeText) {
+        if (sample == null) {
+            return null;
+        }
+        Double peakPercent = sample.peakPercentOfMax();
+        String signal = heartRateSignal(type, sample.zoneIndex(), peakPercent);
+        String basisText = "HRR".equals(sample.percentBasis()) ? "储备心率" : "最大心率";
+        StringBuilder text = new StringBuilder()
+                .append("平均心率 ").append(sample.avgHeartRate()).append(" 次/分");
+        if (sample.maxHeartRate() != null && sample.maxHeartRate() > 0) {
+            text.append("（最高 ").append(sample.maxHeartRate()).append("）");
+        }
+        text.append("，占").append(basisText).append(' ')
+                .append(Math.round(sample.percent())).append("%，属 ")
+                .append(sample.zoneLabel());
+        if (("INTERVAL".equals(type) || "RACE".equals(type)) && peakPercent != null) {
+            text.append("；峰值心率占最大心率基准 ").append(Math.round(peakPercent)).append("%");
+        }
+        switch (signal) {
+            case "SUPPORT" -> text.append("，与").append(typeText).append("的强度相符");
+            case "CONFLICT" -> text.append("，与配速判定的").append(typeText).append("不一致");
+            default -> text.append("，对这次判定既不支持也不反对");
+        }
+        return new RunClassification.HeartRate(sample.avgHeartRate(), sample.maxHeartRate(),
+                sample.restingHeartRate(), sample.maxHeartRateReference(), sample.percentBasis(),
+                sample.percent(), sample.zoneCode(), sample.zoneText(), signal, text.toString());
+    }
+
+    /** 置信度升降只走一格，避免单靠心率把「LOW」直接抬到「HIGH」。 */
+    private static String raiseConfidence(String confidence) {
+        return switch (confidence) {
+            case "MEDIUM" -> "HIGH";
+            default -> confidence;
+        };
+    }
+
+    private static String lowerConfidence(String confidence) {
+        return switch (confidence) {
+            case "HIGH" -> "MEDIUM";
+            case "MEDIUM" -> "LOW";
+            default -> confidence;
+        };
     }
 
     /**
@@ -1255,8 +1453,9 @@ public class RunAnalyticsService {
         List<RunActivity> all = repository.dataset().activities();
         double baselinePace = baselinePace(all);
         double medianDistanceKm = medianDistanceKm(all);
+        HeartRateBaseline heartRateBaseline = heartRateBaseline(all);
         List<RunClassification> classified = runs(range).stream()
-                .map(run -> classify(run, baselinePace, medianDistanceKm))
+                .map(run -> classify(run, baselinePace, medianDistanceKm, heartRateBaseline))
                 .toList();
 
         Map<String, List<RunClassification>> byType = new LinkedHashMap<>();

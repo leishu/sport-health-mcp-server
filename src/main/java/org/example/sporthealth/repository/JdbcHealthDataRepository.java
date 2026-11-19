@@ -135,6 +135,20 @@ public class JdbcHealthDataRepository implements HealthDataRepository {
             RunRows.real(rs, "value"),
             parseFields(rs.getString("data")));
 
+    /**
+     * 近 28 天静息心率均值，作为换算储备心率的基准；没有数据时为空。
+     *
+     * <p>取均值而不是当天值：静息心率逐日波动 2~3 bpm 属正常噪声，用近期均值当基准才不会
+     * 让某天睡眠不佳把整次跑步的强度区间抬高。取不到就退化成「占最大心率百分比」。
+     */
+    private static final String SELECT_RESTING_HEART_RATE = """
+            SELECT resting_heart_rate
+            FROM daily_vitals
+            WHERE resting_heart_rate IS NOT NULL
+            ORDER BY heart_date DESC
+            LIMIT 28
+            """;
+
     /** {@code data} 是本项目自己写的 JSON 对象；解析失败说明库被外部改过，退化成 {@code _raw}。 */
     private static Map<String, String> parseFields(String data) {
         if (data == null || data.isBlank()) {
@@ -149,7 +163,9 @@ public class JdbcHealthDataRepository implements HealthDataRepository {
     }
 
     /** 快照与轨迹缓存成对替换，保证 reload 后不会出现「新摘要 + 旧轨迹」的混搭。 */
-    private record Snapshot(RunDataset dataset, ConcurrentHashMap<String, List<TrackPoint>> routes) {
+    private record Snapshot(RunDataset dataset,
+                            ConcurrentHashMap<String, List<TrackPoint>> routes,
+                            Double restingHeartRate) {
     }
 
     private final JdbcClient jdbc;
@@ -173,6 +189,11 @@ public class JdbcHealthDataRepository implements HealthDataRepository {
     @Override
     public RunDataset dataset() {
         return current().dataset();
+    }
+
+    @Override
+    public Double restingHeartRate() {
+        return current().restingHeartRate();
     }
 
     @Override
@@ -290,6 +311,17 @@ public class JdbcHealthDataRepository implements HealthDataRepository {
                 List.copyOf(lastSync.warnings()));
 
         log.info("快照已装载：{} 条活动、{} 个来源文件", activities.size(), sourceFiles.size());
-        return new Snapshot(dataset, new ConcurrentHashMap<>());
+        return new Snapshot(dataset, new ConcurrentHashMap<>(), loadRestingHeartRate());
+    }
+
+    /** 近 28 天静息心率均值；{@code daily_vitals} 还没生成时返回 null，不当作错误。 */
+    private Double loadRestingHeartRate() {
+        try {
+            List<Integer> values = jdbc.sql(SELECT_RESTING_HEART_RATE).query(Integer.class).list();
+            return values.isEmpty() ? null : values.stream().mapToInt(Integer::intValue).average().orElse(0d);
+        } catch (RuntimeException e) {
+            log.debug("读取静息心率失败，心率区间退化为占最大心率百分比：{}", e.getMessage());
+            return null;
+        }
     }
 }

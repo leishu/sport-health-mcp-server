@@ -238,7 +238,7 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `predict_race_time` | `startDate?` `endDate?` `distanceKm?` `includeOfficial?` | 用区间内 1K/5K/10K/半马/全马最佳努力做 Riegel 外推（`T2 = T1 × (D2/D1)^1.06`）。不传 `distanceKm` 时输出 5K/10K/半马/全马；有实测距离时标记 `source=ACTUAL`，外推标记 `RIEGEL`，并给出参考记录与 `HIGH/MEDIUM/LOW` 置信度。`includeOfficial=true` 时额外返回 `official` 块：华为官方跑力给出的同距离成绩（`source=HUAWEI_OFFICIAL`）、逐行的 `officialSource`/`riegelSource`/`deltaSeconds`/`deltaText`，以及快照日期与时效（`withinRange`/`staleDays`）；官方没有对应档位的目标距离列在 `unavailableTargetsKm` |
 | `get_run_level` | `date?` `includeHistory?` `historyDays?` | 华为官方跑力（`run_level` 每日快照）：跑力值 `runLevel`、A/E/I/M/R 五档配速（华为原文是 km/h，这里换算成秒/公里与 `4'35"/km` 文本）、官方给的 1/3/5/10 公里与半马/全马成绩。不传 `date` 取最新一天，传了取该日或之前最近一天（`note` 说明回退）；`includeHistory=true` 附跑力趋势，`historyDays` 默认 90、最大 3650 |
 | `get_training_load` | `endDate?` `metric?` | 训练负荷与 ACWR：7 天急性、28 天慢性、`ACWR = 急性 / (慢性/4)`、周跑量增幅、连续训练天数、休息日、单调性与 Strain，并给出调整建议。`metric` 可选 `distance`（默认，公里）或 `duration`（分钟）；数据覆盖不足时明确标注置信度 |
-| `classify_run` | `runId` | 识别训练类型：轻松跑、长距离跑、节奏跑、间歇/变速跑、比赛/测试跑、恢复跑。基于距离、时长、配速相对个人中位数与分段波动，返回判定依据与置信度（无 GPS 时降为 LOW） |
+| `classify_run` | `runId` | 识别训练类型：轻松跑、长距离跑、节奏跑、间歇/变速跑、比赛/测试跑、恢复跑。基于距离、时长、配速相对个人中位数与分段波动，并用平均心率所在区间（Z1~Z5）交叉验证，返回判定依据、心率区间与置信度（无 GPS 时降为 LOW） |
 | `get_training_mix` | `startDate?` `endDate?` | 区间内的训练类型构成：各类型的次数、距离、距离占比，并逐条列出分类结果。逐条分类会按需解析轨迹，首次调用稍慢 |
 | `get_weather_impact` | `startDate?` `endDate?` `minDistanceKm?` | 只读已回填的 `run_weather`，按起跑气温、湿度、风速、有无降水分组，返回每组次数、加权平均配速、相对整体基线的快慢秒数，以及气温与配速的 Pearson 相关系数。不联网，没有天气时提示先 `reload_data` |
 | `reload_data` | — | 增量同步：按 `(文件名, size, mtime, sha256)` 只解析变化的 TCX 与华为导出文件（JSON / xls / xlsx），写完后触发天气回填，无需重启 |
@@ -259,7 +259,7 @@ P0 新增的五项分析都只使用已有的 TCX 数据与已回填的天气，
 - **官方跑力（与 Riegel 并列，不互相替代）**：`run_level` 是华为每日一行的官方快照，含 `currentRunLevel`、A/E/I/M/R 五档速度（km/h）与 1/3/5/10 公里、半马、全马成绩。`get_run_level` 原样读出并换算配速；`predict_race_time(includeOfficial=true)` 按「区间结束日或之前最近一天」取快照，与 Riegel 逐距离并列，每行都带 `officialSource=HUAWEI_OFFICIAL` 与 `riegelSource=ACTUAL/RIEGEL`，差值为正表示官方更慢；相差 30 秒以内算「基本一致」，不作快慢判断。快照不在区间内时 `withinRange=false` 并给出 `staleDays`。
 - **训练负荷 / ACWR**：急性窗口 7 天、慢性窗口 28 天，负荷口径默认距离（公里），也可切换为时长（分钟）。`ACWR = 急性负荷 / (慢性负荷 / 4)`；同时返回周增幅、连续训练天数、休息日、7 天单调性（均值/标准差）与 Strain。慢性窗口覆盖不足 21 天或训练日少于 7 天时 `dataSufficient=false`，置信度降为 `LOW`。
 - **坡度修正配速 GAP**：用 Minetti 跑步能量代价公式计算坡度代价比 `Cr(grade)/Cr(0)`，`GAP = 实际配速 / 代价比`，坡度夹取到 `[-45%, 45%]`；净海拔变化取每段首尾海拔差。全程 GAP 用等效平路距离加权，而不是对分段 GAP 做算术平均。
-- **训练类型识别**：无心率数据，基于距离、时长、配速相对个人中位数与分段波动做启发式判断。长距离阈值取 `max(10 km, 1.5 × 个人中位距离)`；间歇/变速要求同时有至少 2 段明显快、2 段明显慢于中位配速，避免把长距离跑里的一次停顿误判成间歇；无 GPS 轨迹时置信度降为 `LOW`。
+- **训练类型识别**：主判据是距离、时长、配速相对个人中位数与分段波动。长距离阈值取 `max(10 km, 1.5 × 个人中位距离)`；间歇/变速要求同时有至少 2 段明显快、2 段明显慢于中位配速，避免把长距离跑里的一次停顿误判成间歇；无 GPS 轨迹时置信度降为 `LOW`。华为来源的记录还有平均心率，会换算成区间（Z1~Z5）做交叉验证：静息心率取 `daily_vitals` 近 28 天均值，最大心率取数据集里观察到的最快值（只会低估，偏保守），两者差 ≥ 60 bpm 时用储备心率（Karvonen）百分比，否则退回占最大心率百分比；区间与配速一致则置信度上调一格，冲突则下调一格，配速像轻松跑但心率已进 `Z4` 时改判节奏跑。
 - **天气影响**：只读 `run_weather` 中 `status=OK` 的记录，优先使用起跑快照（缺失时退回结束快照）。分组内配速用「总时长 / 总距离」加权；样本少于 3 条时相关系数为 `null`，并在结论文本里提示样本不足。
 
 ### 返回状态

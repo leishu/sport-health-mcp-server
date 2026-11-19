@@ -185,7 +185,7 @@ public class SportHealthTools {
                     + "可选按页返回 GPS 轨迹点。runId 先用 list_runs 获取。"
                     + "用于回答“这次跑步的天气怎么样”“那天多少度”“这次心率多少”。")
     public Map<String, Object> getRunDetail(
-            @McpToolParam(description = "跑步记录 id，例如 20261025户外跑步") String runId,
+            @McpToolParam(description = "跑步记录 id，先用 list_runs 获取") String runId,
             @McpToolParam(description = "是否返回轨迹点，默认 false", required = false) Boolean includeTrack,
             @McpToolParam(description = "轨迹分页偏移，默认 0", required = false) Integer trackOffset,
             @McpToolParam(description = "轨迹返回条数，默认 200，最多 5000", required = false) Integer trackLimit) {
@@ -827,14 +827,17 @@ public class SportHealthTools {
     }
 
     /**
-     * 单次跑步的训练类型识别。
+     * 单次跑步的训练类型识别：配速/距离/分段波动为主，心率区间做交叉验证。
      */
     @McpTool(name = "classify_run",
             description = "识别一次跑步的训练类型：轻松跑、长距离跑、节奏跑、间歇/变速跑、比赛/测试跑或恢复跑。"
-                    + "没有心率数据，分类基于距离、时长、配速相对个人中位数以及分段配速波动，"
-                    + "返回判定依据与置信度。用于回答“这次算轻松跑还是节奏跑”。")
+                    + "主判据是距离、时长、配速相对个人中位数与分段配速波动；华为来源的记录还会把平均心率换算成"
+                    + "心率区间（静息心率取近 28 天均值、最大心率取数据里观察到的最快值，即储备心率口径）做交叉验证："
+                    + "心率与配速一致时提高置信度，冲突时下调并在 reasons 里说明；配速像轻松跑但平均心率已进阈值区时"
+                    + "改判为节奏跑。返回判定依据、心率区间与置信度。用于回答“这次算轻松跑还是节奏跑”。"
+                    + "runId 先用 list_runs 获取。")
     public Map<String, Object> classifyRun(
-            @McpToolParam(description = "跑步记录 id，例如 20261025户外跑步") String runId) {
+            @McpToolParam(description = "跑步记录 id，先用 list_runs 获取") String runId) {
         RunLookup lookup = analytics.lookup(runId);
         if (lookup.isAmbiguous()) {
             return ambiguous(runId, lookup);
@@ -859,8 +862,28 @@ public class SportHealthTools {
         result.put("paceStdDevSeconds", classification.paceStdDevSeconds());
         result.put("gradeAdjustedPaceSecondsPerKm", classification.gradeAdjustedPaceSecondsPerKm());
         result.put("gradeAdjustedPaceText", classification.gradeAdjustedPaceText());
+        result.put("heartRate", heartRateMap(classification.heartRate()));
         result.put("text", classification.text());
         return result;
+    }
+
+    /** 心率区间判定的输出形态；TCX 来源没有心率时整块为 null，键仍然存在。 */
+    private Map<String, Object> heartRateMap(RunClassification.HeartRate heartRate) {
+        if (heartRate == null) {
+            return null;
+        }
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("avgHeartRate", heartRate.avgHeartRate());
+        map.put("maxHeartRate", heartRate.maxHeartRate());
+        map.put("restingHeartRate", heartRate.restingHeartRate());
+        map.put("maxHeartRateReference", heartRate.maxHeartRateReference());
+        map.put("percentBasis", heartRate.percentBasis());
+        map.put("percent", heartRate.percent());
+        map.put("zone", heartRate.zone());
+        map.put("zoneText", heartRate.zoneText());
+        map.put("signal", heartRate.signal());
+        map.put("text", heartRate.text());
+        return map;
     }
 
     /**
