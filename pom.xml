@@ -67,6 +67,13 @@
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
         </dependency>
+        <!-- SportsHealth 的 .xls 与 HUAWEI_Research 的 .xlsx：POI 同时支持 HSSF 与 XSSF，
+             WorkbookFactory 按文件头自动选择 -->
+        <dependency>
+            <groupId>org.apache.poi</groupId>
+            <artifactId>poi-ooxml</artifactId>
+            <version>5.5.1</version>
+        </dependency>
 
         <dependency>
             <groupId>org.springframework.boot</groupId>

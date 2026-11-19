@@ -15,7 +15,7 @@ import org.springframework.stereotype.Component;
 /**
  * SQLite 表结构与版本迁移。
  *
- * <p>只维护七张表：
+ * <p>核心表：
  * <ul>
  *   <li>{@code run_activity}：一次运动的全部摘要字段，外加来源文件、内容哈希与导入时间。
  *       来自华为 JSON 导出的记录还会带上心率、步数、卡路里、运动类型码等列；</li>
@@ -28,6 +28,19 @@ import org.springframework.stereotype.Component;
  *   <li>{@code activity_minute}：华为「每分钟运动数据」，一行一分钟一种运动类型，用于步数与活动量分析；</li>
  *   <li>{@code health_metric_type}：指标字典，把 {@code type_code + metric_key} 翻译成人话，
  *       由 v4 迁移写入种子数据，{@code describe_data_source} 与数据字典文档都以它为准。</li>
+ *   <li>{@code body_measurement} / {@code sleep_session} / {@code daily_activity} / {@code daily_vitals}：
+ *       v7 起由 {@link DerivedTables} 从上面两张原始表重建的业务视图，一次称重 / 一次睡眠 /
+ *       一天活动量 / 一天体征各一行。</li>
+ *   <li>{@code sample_sequence}：v8 新增，承载华为「Sample sequence data」里的原始样本序列
+ *       （HRV RRI、心律失常、睡眠报告、ECG 波形等），一行一条原始记录，detail/extend 原样保留；</li>
+ *   <li>{@code excel_sheet} / {@code excel_sheet_row}：v8 新增，把 SportsHealth 的 xls 与
+ *       HUAWEI_Research 的 xlsx 按「工作表 + 行」原样落库，空单元格不占空间，表头另存；</li>
+ *   <li>{@code track_stream}：v8 新增，运动 detailData 里未进 {@code track_point} 的流
+ *       （每 5 秒速度、跑姿、单公里配速、事件等），一行一个采样；</li>
+ *   <li>{@code sleep_report} / {@code ecg_record} / {@code daily_sport_stat} /
+ *       {@code sport_daily_dimen_stat} / {@code daily_health_stat} /
+ *       {@code daily_health_samplestat} / {@code run_level} / {@code medal}：
+ *       v8 起由 {@link DerivedTables} 从样本序列与 Excel 原始行重建的便捷表。</li>
  * </ul>
  *
  * <p>版本号写在 {@code PRAGMA user_version}：0 表示空库，直接建表；后续加字段时
@@ -42,7 +55,7 @@ import org.springframework.stereotype.Component;
 public class SqliteSchema {
 
     /** 当前结构版本，改动 {@link #MIGRATIONS} 时同步递增。 */
-    static final int SCHEMA_VERSION = 6;
+    static final int SCHEMA_VERSION = 8;
 
     /** 索引 {@code i} 对应从版本 {@code i} 升级到 {@code i + 1} 的脚本。 */
     private static final List<String> MIGRATIONS = List.of("""
@@ -269,6 +282,286 @@ public class SqliteSchema {
             // 把 TCX 行删掉并把天气改挂到新 id；其他记录只是原地重写一次。
             """
             DELETE FROM source_file WHERE kind = 'huawei' AND source_file LIKE 'motion path detail data%'
+            """,
+            // v7：体重、睡眠、每日活动、每日体征各落成一张直接可查的表。
+            // 这里只建表，数据由 DerivedTables 在每次同步末尾用 INSERT … SELECT 重建：
+            // 升级上来的旧库在下一次同步时一次性补齐，不需要重导 630MB 源文件；
+            // 新建的空库则等到第一次真正有数据时才会填满。
+            """
+            CREATE TABLE IF NOT EXISTS body_measurement (
+                record_id             TEXT PRIMARY KEY,
+                measured_at           TEXT NOT NULL,
+                weight_kg             REAL NOT NULL,
+                bmi                   REAL,
+                body_fat_percent      REAL,
+                body_fat_kg           REAL,
+                muscle_mass_kg        REAL,
+                protein_percent       REAL,
+                body_water_percent    REAL,
+                bone_salt_kg          REAL,
+                visceral_fat_level    REAL,
+                waist_hip_ratio       REAL,
+                basal_metabolism_kcal REAL,
+                body_age              INTEGER,
+                body_score            REAL,
+                height_cm             REAL,
+                heart_rate            INTEGER,
+                gender                INTEGER,
+                has_body_composition  INTEGER NOT NULL,
+                source_file           TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_body_measurement_at ON body_measurement (measured_at);
+
+            CREATE TABLE IF NOT EXISTS sleep_session (
+                session_start  TEXT PRIMARY KEY,
+                session_end    TEXT NOT NULL,
+                sleep_date     TEXT NOT NULL,
+                sleep_type     TEXT NOT NULL,
+                in_bed_minutes INTEGER NOT NULL,
+                asleep_minutes INTEGER NOT NULL,
+                deep_minutes   INTEGER NOT NULL,
+                light_minutes  INTEGER NOT NULL,
+                rem_minutes    INTEGER NOT NULL,
+                awake_minutes  INTEGER NOT NULL,
+                noon_minutes   INTEGER NOT NULL,
+                segment_count  INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sleep_session_date ON sleep_session (sleep_date, sleep_type);
+
+            CREATE TABLE IF NOT EXISTS daily_activity (
+                activity_date   TEXT PRIMARY KEY,
+                steps           INTEGER NOT NULL,
+                walk_steps      INTEGER NOT NULL,
+                run_steps       INTEGER NOT NULL,
+                distance_meters REAL NOT NULL,
+                calories_kcal   REAL NOT NULL,
+                active_minutes  INTEGER NOT NULL,
+                stand_minutes   INTEGER NOT NULL,
+                first_minute    TEXT,
+                last_minute     TEXT,
+                minute_rows     INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS daily_vitals (
+                heart_date         TEXT PRIMARY KEY,
+                resting_heart_rate INTEGER,
+                hrv_rmssd          REAL,
+                avg_heart_rate     REAL,
+                min_heart_rate     INTEGER,
+                max_heart_rate     INTEGER,
+                heart_rate_samples INTEGER NOT NULL,
+                stress_avg         REAL,
+                stress_max         INTEGER,
+                vo2max             REAL
+            )
+            """,
+            // v8：把此前忽略的三类原始数据也收进库。
+            //   - Sample sequence data：13 个 JSON、1.18 万条记录，detailData 常有几十万字符的波形；
+            //   - SportsHealth xls：93 个数据文件里 37 个非空，按工作表 + 行原样保存；
+            //   - HUAWEI_Research xlsx：4 张汇总表；
+            //   - 运动 detailData 里未入 track_point 的流，以及 summaryData 全文。
+            // 运动 JSON 的指纹在这里清掉，让下一次同步重读一遍补齐 summary_data / track_stream；
+            // sample sequence 与 Excel 是新增类别，本身没有旧指纹，会自然首次导入。
+            """
+            CREATE TABLE IF NOT EXISTS sample_sequence (
+                record_id    TEXT PRIMARY KEY,
+                type_code    INTEGER NOT NULL,
+                data_id      INTEGER,
+                sub_type     INTEGER,
+                start_time   TEXT NOT NULL,
+                end_time     TEXT NOT NULL,
+                time_zone    TEXT,
+                device_code  TEXT,
+                summary_data TEXT,
+                detail_data  TEXT,
+                extend_data  TEXT,
+                source_file  TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sample_sequence_type
+                ON sample_sequence (type_code, start_time);
+            CREATE INDEX IF NOT EXISTS idx_sample_sequence_source
+                ON sample_sequence (source_file);
+
+            CREATE TABLE IF NOT EXISTS excel_sheet (
+                source_file  TEXT NOT NULL,
+                sheet_name   TEXT NOT NULL,
+                row_count    INTEGER NOT NULL,
+                column_count INTEGER NOT NULL,
+                header_json  TEXT NOT NULL,
+                PRIMARY KEY (source_file, sheet_name)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS excel_sheet_row (
+                source_file TEXT NOT NULL,
+                sheet_name  TEXT NOT NULL,
+                row_number  INTEGER NOT NULL,
+                row_data    TEXT NOT NULL,
+                PRIMARY KEY (source_file, sheet_name, row_number)
+            ) WITHOUT ROWID;
+
+            CREATE INDEX IF NOT EXISTS idx_excel_sheet_row_sheet
+                ON excel_sheet_row (sheet_name, row_number);
+
+            CREATE TABLE IF NOT EXISTS track_stream (
+                run_id       TEXT NOT NULL,
+                stream_type  TEXT NOT NULL,
+                seq          INTEGER NOT NULL,
+                time_millis  INTEGER,
+                point_index  INTEGER,
+                value        REAL,
+                data         TEXT NOT NULL,
+                PRIMARY KEY (run_id, stream_type, seq)
+            ) WITHOUT ROWID;
+
+            ALTER TABLE run_activity ADD COLUMN summary_data TEXT;
+
+            CREATE TABLE IF NOT EXISTS sleep_report (
+                record_id                       TEXT PRIMARY KEY,
+                start_time                      TEXT NOT NULL,
+                end_time                        TEXT NOT NULL,
+                sleep_date                      TEXT NOT NULL,
+                sleep_score                     REAL,
+                sleep_efficiency                REAL,
+                sleep_latency                   REAL,
+                avg_breathrate                  REAL,
+                avg_heartrate                   REAL,
+                avg_hrv                         REAL,
+                avg_oxygen_saturation           REAL,
+                rdi                             REAL,
+                snore_freq                      REAL,
+                wake_count                      INTEGER,
+                turn_over_count                 INTEGER,
+                deep_part                       REAL,
+                bed_time                        INTEGER,
+                fall_asleep_time                INTEGER,
+                rising_time                     INTEGER,
+                wakeup_time                     INTEGER,
+                prepare_sleep_time              INTEGER,
+                sleep_data_quality              INTEGER,
+                valid_data                      REAL,
+                breathrate_day_to_baseline      REAL,
+                heartrate_day_to_baseline       REAL,
+                hrv_day_to_baseline             REAL,
+                oxygen_saturation_day_to_baseline REAL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sleep_report_date ON sleep_report (sleep_date);
+
+            CREATE TABLE IF NOT EXISTS ecg_record (
+                record_id             TEXT PRIMARY KEY,
+                start_time            TEXT NOT NULL,
+                end_time              TEXT NOT NULL,
+                average_heart_rate    INTEGER,
+                ecg_arrhy_type        INTEGER,
+                ecg_data_length       INTEGER,
+                data_sources          TEXT,
+                ecg_app_version       TEXT,
+                package_name          TEXT,
+                user_symptom          INTEGER,
+                device_code           TEXT,
+                detail_sample_count   INTEGER,
+                extend_sample_count   INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS daily_sport_stat (
+                activity_date    TEXT PRIMARY KEY,
+                excel_row        INTEGER NOT NULL,
+                data_id          TEXT,
+                time_zone        TEXT,
+                data_source      TEXT,
+                device_code      TEXT,
+                sport_type       TEXT,
+                sport_basic_info TEXT,
+                steps            INTEGER,
+                distance_meters  REAL,
+                calories_kcal    REAL,
+                altitude         REAL,
+                floors           REAL,
+                duration_seconds REAL,
+                record_count     INTEGER,
+                version          TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS sport_daily_dimen_stat (
+                activity_date    TEXT NOT NULL,
+                sport_type       TEXT NOT NULL,
+                excel_row        INTEGER NOT NULL,
+                data_id          TEXT,
+                time_zone        TEXT,
+                data_source      TEXT,
+                device_code      TEXT,
+                sport_basic_info TEXT,
+                steps            INTEGER,
+                distance_meters  REAL,
+                calories_kcal    REAL,
+                altitude         REAL,
+                floors           REAL,
+                duration_seconds REAL,
+                record_count     INTEGER,
+                version          TEXT,
+                PRIMARY KEY (activity_date, sport_type, excel_row)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS daily_health_stat (
+                generate_time TEXT NOT NULL,
+                type_code     TEXT NOT NULL,
+                excel_row     INTEGER NOT NULL,
+                time_zone     TEXT,
+                total_info    TEXT NOT NULL,
+                PRIMARY KEY (generate_time, type_code, excel_row)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS daily_health_samplestat (
+                generate_time TEXT NOT NULL,
+                type_code     TEXT NOT NULL,
+                excel_row     INTEGER NOT NULL,
+                time_zone     TEXT,
+                total_info    TEXT NOT NULL,
+                PRIMARY KEY (generate_time, type_code, excel_row)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS run_level (
+                record_day             TEXT PRIMARY KEY,
+                excel_row              INTEGER NOT NULL,
+                version                TEXT,
+                current_run_level      REAL,
+                a_speed                REAL,
+                e_speed                REAL,
+                i_speed                REAL,
+                m_speed                REAL,
+                r_speed                REAL,
+                km1_seconds            REAL,
+                km3_seconds            REAL,
+                km5_seconds            REAL,
+                km10_seconds           REAL,
+                half_marathon_seconds  REAL,
+                marathon_seconds       REAL,
+                user_run_level_json    TEXT,
+                motion_path_run_level_json TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS medal (
+                medal_type  TEXT NOT NULL,
+                medal_level TEXT NOT NULL,
+                excel_row   INTEGER NOT NULL,
+                gain_count  INTEGER,
+                take_date   TEXT,
+                modify_time TEXT,
+                PRIMARY KEY (medal_type, medal_level, excel_row)
+            ) WITHOUT ROWID;
+
+            -- 派生表都可以从原始表重算。清空一次，保证升级到 v8 后即使没有任何文件重导，
+            -- 下一次同步的「派生表为空」判断也会触发一次全量重建，把新增的 8 张表填满。
+            DELETE FROM body_measurement;
+            DELETE FROM sleep_session;
+            DELETE FROM daily_activity;
+            DELETE FROM daily_vitals;
+
+            DELETE FROM source_file
+             WHERE kind = 'huawei' AND source_file LIKE 'motion path detail data%'
             """);
 
     private final JdbcClient jdbc;

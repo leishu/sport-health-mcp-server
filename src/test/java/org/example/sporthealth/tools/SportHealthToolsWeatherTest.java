@@ -19,8 +19,11 @@ import org.example.sporthealth.importer.SourceFileScanner;
 import org.example.sporthealth.importer.TcxParser;
 import org.example.sporthealth.importer.huawei.HealthDetailParser;
 import org.example.sporthealth.importer.huawei.HuaweiExportScanner;
+import org.example.sporthealth.importer.huawei.ExcelWorkbookParser;
 import org.example.sporthealth.importer.huawei.MinuteActivityParser;
 import org.example.sporthealth.importer.huawei.MotionPathParser;
+import org.example.sporthealth.importer.huawei.SampleSequenceParser;
+import org.example.sporthealth.repository.DerivedTables;
 import org.example.sporthealth.repository.HuaweiExportImporter;
 import org.example.sporthealth.repository.JdbcHealthDataRepository;
 import org.example.sporthealth.repository.RunWeatherStore;
@@ -189,9 +192,11 @@ class SportHealthToolsWeatherTest {
         TransactionTemplate transactions = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
         SqliteSchema schema = new SqliteSchema(jdbc, dataSource);
         SourceFileStateStore stateStore = new SourceFileStateStore(jdbc, schema);
+        DerivedTables derived = new DerivedTables(jdbc, transactions, schema);
         HuaweiExportImporter huawei = new HuaweiExportImporter(dataSource, jdbc, transactions,
                 new HuaweiExportScanner(), new MotionPathParser(), new HealthDetailParser(),
-                new MinuteActivityParser(), properties, stateStore, schema);
+                new MinuteActivityParser(), new SampleSequenceParser(),
+                new ExcelWorkbookParser(), properties, stateStore, schema, derived);
         TcxIncrementalImporter importer = new TcxIncrementalImporter(
                 jdbc, transactions, new SourceFileScanner(), new TcxParser(properties),
                 properties, stateStore, schema, offlineBackfill(jdbc), huawei);

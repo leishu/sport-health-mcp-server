@@ -334,19 +334,44 @@ sport:
 
 TCX 文件只在**内容变化**时被解析一次，结果写进 SQLite；之后所有查询都走库和内存快照。
 
-### 四张表
+### 表清单
 
 | 表 | 内容 |
 | --- | --- |
-| `run_activity` | 一次运动一行：摘要字段（时间、距离、配速、爬升、起终点坐标…）+ `source_file` + `content_hash` + `imported_at` |
+| `run_activity` | 一次运动一行：摘要字段（时间、距离、配速、爬升、起终点坐标…）+ `source_file` + `content_hash` + `imported_at`；v8 起附带 `summary_data` 原文 |
 | `track_point` | 轨迹点，主键 `(run_id, seq)`，`WITHOUT ROWID`，一个活动的点物理连续 |
+| `track_stream` | 未进入轨迹点的原始流：`rs` 每 5 秒速度、`rp` 跑姿、`pm2` 单公里配速、`evt` 事件等，主键 `(run_id, stream_type, seq)` |
 | `source_file` | 来源文件指纹：`size`、`modified_millis`、`content_hash`，增量同步的比对基准 |
 | `run_weather` | 每次跑步的起跑 / 结束两个时刻的天气，主键 `run_id`，由 open-meteo 回填 |
+| `health_metric` | 华为健康明细，一行一个采样点：动态心率、睡眠分期、体重、血氧、压力… |
+| `activity_minute` | 华为每分钟运动数据：步数、距离、热量、站立 |
+| `health_metric_type` | 指标字典，把 `type_code + metric_key` 翻成中文名与口径 |
+| `sample_sequence` | 华为「Sample sequence data」原始记录：HRV RRI、心律失常、睡眠报告、ECG 波形等；`summary/detail/extend` 三段原文完整保留 |
+| `excel_sheet` | Excel 工作表清单与清洗后的表头（SportsHealth xls + HUAWEI_Research xlsx） |
+| `excel_sheet_row` | Excel 原始数据行，一行一个非空行，空单元格不写入 JSON |
+| `body_measurement` | 一次称重一行：体重、体脂率、BMI、骨骼肌量…（由 `health_metric` 派生） |
+| `sleep_session` | 一次睡眠或午睡一行：入/离床时刻、深睡 / 浅睡 / REM / 清醒分钟（派生） |
+| `daily_activity` | 一天一行：步数（含走路 / 跑步拆分）、距离、热量、中高强度分钟（派生） |
+| `daily_vitals` | 一天一行：静息心率、HRV、动态心率区间、压力、最大摄氧量（派生） |
+| `sleep_report` | 夜间睡眠报告：评分、效率、平均心率 / HRV / 血氧、呼吸紊乱指数（派生自 `sample_sequence`） |
+| `ecg_record` | ECG 记录元数据（派生自 `sample_sequence`，波形仍在原始表） |
+| `daily_sport_stat` | 每日运动统计（派生自 `user sport daily statistics.xls`） |
+| `sport_daily_dimen_stat` | 按运动类型拆分的每日统计（派生自 `sport daily dimen statistics.xls`） |
+| `daily_health_stat` | 每日健康统计（派生自 `user health daily statistics.xls`） |
+| `daily_health_samplestat` | 每日健康样本统计（派生自 `user health daily samplestat.xls`） |
+| `run_level` | 华为官方跑力与 5 km / 10 km / 半马 / 全马预测成绩 |
+| `medal` | 勋章获得记录（同一类型 / 等级可多次获得） |
 
-表结构版本记在 `PRAGMA user_version`（当前为 3）。以后加心率、步频等列时，
+前 11 张是原始表，后 12 张是**派生表**：内容完全由 `health_metric` / `activity_minute` /
+`sample_sequence` / `excel_sheet_row` 决定，每次真有文件重导后由 `DerivedTables` 用
+`INSERT … SELECT` 整表重建，升级到 v7 / v8 的旧库在下一次同步时一次性回填。
+字段级说明见 [`docs/数据字典.md`](docs/数据字典.md)。
+
+表结构版本记在 `PRAGMA user_version`（当前为 8）。以后加列或加表时，
 往 `SqliteSchema.MIGRATIONS` 追加一段脚本并把 `SCHEMA_VERSION` 加一即可，不需要 Flyway；
 版本 1 的旧库会在启动时自动补上 `source_file.status` / `error_message` 两列，版本 2 的会补建 `run_weather`，
-不需要删库重建。
+v4/v6 补健康明细与分钟活动表，v7 补四张业务派生表，v8 补样本序列、Excel 原始行、轨迹附加流
+以及另外八张派生表，不需要删库重建。
 
 ### 增量规则
 

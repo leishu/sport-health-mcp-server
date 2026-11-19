@@ -4,6 +4,7 @@ import java.time.Instant;
 import java.util.List;
 
 import org.example.sporthealth.domain.TrackPoint;
+import org.example.sporthealth.importer.huawei.MotionTrackData.MotionStream;
 
 /**
  * 一次华为运动记录解析后的中间形态，尚未落库。
@@ -31,6 +32,8 @@ import org.example.sporthealth.domain.TrackPoint;
  * @param climbMeters       累计爬升（米），由气压高度序列累加，估算值
  * @param descentMeters     累计下降（米），优先取导出汇总值（原单位分米，已换算）
  * @param trackPoints       轨迹点（已转 WGS-84），可能为空
+ * @param summaryData       华为 summaryData 原文，保留全部未建模字段
+ * @param streams           detailData 里未进入轨迹点的流（rs/rp/pm2/evt 等）
  */
 public record ParsedWorkout(
         String id,
@@ -52,7 +55,9 @@ public record ParsedWorkout(
         Integer avgCadence,
         Double climbMeters,
         Double descentMeters,
-        List<TrackPoint> trackPoints) {
+        List<TrackPoint> trackPoints,
+        String summaryData,
+        List<MotionStream> streams) {
 
     /** 是否有可用轨迹（掉落 GPS 的室内运动为 false）。 */
     public boolean hasTrack() {

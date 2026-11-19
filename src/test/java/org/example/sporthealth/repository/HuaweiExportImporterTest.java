@@ -3,6 +3,7 @@ package org.example.sporthealth.repository;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -10,6 +11,10 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+
+import org.apache.poi.hssf.usermodel.HSSFWorkbook;
+import org.apache.poi.ss.usermodel.Row;
+import org.apache.poi.ss.usermodel.Sheet;
 
 import org.example.sporthealth.config.HealthDataProperties;
 import org.example.sporthealth.config.WeatherProperties;
@@ -19,8 +24,10 @@ import org.example.sporthealth.importer.SourceFileScanner;
 import org.example.sporthealth.importer.TcxParser;
 import org.example.sporthealth.importer.huawei.HealthDetailParser;
 import org.example.sporthealth.importer.huawei.HuaweiExportScanner;
+import org.example.sporthealth.importer.huawei.ExcelWorkbookParser;
 import org.example.sporthealth.importer.huawei.MinuteActivityParser;
 import org.example.sporthealth.importer.huawei.MotionPathParser;
+import org.example.sporthealth.importer.huawei.SampleSequenceParser;
 import org.example.sporthealth.weather.OpenMeteoClient;
 import org.example.sporthealth.weather.WeatherBackfill;
 import org.junit.jupiter.api.BeforeEach;
@@ -63,6 +70,9 @@ class HuaweiExportImporterTest {
         write("HUAWEI_HEALTH/Health detail data & description/health detail data1_0.json", healthJson());
         write("HUAWEI_HEALTH/Sport per minute merged data & description/sport per minute merged data.json",
                 minuteJson());
+        write("HUAWEI_HEALTH/Sample sequence data & description/sample sequence data1_0.json",
+                sampleJson());
+        writeWorkbook("HUAWEI_HEALTH/SportsHealth data & desciption/user medal info.xls");
         properties = new HealthDataProperties(dataDir.toString(), dbFile.toString(), "Asia/Shanghai", 20, 200);
     }
 
@@ -131,9 +141,9 @@ class HuaweiExportImporterTest {
         repository.reload();
 
         HuaweiExportImporter.Result sync = repository.lastHuaweiSync();
-        assertEquals(3, sync.scanned());
+        assertEquals(5, sync.scanned(), "运动 / 健康明细 / 分钟数据 / 样本序列 / Excel 各一个文件");
         assertEquals(0, sync.imported(), "指纹命中后不应重新解析");
-        assertEquals(3, sync.unchanged());
+        assertEquals(5, sync.unchanged());
         assertEquals(2, repository.dataset().runCount(), "接管后仍是 2 次跑步，没有多出一行");
     }
 
@@ -169,9 +179,86 @@ class HuaweiExportImporterTest {
         assertEquals(13.07, minuteKcal, 0.001, "4070 + 9000 cal = 13.07 kcal");
     }
 
+    /**
+     * 原始长表写完之后，四张派生表要跟着补齐：心率按天汇总、分钟活动按天汇总。
+     * 这两张是「心率 / 走路」最常被查的样子，空了就等于没导进来。
+     */
     @Test
-    void reimportKeepsRowCountStable() throws IOException {
+    void rebuildsDerivedTablesAfterImport() {
         JdbcHealthDataRepository repository = repository();
+        repository.dataset();
+
+        // 健康明细的时间是 2026-11-10T23:05Z，按 Asia/Shanghai 落在 11-11 07:05
+        Map<String, Object> vitals = jdbc().sql(
+                        "SELECT * FROM daily_vitals WHERE heart_date = '2026-11-11'")
+                .query().singleRow();
+        assertEquals(61.0, ((Number) vitals.get("avg_heart_rate")).doubleValue(), 0.001);
+        assertEquals(61, ((Number) vitals.get("min_heart_rate")).intValue());
+        assertEquals(1, ((Number) vitals.get("heart_rate_samples")).intValue(),
+                "同一批数据的两份副本按主键去重后只剩一条");
+
+        Map<String, Object> day = jdbc().sql(
+                        "SELECT * FROM daily_activity WHERE activity_date = '2026-11-11'")
+                .query().singleRow();
+        assertEquals(273, ((Number) day.get("steps")).intValue());
+        assertEquals(252.0, ((Number) day.get("distance_meters")).doubleValue(), 0.001);
+        assertEquals(13.1, ((Number) day.get("calories_kcal")).doubleValue(), 0.001,
+                "4.07 + 9.0 kcal，派生表统一保留一位小数");
+
+        HuaweiExportImporter.StorageStats stats = repository.healthStats();
+        assertEquals(1, stats.vitalDays());
+        assertEquals(1, stats.activityDays());
+        assertEquals(0, stats.bodyMeasurements(), "这份夹具里没有体重数据");
+        assertEquals(0, stats.sleepSessions(), "这份夹具里没有睡眠分期");
+    }
+
+    /**
+     * v8 新收的三类数据：样本序列、Excel 原始行、轨迹附加流。
+     * 同时验证 sleep_report / ecg_record / medal / daily_sport_stat 四张派生表确实被回填。
+     */
+    @Test
+    void importsSampleSequencesExcelRowsAndTrackStreams() {
+        JdbcHealthDataRepository repository = repository();
+        repository.dataset();
+
+        HuaweiExportImporter.StorageStats stats = repository.healthStats();
+        assertEquals(2, stats.sampleSequences());
+        assertEquals(1, stats.sleepReports());
+        assertEquals(1, stats.ecgRecords());
+        assertEquals(2, stats.excelSheets());
+        assertEquals(4, stats.excelRows());
+        assertEquals(2, stats.trackStreams());
+
+        Map<String, Object> sleep = jdbc().sql(
+                        "SELECT * FROM sleep_report WHERE record_id = 'SLEEP-1'")
+                .query().singleRow();
+        assertEquals(75.0, ((Number) sleep.get("sleep_score")).doubleValue(), 0.001);
+        assertEquals("2026-11-11", sleep.get("sleep_date"));
+
+        Map<String, Object> ecg = jdbc().sql(
+                        "SELECT * FROM ecg_record WHERE record_id = 'ECG-1'")
+                .query().singleRow();
+        assertEquals(51, ((Number) ecg.get("average_heart_rate")).intValue());
+        assertEquals(3, ((Number) ecg.get("detail_sample_count")).intValue());
+        assertEquals(1, ((Number) ecg.get("extend_sample_count")).intValue());
+
+        assertEquals(2, jdbc().sql("SELECT COUNT(*) FROM medal").query(Integer.class).single());
+        assertEquals(2, jdbc().sql("SELECT COUNT(*) FROM daily_sport_stat").query(Integer.class).single());
+        Map<String, Object> day = jdbc().sql(
+                        "SELECT * FROM daily_sport_stat WHERE activity_date = '2026-11-10'")
+                .query().singleRow();
+        assertEquals("+0800", day.get("time_zone"));
+
+        assertEquals("rp",
+                jdbc().sql("SELECT stream_type FROM track_stream WHERE stream_type = 'rp' LIMIT 1")
+                        .query(String.class).single());
+        String summary = jdbc().sql("SELECT summary_data FROM run_activity WHERE id LIKE '%-101'")
+                .query(String.class).single();
+        assertTrue(summary.contains("bestPace"), "summaryData 原文应完整保留: " + summary);
+    }
+
+    @Test
+    void reimportKeepsRowCountStable() throws IOException {        JdbcHealthDataRepository repository = repository();
         repository.dataset();
         long metricsAfterFirst = repository.healthStats().healthMetrics();
 
@@ -194,8 +281,8 @@ class HuaweiExportImporterTest {
                 [
                   {"appType":1,"dataId":101,"type":30001,"subType":4,"deviceCode":1,
                    "startTime":%d,"endTime":%d,"timeZone":"+0800",
-                   "summaryData":"{\\"sportType\\":258,\\"totalDistance\\":7123,\\"totalTime\\":2448000,\\"totalCalories\\":516000,\\"totalSteps\\":7300,\\"avgHeartRate\\":130,\\"maxHeartRate\\":152,\\"minHeartRate\\":101,\\"avgStepRate\\":181,\\"mTotalDescent\\":13.5}",
-                   "detailData":"tp=lbs;k=0;lat=39.905708;lon=116.236651;alt=54.5;t=%d;\\ntp=h-r;k=%d;v=128;\\ntp=s-r;k=%d;v=180;\\ntp=alt;k=%d;v=58.8;\\ntp=lbs;k=1;lat=90.0;lon=-80.0;alt=0.0;t=%d;\\n"},
+                   "summaryData":"{\\"sportType\\":258,\\"totalDistance\\":7123,\\"totalTime\\":2448000,\\"totalCalories\\":516000,\\"totalSteps\\":7300,\\"avgHeartRate\\":130,\\"maxHeartRate\\":152,\\"minHeartRate\\":101,\\"avgStepRate\\":181,\\"bestPace\\":338.5,\\"mTotalDescent\\":13.5}",
+                   "detailData":"tp=lbs;k=0;lat=39.905708;lon=116.236651;alt=54.5;t=%d;\\ntp=h-r;k=%d;v=128;\\ntp=s-r;k=%d;v=180;\\ntp=alt;k=%d;v=58.8;\\ntp=lbs;k=1;lat=90.0;lon=-80.0;alt=0.0;t=%d;\\ntp=rs;k=5;v=3.2;\\ntp=rp;k=16;gct=283;sa=-1;\\n"},
                   {"appType":1,"dataId":102,"type":30001,"subType":5,"deviceCode":1,
                    "startTime":%d,"endTime":%d,"timeZone":"+0800",
                    "summaryData":"{\\"sportType\\":257,\\"totalDistance\\":2000,\\"totalTime\\":1800000,\\"totalCalories\\":90000,\\"totalSteps\\":2500,\\"avgHeartRate\\":95,\\"avgStepRate\\":110,\\"mTotalDescent\\":135}",
@@ -239,6 +326,70 @@ class HuaweiExportImporterTest {
                 """.formatted(start, start + 60_000, start + 60_000, start + 120_000);
     }
 
+    private String sampleJson() {
+        long sleepStart = Instant.parse("2026-11-10T14:32:00Z").toEpochMilli();
+        long sleepEnd = Instant.parse("2026-11-11T01:07:00Z").toEpochMilli();
+        long ecgStart = Instant.parse("2026-11-10T02:08:15Z").toEpochMilli();
+        return """
+                [
+                  {"appType":1,"dataId":281,"type":700013,"subType":0,"deviceCode":2374625270,
+                   "recordId":"SLEEP-1","startTime":%d,"endTime":%d,"timeZone":"+0800",
+                   "summaryData":"{\\"sleepScore\\":75,\\"sleepEfficiency\\":92,\\"avgBreathrate\\":14,\\"avgHeartrate\\":46,\\"avgHrv\\":49,\\"avgOxygenSaturation\\":97,\\"rdi\\":0,\\"snoreFreq\\":1,\\"wakeCount\\":0,\\"turnOverCount\\":0,\\"deepPart\\":73,\\"bedTime\\":1781274360,\\"fallAsleepTime\\":1781274720,\\"risingTime\\":1781299620,\\"wakeupTime\\":1781299620}",
+                   "detailData":"6801000004000000"},
+                  {"appType":1,"dataId":232,"type":700009,"subType":0,"deviceCode":2374625270,
+                   "recordId":"ECG-1","startTime":%d,"endTime":%d,"timeZone":"+0800",
+                   "summaryData":"{\\"averageHeartRate\\":51,\\"ecgArrhyType\\":1,\\"ecgDataLength\\":3,\\"dataSources\\":\\"HUAWEI\\",\\"ecgAppVersion\\":\\"V1.0.0.26\\",\\"packageName\\":\\"hw.health.ecganalysis\\",\\"userSymptom\\":0}",
+                   "detailData":"[1.0,2.0,3.0]","extendData":"[4.0]"}
+                ]
+                """.formatted(sleepStart, sleepEnd, ecgStart, ecgStart + 60_000);
+    }
+
+    /** 用 POI 现造一个 .xls：两张有数据的工作表，覆盖勋章与每日运动统计。 */
+    private void writeWorkbook(String relative) throws IOException {
+        try (HSSFWorkbook workbook = new HSSFWorkbook();
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            Sheet medal = workbook.createSheet("user medal info");
+            header(medal, "medalType", "medalLevel", "gainCount", "takeDate", "modifyTime");
+            medalRow(medal, 1, "A", "5", 3, "\"\t2025-01-11T08:06:59.000Z\"",
+                    "\"\t2025-12-21T00:28:29.000Z\"");
+            medalRow(medal, 2, "A", "5", 1, "\"\t2026-01-11T08:06:59.000Z\"",
+                    "\"\t2026-12-21T00:28:29.000Z\"");
+
+            Sheet sport = workbook.createSheet("user sport daily statistics");
+            header(sport, "recordDay", "timeZone", "deviceCode", "steps");
+            Row first = sport.createRow(1);
+            first.createCell(0).setCellValue("2026-11-10");
+            first.createCell(1).setCellValue("\"\t+0800\"");
+            first.createCell(2).setCellValue("0");
+            Row second = sport.createRow(2);
+            second.createCell(0).setCellValue("2026-11-11");
+            second.createCell(1).setCellValue("\"\t+0800\"");
+            second.createCell(2).setCellValue("0");
+
+            workbook.write(out);
+            Path target = dataDir.resolve(relative);
+            Files.createDirectories(target.getParent());
+            Files.write(target, out.toByteArray());
+        }
+    }
+
+    private static void header(Sheet sheet, String... names) {
+        Row row = sheet.createRow(0);
+        for (int index = 0; index < names.length; index++) {
+            row.createCell(index).setCellValue(names[index]);
+        }
+    }
+
+    private static void medalRow(Sheet sheet, int rowIndex, String type, String level,
+                                 int count, String takeDate, String modifyTime) {
+        Row row = sheet.createRow(rowIndex);
+        row.createCell(0).setCellValue(type);
+        row.createCell(1).setCellValue(level);
+        row.createCell(2).setCellValue(count);
+        row.createCell(3).setCellValue(takeDate);
+        row.createCell(4).setCellValue(modifyTime);
+    }
+
     // ---------------------------------------------------------------- wiring
 
     private JdbcHealthDataRepository repository() {
@@ -247,9 +398,11 @@ class HuaweiExportImporterTest {
         TransactionTemplate transactions = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
         SqliteSchema schema = new SqliteSchema(jdbc, dataSource);
         SourceFileStateStore stateStore = new SourceFileStateStore(jdbc, schema);
+        DerivedTables derived = new DerivedTables(jdbc, transactions, schema);
         HuaweiExportImporter huawei = new HuaweiExportImporter(dataSource, jdbc, transactions,
                 new HuaweiExportScanner(), new MotionPathParser(), new HealthDetailParser(),
-                new MinuteActivityParser(), properties, stateStore, schema);
+                new MinuteActivityParser(), new SampleSequenceParser(),
+                new ExcelWorkbookParser(), properties, stateStore, schema, derived);
         TcxIncrementalImporter importer = new TcxIncrementalImporter(
                 jdbc, transactions, new SourceFileScanner(), new TcxParser(properties),
                 properties, stateStore, schema, offlineBackfill(jdbc), huawei);

@@ -956,6 +956,16 @@ public class SportHealthTools {
             health.put("healthMetrics", stats.healthMetrics());
             health.put("activityMinutes", stats.activityMinutes());
             health.put("metricTypes", stats.metricTypes());
+            health.put("bodyMeasurements", stats.bodyMeasurements());
+            health.put("sleepSessions", stats.sleepSessions());
+            health.put("activityDays", stats.activityDays());
+            health.put("vitalDays", stats.vitalDays());
+            health.put("sampleSequences", stats.sampleSequences());
+            health.put("sleepReports", stats.sleepReports());
+            health.put("ecgRecords", stats.ecgRecords());
+            health.put("excelSheets", stats.excelSheets());
+            health.put("excelRows", stats.excelRows());
+            health.put("trackStreams", stats.trackStreams());
             health.put("firstMetricDate", stats.firstMetricDate());
             health.put("lastMetricDate", stats.lastMetricDate());
             health.put("scannedFiles", sync.scanned());

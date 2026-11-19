@@ -28,7 +28,7 @@ import org.example.sporthealth.domain.TrackPoint;
  *   <li>{@code alt}：气压计高度，{@code k} 是毫秒时间戳（比 GPS 高度平滑得多）；</li>
  *   <li>{@code dis}：累计距离，{@code k} 与 {@code lbs} 的点序号对齐；</li>
  *   <li>{@code rs}：每 5 秒速度、{@code rp} 跑姿、{@code pm2}/{@code bpm2} 单公里配速等，
- *       当前只用于扩展，未落库。</li>
+ *       不属于逐点轨迹，原样收进 {@link MotionStream}，由写入层落到 {@code track_stream}。</li>
  * </ul>
  *
  * <p>心率、步频、气压高度与轨迹点各自独立采样，因此按时间就近匹配：心率与高度容差 30 秒，
@@ -51,17 +51,20 @@ public final class MotionTrackData {
     private final List<Sample> cadences;
     private final List<Sample> altitudes;
     private final Map<Integer, Double> distanceByIndex;
+    private final List<MotionStream> streams;
 
     private MotionTrackData(List<Position> positions,
                             List<Sample> heartRates,
                             List<Sample> cadences,
                             List<Sample> altitudes,
-                            Map<Integer, Double> distanceByIndex) {
+                            Map<Integer, Double> distanceByIndex,
+                            List<MotionStream> streams) {
         this.positions = positions;
         this.heartRates = heartRates;
         this.cadences = cadences;
         this.altitudes = altitudes;
         this.distanceByIndex = distanceByIndex;
+        this.streams = streams;
     }
 
     /** 一个 GPS 点。 */
@@ -70,6 +73,28 @@ public final class MotionTrackData {
 
     /** 一条「时刻 → 数值」采样。 */
     public record Sample(long timeMillis, double value) {
+    }
+
+    /**
+     * 未进入 {@code track_point} 的原始流。
+     *
+     * <p>{@code fields} 保留该行的全部键值，序列化后就是 {@code track_stream.data}，
+     * 这样新增字段（例如跑姿指标扩充）不需要改表结构。
+     *
+     * @param type        流类型：rs / rp / pad / pm2 / p-m / b-p-m / bpm2 / scp / i-h-r / evt，
+     *                    解析不出的行记为 {@code unknown}
+     * @param timeMillis  时间戳（毫秒）；该流的 k 不是时间时为 null
+     * @param pointIndex  点序号或分段序号；没有时为 null
+     * @param value       主数值：优先 v，其次 p；跑姿行没有单一数值
+     * @param fields      原始键值对
+     * @param rawLine     原始行，仅在无法拆分时保留，确保不丢数据
+     */
+    public record MotionStream(String type,
+                               Long timeMillis,
+                               Integer pointIndex,
+                               Double value,
+                               Map<String, String> fields,
+                               String rawLine) {
     }
 
     public boolean hasPositions() {
@@ -83,8 +108,9 @@ public final class MotionTrackData {
         List<Sample> cadences = new ArrayList<>();
         List<Sample> altitudes = new ArrayList<>();
         Map<Integer, Double> distances = new HashMap<>();
+        List<MotionStream> streams = new ArrayList<>();
         if (detailData == null || detailData.isBlank()) {
-            return new MotionTrackData(positions, heartRates, cadences, altitudes, distances);
+            return new MotionTrackData(positions, heartRates, cadences, altitudes, distances, streams);
         }
         for (String line : detailData.split("\n")) {
             String trimmed = line.strip();
@@ -94,6 +120,8 @@ public final class MotionTrackData {
             Map<String, String> fields = fields(trimmed);
             String type = fields.get("tp");
             if (type == null) {
+                // DETAIL_NULL 前缀等异常行：不猜结构，原样收进 unknown 流
+                streams.add(new MotionStream("unknown", null, null, null, Map.of(), trimmed));
                 continue;
             }
             switch (type) {
@@ -102,16 +130,48 @@ public final class MotionTrackData {
                 case "s-r" -> addSample(fields, cadences);
                 case "alt" -> addSample(fields, altitudes);
                 case "dis" -> addDistance(fields, distances);
-                default -> {
-                    // rs / rp / pm2 / bpm2 / evt / pad / scp 等暂不入库
-                }
+                default -> streams.add(toStream(type, fields, trimmed));
             }
         }
         positions.sort((left, right) -> Long.compare(left.timeMillis(), right.timeMillis()));
         heartRates.sort((left, right) -> Long.compare(left.timeMillis(), right.timeMillis()));
         cadences.sort((left, right) -> Long.compare(left.timeMillis(), right.timeMillis()));
         altitudes.sort((left, right) -> Long.compare(left.timeMillis(), right.timeMillis()));
-        return new MotionTrackData(positions, heartRates, cadences, altitudes, distances);
+        return new MotionTrackData(positions, heartRates, cadences, altitudes, distances, streams);
+    }
+
+    /** 未入轨迹的流：识别时间戳/序号/主数值，其余字段全部留在 fields 里。 */
+    private static MotionStream toStream(String type, Map<String, String> fields, String rawLine) {
+        Long timeMillis = null;
+        Integer pointIndex = null;
+        Double k = number(fields.get("k"));
+        if (k != null) {
+            if (k > 100_000_000_000d) {
+                timeMillis = k.longValue();
+            } else {
+                pointIndex = (int) Math.round(k);
+            }
+        }
+        if (timeMillis == null) {
+            Double start = number(fields.get("st"));
+            if (start != null && start > 100_000_000_000d) {
+                timeMillis = start.longValue();
+            }
+        }
+        if (pointIndex == null && ("pm2".equals(type) || "bpm2".equals(type))) {
+            Double segment = number(fields.get("n"));
+            pointIndex = segment == null ? null : (int) Math.round(segment);
+        }
+        Double value = number(fields.get("v"));
+        if (value == null) {
+            value = number(fields.get("p"));
+        }
+        return new MotionStream(type, timeMillis, pointIndex, value, Map.copyOf(fields), rawLine);
+    }
+
+    /** 未进入轨迹点的全部流，按原始顺序。 */
+    public List<MotionStream> streams() {
+        return streams;
     }
 
     /** 转成入库用的轨迹点：坐标转 WGS-84，心率/步频/高度按时间就近匹配。 */

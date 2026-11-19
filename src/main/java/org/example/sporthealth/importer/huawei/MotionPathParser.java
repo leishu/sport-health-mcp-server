@@ -81,7 +81,8 @@ public class MotionPathParser {
             endMillis = startMillis;
         }
         ZoneId zone = zoneOf(node.path("timeZone").asText(null), fallbackZone);
-        JsonNode summary = json(node.path("summaryData").asText("{}"));
+        String summaryText = node.path("summaryData").asText("{}");
+        JsonNode summary = json(summaryText);
         MotionTrackData track = MotionTrackData.parse(node.path("detailData").asText(""));
         List<TrackPoint> points = track.toTrackPoints(zone);
 
@@ -128,7 +129,9 @@ public class MotionPathParser {
                 intOrNull(summary, "avgStepRate"),
                 climb,
                 descent,
-                points);
+                points,
+                summaryText,
+                track.streams());
     }
 
     /**

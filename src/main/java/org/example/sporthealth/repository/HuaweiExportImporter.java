@@ -6,6 +6,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -14,10 +16,14 @@ import java.util.Set;
 
 import javax.sql.DataSource;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.example.sporthealth.config.HealthDataProperties;
 import org.example.sporthealth.domain.TrackPoint;
 import org.example.sporthealth.importer.SourceFile;
+import org.example.sporthealth.importer.huawei.ExcelSheet;
+import org.example.sporthealth.importer.huawei.ExcelWorkbookParser;
 import org.example.sporthealth.importer.huawei.HealthDetailParser;
 import org.example.sporthealth.importer.huawei.HuaweiDataException;
 import org.example.sporthealth.importer.huawei.HuaweiExportScanner;
@@ -26,7 +32,10 @@ import org.example.sporthealth.importer.huawei.MetricSample;
 import org.example.sporthealth.importer.huawei.MinuteActivityParser;
 import org.example.sporthealth.importer.huawei.MinuteActivityRow;
 import org.example.sporthealth.importer.huawei.MotionPathParser;
+import org.example.sporthealth.importer.huawei.MotionTrackData.MotionStream;
 import org.example.sporthealth.importer.huawei.ParsedWorkout;
+import org.example.sporthealth.importer.huawei.SampleSequenceParser;
+import org.example.sporthealth.importer.huawei.SampleSequenceRecord;
 import org.example.sporthealth.repository.SourceFileStateStore.State;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
@@ -78,7 +87,7 @@ public class HuaweiExportImporter {
                 min_altitude_meters, max_altitude_meters, source_file, creator,
                 content_hash, imported_at, sport_family, sport_type_code, sub_type,
                 total_steps, total_calories_kcal, avg_heart_rate, max_heart_rate, min_heart_rate,
-                avg_cadence, record_id, source_kind
+                avg_cadence, record_id, source_kind, summary_data
             ) VALUES (
                 :id, :activityId, :sport, :runDate, :startTime, :endTime, :startTimeUtc,
                 :durationSeconds, :distanceMeters, :climbMeters, :descentMeters,
@@ -87,7 +96,7 @@ public class HuaweiExportImporter {
                 :minAltitudeMeters, :maxAltitudeMeters, :sourceFile, :creator,
                 :contentHash, :importedAt, :sportFamily, :sportTypeCode, :subType,
                 :totalSteps, :totalCaloriesKcal, :avgHeartRate, :maxHeartRate, :minHeartRate,
-                :avgCadence, :recordId, 'huawei'
+                :avgCadence, :recordId, 'huawei', :summaryData
             )
             """;
 
@@ -119,6 +128,42 @@ public class HuaweiExportImporter {
             )
             """;
 
+    private static final String INSERT_SAMPLE = """
+            INSERT OR REPLACE INTO sample_sequence (
+                record_id, type_code, data_id, sub_type, start_time, end_time, time_zone,
+                device_code, summary_data, detail_data, extend_data, source_file
+            ) VALUES (
+                :recordId, :typeCode, :dataId, :subType, :startTime, :endTime, :timeZone,
+                :deviceCode, :summaryData, :detailData, :extendData, :sourceFile
+            )
+            """;
+
+    private static final String INSERT_STREAM = """
+            INSERT OR REPLACE INTO track_stream (
+                run_id, stream_type, seq, time_millis, point_index, value, data
+            ) VALUES (
+                :runId, :streamType, :seq, :timeMillis, :pointIndex, :value, :data
+            )
+            """;
+
+    private static final String INSERT_EXCEL_SHEET = """
+            INSERT OR REPLACE INTO excel_sheet (
+                source_file, sheet_name, row_count, column_count, header_json
+            ) VALUES (
+                :sourceFile, :sheetName, :rowCount, :columnCount, :headerJson
+            )
+            """;
+
+    private static final String INSERT_EXCEL_ROW = """
+            INSERT OR REPLACE INTO excel_sheet_row (
+                source_file, sheet_name, row_number, row_data
+            ) VALUES (
+                :sourceFile, :sheetName, :rowNumber, :rowData
+            )
+            """;
+
+    private static final ObjectMapper JSON = new ObjectMapper();
+
     private final DataSource dataSource;
     private final JdbcClient jdbc;
     private final TransactionOperations transactions;
@@ -126,9 +171,12 @@ public class HuaweiExportImporter {
     private final MotionPathParser motionParser;
     private final HealthDetailParser healthParser;
     private final MinuteActivityParser minuteParser;
+    private final SampleSequenceParser sampleSequenceParser;
+    private final ExcelWorkbookParser excelParser;
     private final HealthDataProperties properties;
     private final SourceFileStateStore stateStore;
     private final SqliteSchema schema;
+    private final DerivedTables derivedTables;
 
     public HuaweiExportImporter(DataSource dataSource,
                                 JdbcClient jdbc,
@@ -137,9 +185,12 @@ public class HuaweiExportImporter {
                                 MotionPathParser motionParser,
                                 HealthDetailParser healthParser,
                                 MinuteActivityParser minuteParser,
+                                SampleSequenceParser sampleSequenceParser,
+                                ExcelWorkbookParser excelParser,
                                 HealthDataProperties properties,
                                 SourceFileStateStore stateStore,
-                                SqliteSchema schema) {
+                                SqliteSchema schema,
+                                DerivedTables derivedTables) {
         this.dataSource = dataSource;
         this.jdbc = jdbc;
         this.transactions = transactions;
@@ -147,9 +198,12 @@ public class HuaweiExportImporter {
         this.motionParser = motionParser;
         this.healthParser = healthParser;
         this.minuteParser = minuteParser;
+        this.sampleSequenceParser = sampleSequenceParser;
+        this.excelParser = excelParser;
         this.properties = properties;
         this.stateStore = stateStore;
         this.schema = schema;
+        this.derivedTables = derivedTables;
     }
 
     /**
@@ -162,6 +216,9 @@ public class HuaweiExportImporter {
      * @param workouts          写入的运动记录数
      * @param metrics           写入（去重后）的健康指标采样点数
      * @param minutes           写入的分钟活动行数
+     * @param sampleSequences   写入的样本序列行数
+     * @param excelRows         写入的 Excel 数据行数
+     * @param trackStreams      写入的轨迹附加流行数
      */
     public record Result(int scanned,
                          int imported,
@@ -170,11 +227,14 @@ public class HuaweiExportImporter {
                          int workouts,
                          int metrics,
                          int minutes,
+                         int sampleSequences,
+                         int excelRows,
+                         int trackStreams,
                          List<String> warnings,
                          Instant syncedAt) {
 
         public static Result empty(Instant at) {
-            return new Result(0, 0, 0, 0, 0, 0, 0, List.of(), at);
+            return new Result(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, List.of(), at);
         }
     }
 
@@ -186,7 +246,17 @@ public class HuaweiExportImporter {
                                long activityMinutes,
                                int metricTypes,
                                String firstMetricDate,
-                               String lastMetricDate) {
+                               String lastMetricDate,
+                               int bodyMeasurements,
+                               int sleepSessions,
+                               int activityDays,
+                               int vitalDays,
+                               long sampleSequences,
+                               int sleepReports,
+                               int ecgRecords,
+                               int excelSheets,
+                               int excelRows,
+                               long trackStreams) {
     }
 
     /** 扫描数据目录并增量导入。 */
@@ -208,6 +278,9 @@ public class HuaweiExportImporter {
         int workouts = 0;
         int metrics = 0;
         int minutes = 0;
+        int sampleSequences = 0;
+        int excelRows = 0;
+        int trackStreams = 0;
 
         for (ExportFile entry : files) {
             SourceFile file = entry.file();
@@ -230,6 +303,8 @@ public class HuaweiExportImporter {
                     case MOTION -> importMotion(file, hash, tcxRuns, warnings);
                     case HEALTH -> importHealth(file);
                     case MINUTE -> importMinute(file);
+                    case SAMPLE_SEQUENCE -> importSampleSequence(file);
+                    case SPORTSHEALTH_XLS, RESEARCH_XLSX -> importExcel(file);
                 };
                 stateStore.save(file.name(), file.size(), file.modifiedMillis(), hash,
                         false, null, SourceFileStateStore.KIND_HUAWEI);
@@ -237,6 +312,9 @@ public class HuaweiExportImporter {
                 workouts += counters.workouts();
                 metrics += counters.metrics();
                 minutes += counters.minutes();
+                sampleSequences += counters.sampleSequences();
+                excelRows += counters.excelRows();
+                trackStreams += counters.trackStreams();
                 merged += counters.mergedDuplicates();
             } catch (HuaweiDataException e) {
                 warn(warnings, file.name(), e.getMessage());
@@ -256,17 +334,43 @@ public class HuaweiExportImporter {
             log.info("华为导出文件缺失 {} 个，已清理指纹（业务行按 source_file 保留）", removed);
         }
 
+        // 原始长表写完之后重建四张派生表（体重 / 睡眠 / 每日活动 / 每日体征）。
+        // 放在导入事务之外，且失败只降级成 warning：派生表坏了不影响已经落库的原始数据，
+        // 下一次同步会自动重算。
+        //
+        // 派生表只由 health_metric / activity_minute 决定，所以「本次一个文件都没重导」时
+        // 可以整段跳过，免得后台每 5 分钟空转还要跑一遍 17.8 万行分期上的窗口函数；
+        // 表为空时（刚升级到 v7、或被人手工清过）无条件回填。
+        if (imported > 0 || derivedTables.isEmpty()) {
+            rebuildDerivedTables(warnings);
+        }
+
         Instant syncedAt = Instant.now();
         log.info("华为导出同步完成：扫描 {} 个文件、重导 {}、未变 {}、由 JSON 接管 TCX {} 次；"
-                        + "本次写入运动 {} 次、健康指标 {} 条、分钟活动 {} 行",
-                files.size(), imported, unchanged, merged, workouts, metrics, minutes);
+                        + "本次写入运动 {} 次、健康指标 {} 条、分钟活动 {} 行、样本序列 {} 条、"
+                        + "Excel {} 行、轨迹附加流 {} 行",
+                files.size(), imported, unchanged, merged, workouts, metrics, minutes,
+                sampleSequences, excelRows, trackStreams);
 
         return new Result(files.size(), imported, unchanged, merged, workouts, metrics, minutes,
-                List.copyOf(warnings), syncedAt);
+                sampleSequences, excelRows, trackStreams, List.copyOf(warnings), syncedAt);
     }
 
     /** 一次文件导入写入的行数。 */
-    private record Counters(int workouts, int metrics, int minutes, int mergedDuplicates) {
+    private record Counters(int workouts, int metrics, int minutes,
+                            int sampleSequences, int excelRows, int trackStreams,
+                            int mergedDuplicates) {
+    }
+
+    /** 重建派生表；任何异常都降级成一条 warning，不影响原始数据。 */
+    private void rebuildDerivedTables(List<String> warnings) {
+        try {
+            derivedTables.rebuild();
+        } catch (RuntimeException e) {
+            log.warn("重建派生表失败", e);
+            warnings.add("重建派生表失败：" + e.getMessage()
+                    + "，原始数据不受影响，下次同步会重试");
+        }
     }
 
     // ---------------------------------------------------------------- 运动轨迹
@@ -305,6 +409,7 @@ public class HuaweiExportImporter {
 
         String importedAt = Instant.now().toString();
         String sourceFile = file.name();
+        int[] streamCounter = new int[1];
         transactions.executeWithoutResult(status -> {
             deleteWorkoutRows(sourceFile);
             for (Map.Entry<ParsedWorkout, TcxRun> entry : takenOver) {
@@ -313,17 +418,52 @@ public class HuaweiExportImporter {
             NamedParameterJdbcTemplate template = new NamedParameterJdbcTemplate(dataSource);
             List<SqlParameterSource> activities = new ArrayList<>(BATCH_SIZE);
             List<SqlParameterSource> points = new ArrayList<>(TRACK_BATCH_SIZE);
+            List<SqlParameterSource> streams = new ArrayList<>(TRACK_BATCH_SIZE);
+            int streamCount = 0;
             for (ParsedWorkout workout : kept) {
                 activities.add(activityParameters(workout, sourceFile, hash, importedAt));
                 if (activities.size() >= BATCH_SIZE) {
                     flush(template, INSERT_ACTIVITY, activities);
                 }
                 appendTrackPoints(template, points, workout);
+                streamCount += appendStreams(template, streams, workout);
             }
             flush(template, INSERT_ACTIVITY, activities);
             flush(template, INSERT_TRACK_POINT, points);
+            flush(template, INSERT_STREAM, streams);
+            streamCounter[0] = streamCount;
         });
-        return new Counters(kept.size(), 0, 0, takenOver.size());
+        return new Counters(kept.size(), 0, 0, 0, 0, streamCounter[0], takenOver.size());
+    }
+
+    /**
+     * 把未进轨迹点的流写进 {@code track_stream}。
+     *
+     * @return 本次追加的行数
+     */
+    private int appendStreams(NamedParameterJdbcTemplate template,
+                              List<SqlParameterSource> batch,
+                              ParsedWorkout workout) {
+        int count = 0;
+        Map<String, Integer> seqByType = new LinkedHashMap<>();
+        for (MotionStream stream : workout.streams()) {
+            int seq = seqByType.merge(stream.type(), 1, Integer::sum) - 1;
+            batch.add(new MapSqlParameterSource()
+                    .addValue("runId", workout.id())
+                    .addValue("streamType", stream.type())
+                    .addValue("seq", seq)
+                    .addValue("timeMillis", stream.timeMillis())
+                    .addValue("pointIndex", stream.pointIndex())
+                    .addValue("value", stream.value())
+                    .addValue("data", json(stream.fields().isEmpty()
+                            ? Map.of("_raw", stream.rawLine())
+                            : stream.fields())));
+            count++;
+            if (batch.size() >= TRACK_BATCH_SIZE) {
+                flush(template, INSERT_STREAM, batch);
+            }
+        }
+        return count;
     }
 
     private void appendTrackPoints(NamedParameterJdbcTemplate template,
@@ -422,7 +562,8 @@ public class HuaweiExportImporter {
                 .addValue("maxHeartRate", workout.maxHeartRate())
                 .addValue("minHeartRate", workout.minHeartRate())
                 .addValue("avgCadence", workout.avgCadence())
-                .addValue("recordId", workout.recordId());
+                .addValue("recordId", workout.recordId())
+                .addValue("summaryData", workout.summaryData());
     }
 
     private static TrackPoint firstWithPosition(List<TrackPoint> points, boolean fromStart) {
@@ -492,6 +633,7 @@ public class HuaweiExportImporter {
                 .update();
         jdbc.sql("DELETE FROM run_weather WHERE run_id = :oldId").param("oldId", tcx.id()).update();
         jdbc.sql("DELETE FROM track_point WHERE run_id = :oldId").param("oldId", tcx.id()).update();
+        jdbc.sql("DELETE FROM track_stream WHERE run_id = :oldId").param("oldId", tcx.id()).update();
         jdbc.sql("DELETE FROM run_activity WHERE id = :oldId").param("oldId", tcx.id()).update();
         jdbc.sql("DELETE FROM source_file WHERE source_file = :file AND kind = 'tcx'")
                 .param("file", tcx.sourceFile())
@@ -544,6 +686,7 @@ public class HuaweiExportImporter {
             return;
         }
         jdbc.sql("DELETE FROM track_point WHERE run_id IN (:ids)").param("ids", ids).update();
+        jdbc.sql("DELETE FROM track_stream WHERE run_id IN (:ids)").param("ids", ids).update();
         jdbc.sql("DELETE FROM run_weather WHERE run_id IN (:ids)").param("ids", ids).update();
         jdbc.sql("DELETE FROM run_activity WHERE id IN (:ids)").param("ids", ids).update();
     }
@@ -571,7 +714,7 @@ public class HuaweiExportImporter {
             flush(template, INSERT_METRIC, batch);
             delta[0] = longCount("SELECT COUNT(*) FROM health_metric") - before;
         });
-        return new Counters(0, (int) delta[0], 0, 0);
+        return new Counters(0, (int) delta[0], 0, 0, 0, 0, 0);
     }
 
     private SqlParameterSource metricParameters(MetricSample sample, String sourceFile) {
@@ -612,7 +755,113 @@ public class HuaweiExportImporter {
             flush(template, INSERT_MINUTE, batch);
             delta[0] = longCount("SELECT COUNT(*) FROM activity_minute") - before;
         });
-        return new Counters(0, 0, (int) delta[0], 0);
+        return new Counters(0, 0, (int) delta[0], 0, 0, 0, 0);
+    }
+
+    // ---------------------------------------------------------------- 样本序列
+
+    private Counters importSampleSequence(SourceFile file) {
+        String sourceFile = file.name();
+        int[] inserted = new int[1];
+        transactions.executeWithoutResult(status -> {
+            jdbc.sql("DELETE FROM sample_sequence WHERE source_file = ?").param(sourceFile).update();
+            NamedParameterJdbcTemplate template = new NamedParameterJdbcTemplate(dataSource);
+            List<SqlParameterSource> batch = new ArrayList<>(200);
+            try (InputStream input = file.open()) {
+                sampleSequenceParser.parse(sourceFile, input, record -> {
+                    batch.add(sampleParameters(record, sourceFile));
+                    inserted[0]++;
+                    if (batch.size() >= 200) {
+                        flush(template, INSERT_SAMPLE, batch);
+                    }
+                });
+            } catch (IOException e) {
+                throw new HuaweiDataException(sourceFile + ": 读取失败 -> " + e.getMessage(), e);
+            }
+            flush(template, INSERT_SAMPLE, batch);
+        });
+        return new Counters(0, 0, 0, inserted[0], 0, 0, 0);
+    }
+
+    private SqlParameterSource sampleParameters(SampleSequenceRecord record, String sourceFile) {
+        return new MapSqlParameterSource()
+                .addValue("recordId", record.recordId())
+                .addValue("typeCode", record.typeCode())
+                .addValue("dataId", record.dataId())
+                .addValue("subType", record.subType())
+                .addValue("startTime", RunRows.text(java.time.LocalDateTime.ofInstant(
+                        record.startTime(), properties.zone())))
+                .addValue("endTime", RunRows.text(java.time.LocalDateTime.ofInstant(
+                        record.endTime(), properties.zone())))
+                .addValue("timeZone", record.timeZone())
+                .addValue("deviceCode", record.deviceCode())
+                .addValue("summaryData", record.summaryData())
+                .addValue("detailData", record.detailData())
+                .addValue("extendData", record.extendData())
+                .addValue("sourceFile", sourceFile);
+    }
+
+    // ---------------------------------------------------------------- Excel
+
+    private Counters importExcel(SourceFile file) {
+        String sourceFile = file.name();
+        List<ExcelSheet> sheets;
+        try (InputStream input = file.open()) {
+            sheets = excelParser.parse(sourceFile, input);
+        } catch (IOException e) {
+            throw new HuaweiDataException(sourceFile + ": 读取失败 -> " + e.getMessage(), e);
+        }
+
+        int[] inserted = new int[1];
+        transactions.executeWithoutResult(status -> {
+            jdbc.sql("DELETE FROM excel_sheet_row WHERE source_file = ?").param(sourceFile).update();
+            jdbc.sql("DELETE FROM excel_sheet WHERE source_file = ?").param(sourceFile).update();
+            NamedParameterJdbcTemplate template = new NamedParameterJdbcTemplate(dataSource);
+            List<SqlParameterSource> sheetBatch = new ArrayList<>();
+            List<SqlParameterSource> rowBatch = new ArrayList<>(BATCH_SIZE);
+            for (ExcelSheet sheet : sheets) {
+                sheetBatch.add(new MapSqlParameterSource()
+                        .addValue("sourceFile", sourceFile)
+                        .addValue("sheetName", sheet.name())
+                        .addValue("rowCount", sheet.rows().size())
+                        .addValue("columnCount", sheet.headers().size())
+                        .addValue("headerJson", json(sheet.headers())));
+                for (int row = 0; row < sheet.rows().size(); row++) {
+                    rowBatch.add(new MapSqlParameterSource()
+                            .addValue("sourceFile", sourceFile)
+                            .addValue("sheetName", sheet.name())
+                            .addValue("rowNumber", row + 1)
+                            .addValue("rowData", rowJson(sheet.headers(), sheet.rows().get(row))));
+                    inserted[0]++;
+                    if (rowBatch.size() >= BATCH_SIZE) {
+                        flush(template, INSERT_EXCEL_ROW, rowBatch);
+                    }
+                }
+            }
+            template.batchUpdate(INSERT_EXCEL_SHEET, sheetBatch.toArray(SqlParameterSource[]::new));
+            flush(template, INSERT_EXCEL_ROW, rowBatch);
+        });
+        return new Counters(0, 0, 0, 0, inserted[0], 0, 0);
+    }
+
+    /** 行对象只放非空单元格：空值用 {@code json_extract} 取出来同样是 NULL。 */
+    private static String rowJson(List<String> headers, List<String> values) {
+        Map<String, String> row = new LinkedHashMap<>();
+        for (int index = 0; index < headers.size() && index < values.size(); index++) {
+            String value = values.get(index);
+            if (value != null && !value.isEmpty()) {
+                row.put(headers.get(index), value);
+            }
+        }
+        return json(row);
+    }
+
+    private static String json(Object value) {
+        try {
+            return JSON.writeValueAsString(value);
+        } catch (JsonProcessingException e) {
+            throw new HuaweiDataException("序列化 JSON 失败 -> " + e.getMessage(), e);
+        }
     }
 
     private SqlParameterSource minuteParameters(MinuteActivityRow row, String sourceFile) {
@@ -642,9 +891,18 @@ public class HuaweiExportImporter {
         long metrics = longCount("SELECT COUNT(*) FROM health_metric");
         long minutes = longCount("SELECT COUNT(*) FROM activity_minute");
         int types = count("SELECT COUNT(*) FROM health_metric_type");
+        DerivedTables.Counts derived = derivedTables.counts();
         return new StorageStats(workouts, running, workouts - running, metrics, minutes, types,
                 text("SELECT MIN(substr(start_time, 1, 10)) FROM health_metric"),
-                text("SELECT MAX(substr(start_time, 1, 10)) FROM health_metric"));
+                text("SELECT MAX(substr(start_time, 1, 10)) FROM health_metric"),
+                derived.bodyMeasurements(), derived.sleepSessions(),
+                derived.activityDays(), derived.vitalDays(),
+                longCount("SELECT COUNT(*) FROM sample_sequence"),
+                count("SELECT COUNT(*) FROM sleep_report"),
+                count("SELECT COUNT(*) FROM ecg_record"),
+                count("SELECT COUNT(*) FROM excel_sheet"),
+                count("SELECT COUNT(*) FROM excel_sheet_row"),
+                longCount("SELECT COUNT(*) FROM track_stream"));
     }
 
     private int count(String sql) {
