@@ -276,6 +276,22 @@ P0 新增的五项分析都只使用已有的 TCX 数据与已回填的天气，
 | `NOT_FOUND` | `runId` 不存在 | 先用 `list_runs` 获取可用 id |
 | `NO_GPS` | 没有可用轨迹：轨迹点为空，或轨迹类分析所需的有效坐标点不足 2 个 | 分段、最佳努力、路线等轨迹类分析无法进行，改用 `list_runs` 的汇总字段 |
 | `AMBIGUOUS` | `runId` 匹配到多条 | 返回体里带 `candidates`，改用更完整的 id |
+| `INVALID_ARGUMENT` | 参数值本身非法（非正数、`NaN`、超出取值范围、认不出的枚举值） | 数据没问题，要改的是参数。返回体带 `param` / `value` / 可选 `allowedValues`，按提示改正后重试 |
+
+**参数校验口径**：不传 = 用默认值；**传了但值非法一律返回 `INVALID_ARGUMENT`，不会静默替换成默认值**。
+具体到容易踩的几处：
+
+| 参数 | 非法值 | 过去的行为 |
+| --- | --- | --- |
+| `splitKm`（`get_run_splits` / `compare_runs`） | `≤ 0`、`NaN`、小于 `0.1` | 静默按 1 公里切，返回的分段与请求不符 |
+| `distancesKm`（`get_best_efforts` / `get_personal_bests`） | 任一项 `≤ 0` 或非数值 | 过滤成空目标，再用「目标距离超过轨迹距离」解释 |
+| `category`（`get_personal_bests`） | 认不出的类别 | 静默变成 `all`，返回一堆没被请求的字段 |
+| `distanceKm`（`predict_race_time`） | `≤ 0` | 静默退回「5K/10K/半马/全马」四档 |
+| `groupBy`（`get_daily_running`） | 认不出的粒度 | 静默按 `day` 分组 |
+| `period`（`get_training_trend`） | 认不出的粒度 | 除 `month` 外一律当 `week` |
+| `sortBy` / `weekday` / `min*Km` / `min*Pace*`（`list_runs`） | 认不出的排序、`weekday` 超出 1~7、下限大于上限 | 排序静默按 `date`、`weekday` 越界等于不过滤、下限大于上限直接抛异常 |
+
+刻意保留的宽容行为只有分页：`offset` 负数按 0、`limit` 非正数按默认值，且生效值一定在返回体里回显。
 
 ### 日期与分页
 
@@ -587,7 +603,7 @@ JPA 在 WebFlux 上要配 R2DBC 才不阻塞，对只有两张表的场景属于
 | `callId` | 本次调用序号，START / END 靠它关联（并发调用也能配对） |
 | `tool` | `@McpTool.name`，即客户端调用的工具名 |
 | `args` | 仅 `START`：入参 JSON（参数名来自编译期 `-parameters`，未传的参数记 `null`）；超过 512 字符截断 |
-| `status` | 仅 `END`：返回体里的 `status`：`OK` / `NO_DATA` / `NOT_FOUND` / `NO_GPS` / `AMBIGUOUS`；抛异常时为 `ERROR` |
+| `status` | 仅 `END`：返回体里的 `status`：`OK` / `NO_DATA` / `NOT_FOUND` / `NO_GPS` / `AMBIGUOUS` / `INVALID_ARGUMENT`；抛异常时为 `ERROR` |
 | `durationMs` | 仅 `END`：工具方法执行耗时（毫秒），不含日志自身开销 |
 
 - 使用独立 logger `org.example.sporthealth.config.ToolAccessLogAspect`（即切面类名，日志里按 `%logger{36}` 缩写为 `o.e.s.config.ToolAccessLogAspect`），默认 `INFO`，与其它日志一样写入控制台和 `logs/tender-service.log`。
@@ -725,6 +741,7 @@ JAVA_HOME=/path/to/jdk-21 mvn test
 | --- | --- |
 | `status: "NO_DATA"` | 日期区间没覆盖到。先调 `describe_data_source` 看 `firstDate` / `lastDate` |
 | `status: "AMBIGUOUS"` | `runId` 太短，按返回的 `candidates` 改用完整 id |
+| `status: "INVALID_ARGUMENT"` | 参数值非法。看返回体的 `param` / `value` / `allowedValues`，按 `message` 改正后重试；数据本身没问题 |
 | 轨迹点数量比预期少 | 查看 `warnings`，是否有缺 `Time` 被跳过的点 |
 | `warnings` 不为空但数据正常 | 字段级问题，通常不影响聚合；按告警类型决定是否修源文件 |
 | `describe_data_source` 首次调用很慢 | `duplicateTimestampRunIds` 要逐条读轨迹，首次从库加载后命中缓存；只想看汇总时用其它工具 |

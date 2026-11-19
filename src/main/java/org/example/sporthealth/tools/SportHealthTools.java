@@ -86,7 +86,12 @@ import org.springframework.stereotype.Component;
  *       {@code Instant}（UTC 语义）按 UTC 输出；只有日期的字段仍保持 {@code yyyy-MM-dd}。</li>
  *   <li>返回体通过 {@code status} 区分结果：{@code OK}、{@code NO_DATA}（区间内无记录或缺少所需数据）、
  *       {@code NO_GPS}（没有可用轨迹）、{@code NOT_FOUND}（id 不存在）、
- *       {@code AMBIGUOUS}（id 匹配到多条）。</li>
+ *       {@code AMBIGUOUS}（id 匹配到多条）、{@code INVALID_ARGUMENT}（参数值非法，需要调用方改参数）。</li>
+ *   <li><b>参数校验口径</b>：不传 = 用默认值；传了但值非法（非正数、NaN、超出取值范围、无法识别的枚举）
+ *       一律返回 {@code INVALID_ARGUMENT}，不会静默替换成默认值——否则返回的数据与请求对不上，
+ *       调用方无从发现。返回体里带 {@code param} / {@code value} / 可选 {@code allowedValues}。
+ *       刻意保留的宽容行为只有分页：{@code offset} 负数按 0、{@code limit} 非正数按默认值，
+ *       且生效值一定在返回体里回显（{@code offset} / {@code limit}）。</li>
  *   <li>分页统一使用 {@code offset}/{@code limit}，列表与轨迹各有独立上限。</li>
  * </ul>
  */
@@ -98,6 +103,21 @@ public class SportHealthTools {
     /** {@code rs} 流的 {@code v} 实测单位是 0.1 m/s，乘 0.36 得到 km/h（与活动平均速度吻合）。 */
     private static final double RS_SPEED_TO_KMH = 0.36d;
     private static final double DEFAULT_SPLIT_KM = 1d;
+    /**
+     * 分段距离的下限（公里）。再小切出来的段数会随距离线性膨胀（42 公里按 0.01 公里切就是 4200 段），
+     * 返回体本身失去可读性，也不符合「分段配速」的用途，所以低于这个值直接拒绝。
+     */
+    private static final double MIN_SPLIT_KM = 0.1d;
+    /** {@code get_personal_bests} 的 {@code category} 允许值，用于 {@code INVALID_ARGUMENT} 的提示。 */
+    private static final List<String> CATEGORY_VALUES = List.of(
+            "all", "distance", "pace", "duration", "climb",
+            "best1k", "best3k", "best5k", "best10k", "best15k", "half", "marathon");
+    /** {@code list_runs} 的 {@code sortBy} 允许值。 */
+    private static final List<String> SORT_VALUES = List.of("date", "distance", "duration", "pace", "climb");
+    /** {@code get_daily_running} 的 {@code groupBy} 允许值。 */
+    private static final List<String> GROUP_VALUES = List.of("day", "week", "month");
+    /** {@code get_training_trend} 的 {@code period} 允许值。 */
+    private static final List<String> PERIOD_VALUES = List.of("week", "month");
     private static final double DEFAULT_ELEVATION_BUCKET_METERS = 100d;
     private static final double DEFAULT_ELEVATION_SMOOTHING_METERS = 1d;
     /** 与区间中位配速相差超过这个百分比即视为离群。 */
@@ -177,6 +197,11 @@ public class SportHealthTools {
             @McpToolParam(description = "排序：date（默认，新的在前）、distance、duration、pace（快的在前）、climb", required = false) String sortBy,
             @McpToolParam(description = "分页偏移，默认 0", required = false) Integer offset,
             @McpToolParam(description = "返回条数，默认 20，最多 200", required = false) Integer limit) {
+        Map<String, Object> invalid = validateListArgs(sortBy, weekday, minDistanceKm, maxDistanceKm,
+                minPaceSecondsPerKm, maxPaceSecondsPerKm);
+        if (invalid != null) {
+            return invalid;
+        }
         DateRange range = analytics.resolveRange(startDate, endDate);
         RunFilter filter = new RunFilter(sport, minDistanceKm, maxDistanceKm,
                 minPaceSecondsPerKm, maxPaceSecondsPerKm, weekday, sortBy);
@@ -739,8 +764,13 @@ public class SportHealthTools {
             @McpToolParam(description = "开始日期，格式 yyyy-MM-dd", required = false) String startDate,
             @McpToolParam(description = "结束日期，格式 yyyy-MM-dd", required = false) String endDate,
             @McpToolParam(description = "分组粒度：day（默认）、week、month", required = false) String groupBy) {
-        DateRange range = analytics.resolveRange(startDate, endDate);
         String mode = normalizeGroup(groupBy);
+        if (mode == null) {
+            return invalidArgument("groupBy", groupBy,
+                    "无法识别的分组粒度 \"" + groupBy + "\"，支持 day / week / month；不传按 day",
+                    GROUP_VALUES);
+        }
+        DateRange range = analytics.resolveRange(startDate, endDate);
         List<PeriodSummary> groups = analytics.grouped(range, mode);
         if (groups.isEmpty()) {
             return noData(range, null);
@@ -764,21 +794,37 @@ public class SportHealthTools {
             description = "查询区间内的个人最佳：最长距离、最快配速、最长时长、最大爬升各对应一次跑步记录，"
                     + "以及区间内最快的最佳努力（默认 1 公里与 5 公里，基于 GPS 轨迹逐条解析）。"
                     + "distancesKm 可改成任意目标距离，例如 [1,5,10] 或 [1,5,10,21.0975,42.195]；"
-                    + "只想看某一项时用 category，距离类别支持 best1k/best3k/best5k/best10k/half/marathon。"
+                    + "只想看某一项时用 category，距离类别支持 best1k/best3k/best5k/best10k/best15k/half/marathon；"
+                    + "distancesKm 或 category 取值非法时返回 INVALID_ARGUMENT，不会悄悄换成默认值。"
                     + "用于回答“我最好成绩是多少”“我 10 公里最快多少”“我半马水平如何”。")
     public Map<String, Object> getPersonalBests(
             @McpToolParam(description = "开始日期，格式 yyyy-MM-dd", required = false) String startDate,
             @McpToolParam(description = "结束日期，格式 yyyy-MM-dd", required = false) String endDate,
             @McpToolParam(description = "类别：all（默认）、distance、pace、duration、climb，"
-                    + "或距离类别 best1k/best3k/best5k/best10k/half/marathon", required = false) String category,
+                    + "或距离类别 best1k/best3k/best5k/best10k/best15k/half/marathon", required = false) String category,
             @McpToolParam(description = "最佳努力的目标距离（公里），默认 [1,5]；传了就以它为准，"
-                    + "例如 [1,5,10,21.0975,42.195]", required = false) List<Double> distancesKm) {
+                    + "例如 [1,5,10,21.0975,42.195]；每一项都必须是正数", required = false) List<Double> distancesKm) {
+        // 参数校验先于取数：拿不到数据时，「参数写错了」比「没有数据」更值得先报
+        String key = normalizeCategory(category);
+        if (key == null) {
+            return invalidArgument("category", category,
+                    "无法识别的类别 \"" + category + "\"：距离类别支持 best1k/best3k/best5k/best10k/best15k/"
+                            + "half/marathon（别名如 5k、全马、半马也可以），其余支持 all/distance/pace/duration/climb；"
+                            + "不传等同 all", CATEGORY_VALUES);
+        }
+        if (distancesKm != null && !distancesKm.isEmpty()) {
+            List<String> invalid = invalidDistances(distancesKm);
+            if (!invalid.isEmpty()) {
+                return invalidArgument("distancesKm", distancesKm,
+                        "distancesKm 每一项都必须是正数（单位公里），以下取值非法：" + String.join("、", invalid)
+                                + "。留空数组或不传才会回落到默认值，避免「传了 [-1] 却返回 [1,5] 的结果」", null);
+            }
+        }
         DateRange range = analytics.resolveRange(startDate, endDate);
         PersonalBests bests = analytics.bests(range);
         if (bests.runCount() == 0) {
             return noData(range, null);
         }
-        String key = normalizeCategory(category);
         Map<String, Object> bestRows = new LinkedHashMap<>();
         if ("all".equals(key) || "distance".equals(key)) {
             bestRows.put("longestDistance", toRunRow(bests.longestDistance()));
@@ -843,6 +889,12 @@ public class SportHealthTools {
             @McpToolParam(description = "结束日期，格式 yyyy-MM-dd，默认取数据最新一天", required = false) String endDate,
             @McpToolParam(description = "目标距离（公里）；不传则输出 5K/10K/半马/全马", required = false) Double distanceKm,
             @McpToolParam(description = "是否附带华为官方跑力的同距离成绩，默认 false", required = false) Boolean includeOfficial) {
+        if (distanceKm != null && (!Double.isFinite(distanceKm) || distanceKm <= 0)) {
+            // 过去 <=0 会静默退回「5K/10K/半马/全马」四档，用户以为在预测 0 公里却拿到四行结果
+            return invalidArgument("distanceKm", distanceKm,
+                    "distanceKm 必须是正数（单位公里），收到 " + distanceKm
+                            + "；想看默认四档就不要传这个参数", null);
+        }
         DateRange range = analytics.resolveRange(startDate, endDate);
         RacePrediction prediction = analytics.predictRace(range, distanceKm);
         boolean include = Boolean.TRUE.equals(includeOfficial);
@@ -985,7 +1037,13 @@ public class SportHealthTools {
             @McpToolParam(description = "基准跑步记录 id") String baseRunId,
             @McpToolParam(description = "对比跑步记录 id") String otherRunId,
             @McpToolParam(description = "是否附带两次的分段配速，默认 false", required = false) Boolean includeSplits,
-            @McpToolParam(description = "分段距离（公里），默认 1，仅 includeSplits=true 时生效", required = false) Double splitKm) {
+            @McpToolParam(description = "分段距离（公里），默认 1，仅 includeSplits=true 时生效；"
+                    + "非法值（≤0、NaN、小于 0.1）返回 INVALID_ARGUMENT", required = false) Double splitKm) {
+        // splitKm 只在 includeSplits=true 时参与计算，但校验不看下游是否用到：
+        // 同一个非法值在不同 includeSplits 下时好时坏，比直接拒绝更难排查
+        if (!validSplitKm(splitKm)) {
+            return invalidSplitKm(splitKm);
+        }
         RunLookup baseLookup = analytics.lookup(baseRunId);
         if (baseLookup.isAmbiguous()) {
             return ambiguous(baseRunId, baseLookup);
@@ -1036,9 +1094,13 @@ public class SportHealthTools {
         return result;
     }
 
-    /** 分段距离统一口径：非正数或未传都回落到 DEFAULT_SPLIT_KM，compare_runs 与 get_run_splits 共用。 */
+    /**
+     * 分段距离统一口径：未传用 {@link #DEFAULT_SPLIT_KM}，传了按公里转米。
+     * {@code compare_runs} 与 {@code get_run_splits} 共用，调用前必须先过 {@link #validSplitKm}——
+     * 这里不再兜底非法值，否则「传 0.5 公里却按 1 公里切」这类问题会重新变成静默行为。
+     */
     private static double splitMeters(Double splitKm) {
-        return splitKm != null && splitKm > 0 ? splitKm * 1000d : DEFAULT_SPLIT_KM * 1000d;
+        return splitKm == null ? DEFAULT_SPLIT_KM * 1000d : splitKm * 1000d;
     }
 
     /** 每公里（或自定义距离）分段配速。 */
@@ -1051,7 +1113,11 @@ public class SportHealthTools {
                     + "用于回答“每公里配速多少”“有没有跑崩”“后半程更快吗”“山路实际强度多大”“GPS 准不准”。")
     public Map<String, Object> getRunSplits(
             @McpToolParam(description = "跑步记录 id") String runId,
-            @McpToolParam(description = "分段距离（公里），默认 1", required = false) Double splitKm) {
+            @McpToolParam(description = "分段距离（公里），默认 1；非法值（≤0、NaN、小于 0.1）返回 INVALID_ARGUMENT",
+                    required = false) Double splitKm) {
+        if (!validSplitKm(splitKm)) {
+            return invalidSplitKm(splitKm);
+        }
         RunLookup lookup = analytics.lookup(runId);
         if (lookup.isAmbiguous()) {
             return ambiguous(runId, lookup);
@@ -1083,10 +1149,20 @@ public class SportHealthTools {
     /** 一次跑步内 1K / 5K 等目标距离的最佳用时。 */
     @McpTool(name = "get_best_efforts",
             description = "计算一次跑步内指定目标距离（默认 1 公里、5 公里）的最佳用时与折算配速，"
-                    + "例如“这 10 公里里最快的 5 公里是多少”。超过本次轨迹距离的目标会列在 unavailableTargetsMeters。")
+                    + "例如“这 10 公里里最快的 5 公里是多少”。超过本次轨迹距离的目标会列在 unavailableTargetsMeters。"
+                    + "distancesKm 里出现非正数或非数值时返回 INVALID_ARGUMENT，不会悄悄算别的距离。")
     public Map<String, Object> getBestEfforts(
             @McpToolParam(description = "跑步记录 id") String runId,
-            @McpToolParam(description = "目标距离列表（公里），默认 [1, 5]；例如 [1,5,10]", required = false) List<Double> distancesKm) {
+            @McpToolParam(description = "目标距离列表（公里），默认 [1, 5]；例如 [1,5,10]；"
+                    + "每一项都必须是正数", required = false) List<Double> distancesKm) {
+        if (distancesKm != null && !distancesKm.isEmpty()) {
+            List<String> invalid = invalidDistances(distancesKm);
+            if (!invalid.isEmpty()) {
+                return invalidArgument("distancesKm", distancesKm,
+                        "distancesKm 每一项都必须是正数（单位公里），以下取值非法：" + String.join("、", invalid)
+                                + "；不传则默认 [1, 5]", null);
+            }
+        }
         RunLookup lookup = analytics.lookup(runId);
         if (lookup.isAmbiguous()) {
             return ambiguous(runId, lookup);
@@ -1095,13 +1171,10 @@ public class SportHealthTools {
             return notFound(runId);
         }
         RunActivity run = lookup.run();
+        // 走到这里 targets 一定非空，且全部为正数：默认 [1,5] 或调用方的合法列表（按原顺序去重）
         List<Double> targets = distancesKm == null || distancesKm.isEmpty()
                 ? List.of(1000d, 5000d)
-                : distancesKm.stream()
-                        .filter(Objects::nonNull)
-                        .filter(km -> km > 0)
-                        .map(km -> km * 1000d)
-                        .toList();
+                : distancesKm.stream().distinct().map(km -> km * 1000d).toList();
         BestEfforts efforts = analytics.bestEfforts(run, targets);
         if (efforts.gpsDistanceKm() <= 0) {
             return noGps(run.id(), "没有可用的 GPS 轨迹，无法计算目标距离的最佳用时");
@@ -1114,8 +1187,11 @@ public class SportHealthTools {
         result.put("efforts", efforts.efforts());
         result.put("unavailableTargetsMeters", efforts.unavailableTargets());
         if (efforts.efforts().isEmpty()) {
-            result.put("message", "所有目标距离都超过本次轨迹距离 " + efforts.gpsDistanceKm()
-                    + " 公里，可改小 distances 或先用 list_runs 确认距离");
+            // 只有「目标都合法且都跑不到」才会走到这里，所以可以明说原因与最小的那个目标
+            double smallestKm = targets.stream().mapToDouble(meters -> meters / 1000d).min().orElse(0d);
+            result.put("message", "本次轨迹可用距离 " + efforts.gpsDistanceKm() + " 公里，"
+                    + "小于最小目标距离 " + formatKm(smallestKm) + " 公里，"
+                    + "所以所有目标都算不出来；可调小 distancesKm，或先用 list_runs 确认这次的实际距离");
         }
         return result;
     }
@@ -1128,6 +1204,11 @@ public class SportHealthTools {
             @McpToolParam(description = "周期粒度：week（默认）或 month", required = false) String period,
             @McpToolParam(description = "返回多少个周期，默认 4，最多 52", required = false) Integer count,
             @McpToolParam(description = "结束日期，格式 yyyy-MM-dd，默认取数据最后一天所属周期", required = false) String endDate) {
+        if (period != null && !period.isBlank() && !PERIOD_VALUES.contains(period.trim().toLowerCase(Locale.ROOT))) {
+            // 过去除 month 之外一律当 week 处理，「按季度看」会拿到周趋势且毫无提示
+            return invalidArgument("period", period,
+                    "无法识别的周期粒度 \"" + period + "\"，支持 week / month；不传按 week", PERIOD_VALUES);
+        }
         DateRange anchorRange = analytics.resolveRange(null, endDate);
         TrainingTrend trend = analytics.trend(period, count == null ? 4 : count, anchorRange.to());
         Map<String, Object> result = new LinkedHashMap<>();
@@ -2176,17 +2257,116 @@ public class SportHealthTools {
         return sampled;
     }
 
+    /**
+     * {@code list_runs} 的入参校验。这几项过去都会被静默吞掉：{@code sortBy} 认不出就按 date 排，
+     * {@code weekday} 越界等于不按星期过滤（返回整段数据，看起来像「那天确实有跑」），
+     * {@code min > max} 则直接抛 {@link IllegalArgumentException} 让整个调用失败而不是给状态。
+     *
+     * @return 非 {@code null} 表示校验失败，直接把它当作工具返回值
+     */
+    private Map<String, Object> validateListArgs(String sortBy, Integer weekday,
+                                                 Double minDistanceKm, Double maxDistanceKm,
+                                                 Double minPaceSecondsPerKm, Double maxPaceSecondsPerKm) {
+        if (sortBy != null && !sortBy.isBlank()
+                && !SORT_VALUES.contains(sortBy.trim().toLowerCase(Locale.ROOT))) {
+            return invalidArgument("sortBy", sortBy,
+                    "无法识别的排序方式 \"" + sortBy + "\"，支持 date / distance / duration / pace / climb；"
+                            + "不传按 date（新的在前）", SORT_VALUES);
+        }
+        if (weekday != null && (weekday < 1 || weekday > 7)) {
+            return invalidArgument("weekday", weekday,
+                    "weekday 取值范围 1~7（1=周一，7=周日），收到 " + weekday + "；不传表示不按星期过滤",
+                    List.of("1", "2", "3", "4", "5", "6", "7"));
+        }
+        if (minDistanceKm != null && maxDistanceKm != null && minDistanceKm > maxDistanceKm) {
+            return invalidArgument("minDistanceKm", minDistanceKm,
+                    "最小距离 " + formatKm(minDistanceKm) + " 公里大于最大距离 " + formatKm(maxDistanceKm)
+                            + " 公里，过滤结果必然为空；两个边界都包含在内", null);
+        }
+        if (minPaceSecondsPerKm != null && maxPaceSecondsPerKm != null
+                && minPaceSecondsPerKm > maxPaceSecondsPerKm) {
+            return invalidArgument("minPaceSecondsPerKm", minPaceSecondsPerKm,
+                    "配速下限 " + minPaceSecondsPerKm + " 秒/公里 大于上限 " + maxPaceSecondsPerKm
+                            + " 秒/公里（数值越小越快，下限应不大于上限）", null);
+        }
+        return null;
+    }
+
+    /**
+     * 分组粒度归一化：不传按 {@code day}；给了但认不出来返回 {@code null}，
+     * 由调用方转成 {@code INVALID_ARGUMENT}——静默按 day 分组会让「按周看」的请求拿到日粒度数据。
+     */
+    /**
+     * 参数非法的统一返回：数据本身没问题，要改的是调用参数，所以不能复用 {@code NO_DATA}。
+     * 带上 {@code param} / {@code value}，调用方不必猜是哪个参数出的问题。
+     *
+     * @param allowedValues 枚举型参数的允许值，没有就传 {@code null}
+     */
+    private Map<String, Object> invalidArgument(String param, Object value, String message,
+                                                List<String> allowedValues) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "INVALID_ARGUMENT");
+        result.put("param", param);
+        result.put("value", jsonSafeValue(value));
+        result.put("message", message);
+        if (allowedValues != null && !allowedValues.isEmpty()) {
+            result.put("allowedValues", allowedValues);
+        }
+        return result;
+    }
+
+    /** {@code NaN} / {@code Infinity} 不是合法 JSON 数字，回显时降级成字符串，避免返回体被序列化成非法 JSON。 */
+    private static Object jsonSafeValue(Object value) {
+        if (value instanceof Double d && !Double.isFinite(d)) {
+            return String.valueOf(d);
+        }
+        if (value instanceof List<?> list) {
+            return list.stream().map(SportHealthTools::jsonSafeValue).toList();
+        }
+        return value;
+    }
+
+    /** {@code splitKm} 的校验口径：不传走默认值；非正数、NaN、无穷与小于 0.1 公里都属于非法。 */
+    private static boolean validSplitKm(Double splitKm) {
+        return splitKm == null || (Double.isFinite(splitKm) && splitKm >= MIN_SPLIT_KM);
+    }
+
+    private Map<String, Object> invalidSplitKm(Double splitKm) {
+        return invalidArgument("splitKm", splitKm,
+                "splitKm 必须是 ≥ " + formatKm(MIN_SPLIT_KM) + " 公里的有限数值，收到 " + splitKm
+                        + "；不传则默认按 " + formatKm(DEFAULT_SPLIT_KM) + " 公里分段", null);
+    }
+
+    /**
+     * {@code distancesKm} 里非法项的可读形式：{@code null}、非正数、NaN、Infinity。
+     *
+     * @return 空列表表示全部合法
+     */
+    private static List<String> invalidDistances(List<Double> distancesKm) {
+        return distancesKm.stream()
+                .filter(km -> km == null || !Double.isFinite(km) || km <= 0)
+                .map(String::valueOf)
+                .toList();
+    }
+
     private static String normalizeGroup(String groupBy) {
         if (groupBy == null || groupBy.isBlank()) {
             return "day";
         }
         String key = groupBy.trim().toLowerCase(Locale.ROOT);
         return switch (key) {
-            case "week", "month" -> key;
-            default -> "day";
+            case "day", "week", "month" -> key;
+            default -> null;
         };
     }
 
+    /**
+     * 类别归一化：不传按 {@code all}；给了但认不出来返回 {@code null}，由调用方转成
+     * {@code INVALID_ARGUMENT}——静默变成 {@code all} 会返回一堆没被请求的字段。
+     *
+     * <p>别名比较宽松：大小写、下划线、连字符都不敏感（{@code Best-5K} 等价于 {@code best5k}），
+     * 但「认不出」和「没传」必须分开。
+     */
     private static String normalizeCategory(String category) {
         if (category == null || category.isBlank()) {
             return "all";
@@ -2200,7 +2380,7 @@ public class SportHealthTools {
             case "15k", "best15k", "best15km" -> "best15k";
             case "half", "halfmarathon", "hm", "21k", "21.1k", "besthalf", "半马", "半程马拉松" -> "bestHalf";
             case "marathon", "full", "fm", "42k", "42.2k", "bestmarathon", "全马", "马拉松" -> "bestMarathon";
-            default -> Set.of("distance", "pace", "duration", "climb").contains(key) ? key : "all";
+            default -> Set.of("distance", "pace", "duration", "climb", "all").contains(key) ? key : null;
         };
     }
 

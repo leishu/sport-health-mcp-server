@@ -148,7 +148,7 @@ class SportHealthToolsTest {
         assertNotNull(summaryData.get("reason"));
     }
 
-    /** compare_runs 的分段必须和 get_run_splits 用同一把尺子：splitKm 生效、回显 splitMeters、非法值回落 1 公里。 */
+    /** compare_runs 的分段必须和 get_run_splits 用同一把尺子：splitKm 生效、回显 splitMeters、非法值直接拒绝。 */
     @Test
     void compareRunsHonoursSplitKm() {
         Map<String, Object> list = tools.listRuns(null, null, null, null, null, null, null,
@@ -169,12 +169,22 @@ class SportHealthToolsTest {
         assertTrue(fiveKm.size() < oneKm.size(), "5 公里分段数应少于 1 公里");
         assertEquals(5d, ((RunSplit) fiveKm.get(0)).distanceKm(), 1e-9);
 
-        // 0 / 负数等于没传，不能抛异常也不能切出 0 长度分段
-        assertEquals(1000d, splitMetersOf((Map<?, ?>) tools.compareRuns(baseId, otherId, true, 0d).get("splits")));
-        assertEquals(1000d, splitMetersOf((Map<?, ?>) tools.compareRuns(baseId, otherId, true, -2d).get("splits")));
+        // 0 / 负数 / 小于下限：不能静默按 1 公里切，否则返回的数据和请求对不上
+        for (double bad : new double[] {0d, -2d, 0.01d}) {
+            Map<String, Object> rejected = tools.compareRuns(baseId, otherId, true, bad);
+            assertInvalidArgument(rejected, "splitKm");
+        }
 
         // includeSplits=false 时即使传了 splitKm 也不该顺手把轨迹算一遍
         assertFalse(tools.compareRuns(baseId, otherId, false, 5d).containsKey("splits"));
+    }
+
+    /** 参数校验失败的统一形态：status + param + value，且不再带业务数据。 */
+    private static void assertInvalidArgument(Map<String, Object> result, String param) {
+        assertEquals("INVALID_ARGUMENT", result.get("status"), "应拒绝非法参数而不是静默回落");
+        assertEquals(param, result.get("param"));
+        assertNotNull(result.get("value"), "要回显收到的值");
+        assertNotNull(result.get("message"));
     }
 
     private static double splitMetersOf(Map<?, ?> splits) {
