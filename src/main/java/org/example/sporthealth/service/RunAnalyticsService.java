@@ -57,6 +57,7 @@ import org.example.sporthealth.repository.HealthDataRepository;
 import org.example.sporthealth.support.DateRange;
 import org.example.sporthealth.support.DateRangeResolver;
 import org.example.sporthealth.support.PaceFormat;
+import org.example.sporthealth.support.RaceDistance;
 import org.example.sporthealth.support.TrackPath;
 import org.springframework.stereotype.Service;
 
@@ -979,30 +980,11 @@ public class RunAnalyticsService {
                 .filter(prediction -> Math.abs(prediction.targetMeters() - 10000d) < 1d)
                 .findFirst()
                 .orElse(predictions.get(0));
-        return "基于 " + raceDistanceLabel(headline.referenceMeters()) + " 最佳 "
+        return "基于 " + RaceDistance.label(headline.referenceMeters()) + " 最佳 "
                 + PaceFormat.duration(headline.referenceDurationSeconds())
                 + "（" + headline.referenceDate() + "），预测 "
-                + raceDistanceLabel(headline.targetMeters()) + " 约 "
+                + RaceDistance.label(headline.targetMeters()) + " 约 "
                 + headline.predictedText() + "（" + headline.paceText() + "）";
-    }
-
-    private static String raceDistanceLabel(double meters) {
-        if (Math.abs(meters - 1000d) < 1d) {
-            return "1 公里";
-        }
-        if (Math.abs(meters - 5000d) < 1d) {
-            return "5 公里";
-        }
-        if (Math.abs(meters - 10000d) < 1d) {
-            return "10 公里";
-        }
-        if (Math.abs(meters - 21097.5d) < 1d) {
-            return "半程马拉松";
-        }
-        if (Math.abs(meters - 42195d) < 1d) {
-            return "全程马拉松";
-        }
-        return PaceFormat.round(meters / 1000d, 2) + " 公里";
     }
 
     /**

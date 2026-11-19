@@ -46,12 +46,13 @@ class SportHealthToolsP0Test {
 
     @Test
     void predictRaceTimeReturnsStandardDistances() {
-        Map<String, Object> result = tools.predictRaceTime(null, null, null);
+        Map<String, Object> result = tools.predictRaceTime(null, null, null, null);
 
         assertEquals("OK", result.get("status"));
         assertEquals("riegel", result.get("method"));
         assertEquals(1.06, (Double) result.get("exponent"), 1e-9);
         assertNotNull(result.get("references"));
+        assertFalse(result.containsKey("official"), "默认不请求官方跑力，不应出现 official 块");
         List<RacePrediction.Prediction> predictions = predictions(result);
         assertEquals(4, predictions.size(), "默认输出 5K/10K/半马/全马");
 
@@ -68,7 +69,7 @@ class SportHealthToolsP0Test {
 
     @Test
     void predictRaceTimeAcceptsCustomDistance() {
-        Map<String, Object> result = tools.predictRaceTime(null, null, 12d);
+        Map<String, Object> result = tools.predictRaceTime(null, null, 12d, null);
 
         assertEquals("OK", result.get("status"));
         List<RacePrediction.Prediction> predictions = predictions(result);

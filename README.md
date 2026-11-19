@@ -48,7 +48,7 @@ JAVA_HOME=/path/to/jdk-21 java -jar target/sport-health-mcp-server-1.0.0.jar
 
 ```
 SQLite 数据库文件: /home/you/sport-health-mcp-server/data/sport-health.db
-Registered tools: 20
+Registered tools: 21
 Netty started on port 8080 (http)
 ```
 
@@ -235,7 +235,8 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `get_consistency` | `startDate?` `endDate?` | 打卡天数占比、当前/最长连续天数、平均间隔、日历热力数据；当前连续以最后一次记录为锚点 |
 | `get_elevation_profile` | `runId` `bucketMeters?` `smoothingMeters?` | 按距离分桶的海拔剖面（默认 100 米一桶、最小 10；平滑默认 1 米、0 表示不平滑），含累计爬升下降与坡度 |
 | `get_stop_points` | `runId` `minStopSeconds?` `maxDisplacementMeters?` | 检测停顿（默认 30 秒、30 米）：相邻轨迹点间隔≥阈值且位移≤阈值，返回时长、位置与总停顿 |
-| `predict_race_time` | `startDate?` `endDate?` `distanceKm?` | 用区间内 1K/5K/10K/半马/全马最佳努力做 Riegel 外推（`T2 = T1 × (D2/D1)^1.06`）。不传 `distanceKm` 时输出 5K/10K/半马/全马；有实测距离时标记 `source=ACTUAL`，外推标记 `RIEGEL`，并给出参考记录与 `HIGH/MEDIUM/LOW` 置信度 |
+| `predict_race_time` | `startDate?` `endDate?` `distanceKm?` `includeOfficial?` | 用区间内 1K/5K/10K/半马/全马最佳努力做 Riegel 外推（`T2 = T1 × (D2/D1)^1.06`）。不传 `distanceKm` 时输出 5K/10K/半马/全马；有实测距离时标记 `source=ACTUAL`，外推标记 `RIEGEL`，并给出参考记录与 `HIGH/MEDIUM/LOW` 置信度。`includeOfficial=true` 时额外返回 `official` 块：华为官方跑力给出的同距离成绩（`source=HUAWEI_OFFICIAL`）、逐行的 `officialSource`/`riegelSource`/`deltaSeconds`/`deltaText`，以及快照日期与时效（`withinRange`/`staleDays`）；官方没有对应档位的目标距离列在 `unavailableTargetsKm` |
+| `get_run_level` | `date?` `includeHistory?` `historyDays?` | 华为官方跑力（`run_level` 每日快照）：跑力值 `runLevel`、A/E/I/M/R 五档配速（华为原文是 km/h，这里换算成秒/公里与 `4'35"/km` 文本）、官方给的 1/3/5/10 公里与半马/全马成绩。不传 `date` 取最新一天，传了取该日或之前最近一天（`note` 说明回退）；`includeHistory=true` 附跑力趋势，`historyDays` 默认 90、最大 3650 |
 | `get_training_load` | `endDate?` `metric?` | 训练负荷与 ACWR：7 天急性、28 天慢性、`ACWR = 急性 / (慢性/4)`、周跑量增幅、连续训练天数、休息日、单调性与 Strain，并给出调整建议。`metric` 可选 `distance`（默认，公里）或 `duration`（分钟）；数据覆盖不足时明确标注置信度 |
 | `classify_run` | `runId` | 识别训练类型：轻松跑、长距离跑、节奏跑、间歇/变速跑、比赛/测试跑、恢复跑。基于距离、时长、配速相对个人中位数与分段波动，返回判定依据与置信度（无 GPS 时降为 LOW） |
 | `get_training_mix` | `startDate?` `endDate?` | 区间内的训练类型构成：各类型的次数、距离、距离占比，并逐条列出分类结果。逐条分类会按需解析轨迹，首次调用稍慢 |
@@ -255,6 +256,7 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 P0 新增的五项分析都只使用已有的 TCX 数据与已回填的天气，不引入新的数据源、不新增数据库表：
 
 - **比赛预测**：Riegel 公式 `T2 = T1 × (D2/D1)^1.06`。参考成绩取区间内 1K/5K/10K/半马/全马最佳努力中与目标距离最接近的一项；目标距离本身有实测时直接返回实测值并标记 `ACTUAL`。参考距离与目标距离差得越远，`confidence` 越低。
+- **官方跑力（与 Riegel 并列，不互相替代）**：`run_level` 是华为每日一行的官方快照，含 `currentRunLevel`、A/E/I/M/R 五档速度（km/h）与 1/3/5/10 公里、半马、全马成绩。`get_run_level` 原样读出并换算配速；`predict_race_time(includeOfficial=true)` 按「区间结束日或之前最近一天」取快照，与 Riegel 逐距离并列，每行都带 `officialSource=HUAWEI_OFFICIAL` 与 `riegelSource=ACTUAL/RIEGEL`，差值为正表示官方更慢；相差 30 秒以内算「基本一致」，不作快慢判断。快照不在区间内时 `withinRange=false` 并给出 `staleDays`。
 - **训练负荷 / ACWR**：急性窗口 7 天、慢性窗口 28 天，负荷口径默认距离（公里），也可切换为时长（分钟）。`ACWR = 急性负荷 / (慢性负荷 / 4)`；同时返回周增幅、连续训练天数、休息日、7 天单调性（均值/标准差）与 Strain。慢性窗口覆盖不足 21 天或训练日少于 7 天时 `dataSufficient=false`，置信度降为 `LOW`。
 - **坡度修正配速 GAP**：用 Minetti 跑步能量代价公式计算坡度代价比 `Cr(grade)/Cr(0)`，`GAP = 实际配速 / 代价比`，坡度夹取到 `[-45%, 45%]`；净海拔变化取每段首尾海拔差。全程 GAP 用等效平路距离加权，而不是对分段 GAP 做算术平均。
 - **训练类型识别**：无心率数据，基于距离、时长、配速相对个人中位数与分段波动做启发式判断。长距离阈值取 `max(10 km, 1.5 × 个人中位距离)`；间歇/变速要求同时有至少 2 段明显快、2 段明显慢于中位配速，避免把长距离跑里的一次停顿误判成间歇；无 GPS 轨迹时置信度降为 `LOW`。
@@ -359,7 +361,7 @@ TCX 文件只在**内容变化**时被解析一次，结果写进 SQLite；之�
 | `sport_daily_dimen_stat` | 按运动类型拆分的每日统计（派生自 `sport daily dimen statistics.xls`） |
 | `daily_health_stat` | 每日健康统计（派生自 `user health daily statistics.xls`） |
 | `daily_health_samplestat` | 每日健康样本统计（派生自 `user health daily samplestat.xls`） |
-| `run_level` | 华为官方跑力与 5 km / 10 km / 半马 / 全马预测成绩 |
+| `run_level` | 华为官方跑力：跑力值、A/E/I/M/R 五档速度（km/h）与 1/3/5/10 公里、半马、全马成绩（由 `get_run_level` 读取，单位换算在工具层完成） |
 | `medal` | 勋章获得记录（同一类型 / 等级可多次获得） |
 
 前 11 张是原始表，后 12 张是**派生表**：内容完全由 `health_metric` / `activity_minute` /
@@ -564,9 +566,11 @@ JPA 在 WebFlux 上要配 R2DBC 才不阻塞，对只有两张表的场景属于
 ## 架构
 
 ```
-tools/SportHealthTools          # 20 个 @McpTool，负责参数校验与统一的 Map<String, Object> 返回结构
+tools/SportHealthTools          # 21 个 @McpTool，负责参数校验与统一的 Map<String, Object> 返回结构
         │
 service/RunAnalyticsService     # 区间汇总、按天拆分、个人最佳、对比、分段/GAP、最佳努力、海拔、停顿、趋势、比赛预测、ACWR、训练分类、id 解析
+service/RunLevelService         # 华为官方跑力：每日快照、五档配速、趋势、官方 vs Riegel 对照
+        └── repository/RunLevelStore   # run_level 表：最近一天 / 指定日或之前 / 区间内；km/h → 配速在仓储层换算
 service/AutoSyncScheduler       # 后台自动同步执行器：调用 reload()，失败只记日志、保留上一份快照
 config/AutoSyncConfiguration    # 注册 fixed-delay 任务；enabled=false 时不注册
         │

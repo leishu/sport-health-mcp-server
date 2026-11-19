@@ -2,6 +2,7 @@ package org.example.sporthealth.tools;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
@@ -13,6 +14,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -22,6 +24,7 @@ import org.example.sporthealth.domain.BestEfforts;
 import org.example.sporthealth.domain.Consistency;
 import org.example.sporthealth.domain.DailyRunSummary;
 import org.example.sporthealth.domain.ElevationProfile;
+import org.example.sporthealth.domain.OfficialRaceComparison;
 import org.example.sporthealth.domain.Page;
 import org.example.sporthealth.domain.PeriodSummary;
 import org.example.sporthealth.domain.PersonalBestEffort;
@@ -33,6 +36,8 @@ import org.example.sporthealth.domain.RunComparison;
 import org.example.sporthealth.domain.RunDataset;
 import org.example.sporthealth.domain.RunDetail;
 import org.example.sporthealth.domain.RunFilter;
+import org.example.sporthealth.domain.RunLevel;
+import org.example.sporthealth.domain.RunLevelHistory;
 import org.example.sporthealth.domain.RunLookup;
 import org.example.sporthealth.domain.RunSplits;
 import org.example.sporthealth.domain.RunSummary;
@@ -53,6 +58,8 @@ import org.example.sporthealth.repository.JdbcHealthDataRepository;
 import org.example.sporthealth.repository.RunRows;
 import org.example.sporthealth.repository.RunWeatherStore;
 import org.example.sporthealth.service.RunAnalyticsService;
+import org.example.sporthealth.service.RunLevelService;
+import org.example.sporthealth.support.DateParser;
 import org.example.sporthealth.support.DateRange;
 import org.example.sporthealth.support.PaceFormat;
 import org.example.sporthealth.support.WeatherImpactAnalyzer;
@@ -60,6 +67,7 @@ import org.example.sporthealth.weather.WeatherCodes;
 import org.example.sporthealth.weather.WindDirections;
 import org.springframework.ai.mcp.annotation.McpTool;
 import org.springframework.ai.mcp.annotation.McpToolParam;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
@@ -101,15 +109,30 @@ public class SportHealthTools {
     private final HealthDataProperties properties;
     /** 可选：非 JDBC 仓储（单测里的内存实现）没有 {@code run_weather} 表，此时为 null。 */
     private final RunWeatherStore weatherStore;
+    /** 可选：同理，非 JDBC 仓储没有 {@code run_level} 表。官方跑力是增强信息，缺失不影响其它工具。 */
+    private final RunLevelService runLevelService;
 
+    /**
+     * 不带官方跑力的构造方式，供只有 TCX 数据的内存仓储与单测使用。
+     */
     public SportHealthTools(RunAnalyticsService analytics,
                             HealthDataRepository repository,
                             HealthDataProperties properties,
                             RunWeatherStore weatherStore) {
+        this(analytics, repository, properties, weatherStore, null);
+    }
+
+    @Autowired
+    public SportHealthTools(RunAnalyticsService analytics,
+                            HealthDataRepository repository,
+                            HealthDataProperties properties,
+                            RunWeatherStore weatherStore,
+                            RunLevelService runLevelService) {
         this.analytics = analytics;
         this.repository = repository;
         this.properties = properties;
         this.weatherStore = weatherStore;
+        this.runLevelService = runLevelService;
     }
 
     /** 区间内的记录列表，新的在前，支持过滤、排序与分页。 */
@@ -476,28 +499,152 @@ public class SportHealthTools {
     /**
      * 比赛成绩预测：用区间内的最佳努力做 Riegel 外推。
      * 目标距离本身有实测成绩时直接返回实测值，并标记 {@code source=ACTUAL}。
+     *
+     * <p>{@code includeOfficial=true} 时额外附上华为官方跑力给出的同距离成绩，
+     * 两组数字并列但各带来源标识（{@code HUAWEI_OFFICIAL} / {@code ACTUAL} / {@code RIEGEL}），
+     * 不互相覆盖。官方数据按「区间结束日或之前最近一天」取，时效信息在 {@code official} 块里。
      */
     @McpTool(name = "predict_race_time",
             description = "根据区间内的最佳努力预测比赛成绩（Riegel 公式）。不传 distanceKm 时输出 5K、10K、"
                     + "半马、全马四档；传 distanceKm 时只预测该距离。每条预测都带参考距离、参考记录与置信度，"
-                    + "参考成绩越接近目标距离越可靠。用于回答“我现在的水平全马能跑多少”“目标 10K 该按什么配速跑”。")
+                    + "参考成绩越接近目标距离越可靠。includeOfficial=true 时再返回一组华为官方跑力给出的"
+                    + "同距离成绩（source=HUAWEI_OFFICIAL），与 Riegel 逐行对照并给出差值，两组口径不同、不要混用。"
+                    + "用于回答“我现在的水平全马能跑多少”“目标 10K 该按什么配速跑”“官方预测和我实际成绩差多少”。")
     public Map<String, Object> predictRaceTime(
             @McpToolParam(description = "开始日期，格式 yyyy-MM-dd，默认取数据最早一天", required = false) String startDate,
             @McpToolParam(description = "结束日期，格式 yyyy-MM-dd，默认取数据最新一天", required = false) String endDate,
-            @McpToolParam(description = "目标距离（公里）；不传则输出 5K/10K/半马/全马", required = false) Double distanceKm) {
+            @McpToolParam(description = "目标距离（公里）；不传则输出 5K/10K/半马/全马", required = false) Double distanceKm,
+            @McpToolParam(description = "是否附带华为官方跑力的同距离成绩，默认 false", required = false) Boolean includeOfficial) {
         DateRange range = analytics.resolveRange(startDate, endDate);
         RacePrediction prediction = analytics.predictRace(range, distanceKm);
-        if (prediction.predictions().isEmpty()) {
+        boolean include = Boolean.TRUE.equals(includeOfficial);
+        boolean hasRiegel = !prediction.predictions().isEmpty();
+        if (!hasRiegel && !include) {
             return noData(range, prediction.text());
         }
         Map<String, Object> result = new LinkedHashMap<>();
-        result.put("status", "OK");
+        result.put("status", hasRiegel ? "OK" : "NO_DATA");
         result.put("range", range.text());
+        if (!hasRiegel) {
+            result.put("message", "区间 " + range.text()
+                    + " 内没有可用的 GPS 轨迹，Riegel 外推不可用；official 为华为官方跑力给出的成绩");
+        }
         result.put("method", prediction.method());
         result.put("exponent", prediction.exponent());
         result.put("references", prediction.references());
         result.put("predictions", prediction.predictions());
         result.put("text", prediction.text());
+        if (include) {
+            result.put("official", officialBlock(prediction, range));
+        }
+        return result;
+    }
+
+    /**
+     * 华为官方跑力：跑力值、A/E/I/M/R 五档配速与官方给的 1/3/5/10 公里、半马、全马成绩。
+     *
+     * <p>这是 {@code run_level} 表唯一的读取入口。与 {@link #predictRaceTime} 的关系是并列参照：
+     * 官方值是华为对个人能力的评估，每天一行快照；Riegel 只反映所选区间内实际跑出的成绩。
+     */
+    @McpTool(name = "get_run_level",
+            description = "读取华为官方跑力（导出的 user run level data）：跑力值、A/E/I/M/R 五档配速"
+                    + "（速度已从 km/h 换算成配速），以及官方给出的 1/3/5/10 公里、半马、全马成绩。"
+                    + "不传 date 时取最新一天；传 date 时取该日或之前最近一天（官方数据是每日快照）。"
+                    + "includeHistory=true 时附跑力趋势，historyDays 控制窗口（默认 90 天）。"
+                    + "预测比赛成绩请用 predict_race_time（includeOfficial=true 可与官方值逐项对照）。"
+                    + "用于回答“我的华为跑力多少”“A/E/I/M/R 配速是多少”“官方预测我全马多少”“跑力这一年涨了多少”。")
+    public Map<String, Object> getRunLevel(
+            @McpToolParam(description = "日期，格式 yyyy-MM-dd；不传取最新一天，传了取该日或之前最近一天",
+                    required = false) String date,
+            @McpToolParam(description = "是否附带跑力趋势，默认 false", required = false) Boolean includeHistory,
+            @McpToolParam(description = "趋势窗口天数，默认 90，最大 3650", required = false) Integer historyDays) {
+        if (runLevelService == null) {
+            return runLevelNoData("当前仓储不是 SQLite 版，没有 run_level 表，无法读取华为官方跑力");
+        }
+        LocalDate requested = date == null || date.isBlank() ? null : DateParser.parseDate(date);
+        try {
+            Optional<RunLevel> snapshot = requested == null
+                    ? runLevelService.latest()
+                    : runLevelService.latestOnOrBefore(requested);
+            if (snapshot.isEmpty()) {
+                return runLevelNoData(requested == null
+                        ? "run_level 表为空，尚未导入华为官方跑力数据（重新 reload_data 可触发派生表重建）"
+                        : "没有找到 " + requested + " 或之前的官方跑力数据");
+            }
+            RunLevel level = snapshot.get();
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("status", "OK");
+            result.put("date", level.date());
+            result.put("source", RunLevelService.SOURCE);
+            result.put("runLevel", level.score());
+            result.put("zones", level.zones());
+            result.put("officialTimes", level.officialTimes());
+            result.put("text", runLevelService.describe(level));
+            if (requested != null && !requested.equals(level.date())) {
+                result.put("requestedDate", requested);
+                result.put("note", requested + " 当天没有快照，已取之前最近一天 " + level.date());
+            }
+            if (Boolean.TRUE.equals(includeHistory)) {
+                RunLevelHistory history = runLevelService.history(level.date(), historyDays);
+                if (history != null) {
+                    result.put("history", history);
+                }
+            }
+            return result;
+        } catch (RuntimeException e) {
+            log.warn("读取华为官方跑力失败", e);
+            return runLevelNoData("读取 run_level 失败：" + e.getMessage());
+        }
+    }
+
+    /**
+     * 官方跑力块：官方成绩与 Riegel 逐距离对照。
+     *
+     * <p>没有官方数据时返回嵌套的 {@code status=NO_DATA}，而不是让整个预测失败——
+     * Riegel 结果本身仍然有效，官方值只是增强信息。
+     */
+    private Map<String, Object> officialBlock(RacePrediction prediction, DateRange range) {
+        if (runLevelService == null) {
+            return officialUnavailable("当前仓储不是 SQLite 版，没有 run_level 表");
+        }
+        OfficialRaceComparison comparison;
+        try {
+            comparison = runLevelService.compare(prediction, range);
+        } catch (RuntimeException e) {
+            log.warn("读取华为官方跑力失败", e);
+            return officialUnavailable("读取 run_level 失败：" + e.getMessage());
+        }
+        if (comparison == null) {
+            return officialUnavailable("没有 " + range.to() + " 或之前的官方跑力快照");
+        }
+        Map<String, Object> official = new LinkedHashMap<>();
+        official.put("status", "OK");
+        official.put("source", comparison.source());
+        official.put("date", comparison.date());
+        official.put("runLevel", comparison.score());
+        official.put("withinRange", comparison.withinRange());
+        official.put("staleDays", comparison.staleDays());
+        official.put("predictions", comparison.rows());
+        if (!comparison.unavailableTargetsKm().isEmpty()) {
+            official.put("unavailableTargetsKm", comparison.unavailableTargetsKm());
+        }
+        official.put("text", comparison.text());
+        return official;
+    }
+
+    private static Map<String, Object> officialUnavailable(String message) {
+        Map<String, Object> official = new LinkedHashMap<>();
+        official.put("status", "NO_DATA");
+        official.put("source", RunLevelService.SOURCE);
+        official.put("message", message);
+        return official;
+    }
+
+    private static Map<String, Object> runLevelNoData(String message) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "NO_DATA");
+        result.put("source", RunLevelService.SOURCE);
+        result.put("message", message);
         return result;
     }
 

@@ -43,6 +43,25 @@ public final class PaceFormat {
         return minutes + " 分 " + String.format("%02d", secs) + " 秒";
     }
 
+    /**
+     * 秒 -> 22:47 / 3:35:26，不丢秒。
+     *
+     * <p>用于比赛成绩这类需要精确到秒的场合：{@link #duration(Double)} 在超过 1 小时后会丢掉秒，
+     * 把 3:35:26 显示成「3 小时 35 分」，对成绩对比来说信息损失太大。
+     */
+    public static String clock(Double seconds) {
+        if (seconds == null || seconds <= 0 || !Double.isFinite(seconds)) {
+            return null;
+        }
+        long total = Math.round(seconds);
+        long hours = total / 3600;
+        long minutes = (total % 3600) / 60;
+        long secs = total % 60;
+        return hours > 0
+                ? String.format("%d:%02d:%02d", hours, minutes, secs)
+                : String.format("%d:%02d", minutes, secs);
+    }
+
     /** 四舍五入到指定小数位；与 {@link Math#round(double)} 一致，负数按远离零方向取整。 */
     public static double round(double value, int scale) {
         double factor = Math.pow(10, scale);
