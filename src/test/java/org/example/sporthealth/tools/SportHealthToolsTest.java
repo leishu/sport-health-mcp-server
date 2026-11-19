@@ -16,7 +16,10 @@ import java.util.Map;
 import org.example.sporthealth.config.HealthDataProperties;
 import org.example.sporthealth.domain.RunActivity;
 import org.example.sporthealth.domain.RunDataset;
+import org.example.sporthealth.domain.SplitCrossCheck;
 import org.example.sporthealth.domain.TrackPoint;
+import org.example.sporthealth.domain.TrackStream;
+import org.example.sporthealth.domain.VendorSplit;
 import org.example.sporthealth.importer.TcxParser;
 import org.example.sporthealth.repository.HealthDataRepository;
 import org.example.sporthealth.repository.TcxRunRepository;
@@ -58,16 +61,51 @@ class SportHealthToolsTest {
 
     @Test
     void exposesBest1kAndBest5kCategories() {
-        Map<String, Object> all = tools.getPersonalBests(null, null, "all");
+        Map<String, Object> all = tools.getPersonalBests(null, null, "all", null);
         Map<?, ?> allBests = (Map<?, ?>) all.get("bests");
         assertNotNull(allBests.get("best1k"));
         assertNotNull(allBests.get("best5k"));
 
-        Map<String, Object> only5k = tools.getPersonalBests(null, null, "5k");
+        Map<String, Object> only5k = tools.getPersonalBests(null, null, "5k", null);
         assertEquals("best5k", only5k.get("category"));
         Map<?, ?> only5kBests = (Map<?, ?>) only5k.get("bests");
         assertEquals(1, only5kBests.size());
         assertNotNull(only5kBests.get("best5k"));
+    }
+
+    /** 任意目标距离：样本最长 10.7 公里，所以 10 公里能算出来，半马列在不可用里。 */
+    @Test
+    void personalBestsAcceptArbitraryDistances() {
+        Map<String, Object> result = tools.getPersonalBests(null, null, "all", List.of(1d, 5d, 10d, 21.0975d));
+
+        Map<?, ?> bests = (Map<?, ?>) result.get("bests");
+        assertNotNull(bests.get("best1k"));
+        assertNotNull(bests.get("best5k"));
+        assertNotNull(bests.get("best10k"), "样本有 10.7 公里的一次，10K 必须算得出来");
+        assertNull(bests.get("bestHalf"));
+        assertEquals(List.of(1d, 5d, 10d, 21.0975d), result.get("effortDistancesKm"));
+        assertEquals(List.of(21.0975d), result.get("unavailableDistancesKm"));
+    }
+
+    /** 只查配速时不该顺手把轨迹算一遍，返回体里也不该出现最佳努力字段。 */
+    @Test
+    void nonDistanceCategorySkipsEffortScan() {
+        Map<String, Object> paceOnly = tools.getPersonalBests(null, null, "pace", null);
+
+        assertFalse(paceOnly.containsKey("effortDistancesKm"));
+        assertFalse(((Map<?, ?>) paceOnly.get("bests")).containsKey("best1k"));
+    }
+
+    /** 距离类别的别名都归一到同一个键，半马/全马用固定名。 */
+    @Test
+    void effortLabelsCoverNamedDistances() {
+        assertEquals("best1k", SportHealthTools.effortLabel(1000d));
+        assertEquals("best10k", SportHealthTools.effortLabel(10000d));
+        assertEquals("bestHalf", SportHealthTools.effortLabel(21097.5d));
+        assertEquals("bestMarathon", SportHealthTools.effortLabel(42195d));
+        assertEquals("best2.5k", SportHealthTools.effortLabel(2500d));
+        assertEquals("bestMarathon", tools.getPersonalBests(null, null, "full", null).get("category"));
+        assertEquals("bestHalf", tools.getPersonalBests(null, null, "半马", null).get("category"));
     }
 
     @Test
@@ -187,6 +225,93 @@ class SportHealthToolsTest {
         assertNull(point.get("heartRate"));
         assertNull(point.get("cadence"));
         assertNull(point.get("distanceMeters"));
+    }
+
+    /**
+     * 华为来源的官方分段（pm2）要和 GPS 分段一起给出，并附交叉校验。
+     *
+     * <p>构造一条 2 公里、每 100 米一个点、30 秒一个点的轨迹（≈300 秒/公里），
+     * 华为给的分段配速故意各慢 4~8 秒，用来验证差值被算出来。
+     */
+    @Test
+    void runSplitsIncludeVendorPacesAndCrossCheck() {
+        List<TrackPoint> route = syntheticRoute(21, 30);
+        RunActivity run = sampleRun("run-vendor", "act-vendor", 50d, 300d);
+        List<TrackStream> streams = List.of(
+                stream("pm2", 0, 1000d, 304d),
+                stream("pm2", 1, 2000d, 308d),
+                stream("pm2", 2, 2500d, 310d));
+        SportHealthTools vendorTools = toolsWithStreams(run, route, streams);
+
+        Map<String, Object> result = vendorTools.getRunSplits("run-vendor", null);
+
+        Map<?, ?> vendor = (Map<?, ?>) result.get("vendorSplits");
+        assertNotNull(vendor, "有 pm2 时必须给出厂商分段");
+        assertEquals("HUAWEI_PM2", vendor.get("source"));
+        List<?> vendorSplits = (List<?>) vendor.get("splits");
+        assertEquals(3, vendorSplits.size(), "末段不足一公里也要保留");
+        VendorSplit lastSplit = (VendorSplit) vendorSplits.get(2);
+        assertTrue(lastSplit.partial());
+        assertEquals(0.5d, lastSplit.distanceKm(), 1e-9);
+
+        SplitCrossCheck check = (SplitCrossCheck) result.get("splitCrossCheck");
+        assertNotNull(check, "段长一致的两份分段应能交叉校验");
+        assertEquals(2, check.comparedSplits());
+        assertTrue(check.meanAbsDeltaSecondsPerKm() > 0d);
+        assertTrue(check.maxAbsDeltaSecondsPerKm() >= 4d);
+    }
+
+    /** 一条南北向的直线轨迹：{@code count} 个点、每段 100 米、{@code secondsPerPoint} 秒一个点。 */
+    private static List<TrackPoint> syntheticRoute(int count, int secondsPerPoint) {
+        LocalDateTime start = LocalDateTime.of(2026, 10, 25, 6, 56, 16);
+        List<TrackPoint> points = new java.util.ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            points.add(new TrackPoint(start.plusSeconds((long) i * secondsPerPoint),
+                    39.9 + i * 0.000898, 116.4, 50d));
+        }
+        return points;
+    }
+
+    /** 一条 pm2 流：{@code d} 是累计距离（米），{@code p} 是该段配速（秒/公里）。 */
+    private static TrackStream stream(String type, int seq, double endMeters, double paceSeconds) {
+        Map<String, String> fields = Map.of(
+                "tp", type,
+                "d", String.valueOf((long) endMeters),
+                "n", String.valueOf(seq + 1),
+                "p", String.valueOf(paceSeconds));
+        return new TrackStream("run-vendor", type, seq, null, seq + 1, paceSeconds, fields);
+    }
+
+    /** 单条记录 + 固定轨迹 + 给定原始流的内存仓储。 */
+    private SportHealthTools toolsWithStreams(RunActivity run, List<TrackPoint> route, List<TrackStream> streams) {
+        RunDataset dataset = new RunDataset(Instant.parse("2026-11-03T12:00:00Z"), "memory",
+                List.of(), List.of(run), List.of());
+        HealthDataRepository fake = new HealthDataRepository() {
+            @Override
+            public RunDataset dataset() {
+                return dataset;
+            }
+
+            @Override
+            public void reload() {
+                // 内存实现，无需重新扫描
+            }
+
+            @Override
+            public List<TrackPoint> route(String runId) {
+                return route;
+            }
+
+            @Override
+            public List<TrackStream> streams(String runId, String streamType) {
+                return streams.stream()
+                        .filter(stream -> streamType == null || streamType.equals(stream.streamType()))
+                        .toList();
+            }
+        };
+        Clock clock = Clock.fixed(Instant.parse("2026-11-03T12:00:00Z"), ZoneId.of("Asia/Shanghai"));
+        RunAnalyticsService service = new RunAnalyticsService(fake, new DateRangeResolver(clock));
+        return new SportHealthTools(service, fake, properties, null);
     }
 
     /** 用固定的两点替换真实仓储的 {@code route()}，其它行为（dataset、lookup）保持真实。 */

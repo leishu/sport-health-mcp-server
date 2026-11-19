@@ -3,13 +3,17 @@ package org.example.sporthealth.repository;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.example.sporthealth.config.HealthDataProperties;
 import org.example.sporthealth.domain.RunActivity;
 import org.example.sporthealth.domain.RunDataset;
 import org.example.sporthealth.domain.TrackPoint;
+import org.example.sporthealth.domain.TrackStream;
 import org.example.sporthealth.repository.RunRows.ActivityRow;
 import org.example.sporthealth.repository.RunRows.SyncResult;
 import org.example.sporthealth.repository.RunRows.TrackRow;
@@ -94,6 +98,24 @@ public class JdbcHealthDataRepository implements HealthDataRepository {
             RunRows.integer(rs, "sub_type"),
             rs.getString("summary_data"));
 
+    private static final String SELECT_STREAMS = """
+            SELECT run_id, stream_type, seq, time_millis, point_index, value, data
+            FROM track_stream
+            WHERE run_id = ?
+            ORDER BY stream_type, seq
+            """;
+
+    private static final String SELECT_STREAMS_BY_TYPE = """
+            SELECT run_id, stream_type, seq, time_millis, point_index, value, data
+            FROM track_stream
+            WHERE run_id = ? AND stream_type = ?
+            ORDER BY seq
+            """;
+
+    private static final ObjectMapper JSON = new ObjectMapper();
+    private static final TypeReference<Map<String, String>> FIELD_TYPE = new TypeReference<>() {
+    };
+
     private static final RowMapper<TrackRow> TRACK_MAPPER = (rs, rowNum) -> new TrackRow(
             rs.getInt("seq"),
             RunRows.dateTime(rs.getString("timestamp")),
@@ -103,6 +125,28 @@ public class JdbcHealthDataRepository implements HealthDataRepository {
             RunRows.integer(rs, "heart_rate"),
             RunRows.integer(rs, "cadence"),
             RunRows.real(rs, "distance_meters"));
+
+    private static final RowMapper<TrackStream> STREAM_MAPPER = (rs, rowNum) -> new TrackStream(
+            rs.getString("run_id"),
+            rs.getString("stream_type"),
+            rs.getInt("seq"),
+            RunRows.real(rs, "time_millis") == null ? null : rs.getLong("time_millis"),
+            RunRows.integer(rs, "point_index"),
+            RunRows.real(rs, "value"),
+            parseFields(rs.getString("data")));
+
+    /** {@code data} 是本项目自己写的 JSON 对象；解析失败说明库被外部改过，退化成 {@code _raw}。 */
+    private static Map<String, String> parseFields(String data) {
+        if (data == null || data.isBlank()) {
+            return Map.of();
+        }
+        try {
+            return Map.copyOf(JSON.readValue(data, FIELD_TYPE));
+        } catch (Exception e) {
+            log.warn("track_stream.data 不是合法 JSON，按原文保留：{}", e.getMessage());
+            return Map.of("_raw", data);
+        }
+    }
 
     /** 快照与轨迹缓存成对替换，保证 reload 后不会出现「新摘要 + 旧轨迹」的混搭。 */
     private record Snapshot(RunDataset dataset, ConcurrentHashMap<String, List<TrackPoint>> routes) {
@@ -154,6 +198,26 @@ public class JdbcHealthDataRepository implements HealthDataRepository {
         }
         current.routes().putIfAbsent(key, points);
         return points;
+    }
+
+    /**
+     * 原始流直查：{@code track_stream} 按主键前缀 {@code (run_id, stream_type)} 命中，
+     * 不需要轨迹点，也不走缓存（数据量小、调用频率低，实时读更简单）。
+     */
+    @Override
+    public List<TrackStream> streams(String runId, String streamType) {
+        if (runId == null || runId.isBlank()) {
+            return List.of();
+        }
+        String key = runId.trim();
+        if (streamType == null || streamType.isBlank()) {
+            return jdbc.sql(SELECT_STREAMS).param(key).query(STREAM_MAPPER).list();
+        }
+        return jdbc.sql(SELECT_STREAMS_BY_TYPE)
+                .param(key)
+                .param(streamType.trim())
+                .query(STREAM_MAPPER)
+                .list();
     }
 
     @Override

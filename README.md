@@ -227,9 +227,9 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `get_run_route` | `runId` `offset?` `limit?` `format?` `maxPoints?` `includeSensors?` | 轨迹点分页（时间/纬度/经度/海拔，海拔与累计距离保留 2 位小数），每点另带 `heartRate`/`cadence`/`distanceMeters`（华为来源才有，TCX 为 `null`；`includeSensors=false` 时省略这三个键）；可输出 GeoJSON，此时传感器放在与 `geometry.coordinates` 等长同序的 `sensors` 平行数组里；`maxPoints` 降采样后会忽略 `offset`/`limit` |
 | `get_running_summary` | `startDate?` `endDate?` | 次数、总距离、总时长、总爬升、平均配速、最快/最长记录 |
 | `get_daily_running` | `startDate?` `endDate?` `groupBy?` | 按天/周/月拆分，只含有记录的周期，`day` 时额外返回每天一条 |
-| `get_personal_bests` | `startDate?` `endDate?` `category?` | `category`：`all`（默认）/`distance`/`pace`/`duration`/`climb`/`best1k`/`best5k`；后两项为区间内最快的 1 公里、5 公里（需解析轨迹） |
+| `get_personal_bests` | `startDate?` `endDate?` `category?` `distancesKm?` | `category`：`all`（默认）/`distance`/`pace`/`duration`/`climb`，或距离类别 `best1k`/`best3k`/`best5k`/`best10k`/`half`/`marathon`（别名：`5k`、`半马`、`全马`…）。`distancesKm` 直接指定最佳努力的目标距离，默认 `[1,5]`，例如 `[1,5,10,21.0975,42.195]`；结果按 `best1k`/`best10k`/`bestHalf`/`bestMarathon` 命名，区间内跑不到的目标列在 `unavailableDistancesKm` |
 | `compare_runs` | `baseRunId` `otherRunId` `includeSplits?` | 距离/时长/配速差异 + 一句话结论，可选附带两次的分段 |
-| `get_run_splits` | `runId` `splitKm?` | 沿轨迹按固定距离（默认 1 公里）分段：配速、用时、本段爬升、净海拔变化、平均坡度、坡度修正配速（GAP）、最快/最慢段、前后半程对比、负分段、配速标准差，并返回 `gpsDistanceKm` 与全程 GAP 汇总 |
+| `get_run_splits` | `runId` `splitKm?` | 沿轨迹按固定距离（默认 1 公里）分段：配速、用时、本段爬升、净海拔变化、平均坡度、坡度修正配速（GAP）、最快/最慢段、前后半程对比、负分段、配速标准差，并返回 `gpsDistanceKm` 与全程 GAP 汇总。华为来源的记录另带 `vendorSplits`（华为官方单公里配速，来自 `track_stream` 的 `pm2`）与 `splitCrossCheck`（两边按段对齐后的平均/最大配速差与结论） |
 | `get_best_efforts` | `runId` `distancesKm?` | 单次跑步内 1K/5K 等目标距离的最佳用时与折算配速（默认 `[1,5]`），附 `gpsDistanceKm`，超出本次距离的目标列入 `unavailableTargetsMeters` |
 | `get_training_trend` | `period?` `count?` `endDate?` | 连续周/月趋势（`count` 默认 4、最多 52），含跑量与配速相对上一周期的变化 |
 | `get_consistency` | `startDate?` `endDate?` | 打卡天数占比、当前/最长连续天数、平均间隔、日历热力数据；当前连续以最后一次记录为锚点 |
@@ -631,7 +631,8 @@ JAVA_HOME=/path/to/jdk-21 mvn test
   （38.28 km / 219.8 min / 平均配速 5'45"/km）、区间过滤、按天拆分、最佳成绩、对比与轨迹分页。
 - **轨迹分析**：逐公里分段（末段 `partial`、前后半程与负分段）、单次最佳努力、跨记录 1K/5K 最佳、
   海拔剖面、停顿检测与 `describe_data_source` 的 quality 自检。
-- **工具层**：quality 块结构、`best1k`/`best5k` 类别，以及 `get_run_route` 两种格式的海拔小数精度。
+- **工具层**：quality 块结构、任意 `distancesKm` 的目标距离最佳（含 `best10k`/`bestHalf` 命名与不可用距离），
+  华为官方分段与 GPS 分段的交叉校验，以及 `get_run_route` 两种格式的海拔小数精度。
 - **访问日志**：每次调用前后各一条，START 带工具名与入参、END 带 `status` 与耗时，两条用 `callId` 关联；异常时 END 按 `ERROR` 记录并重新抛出。
 - **内联 XML 边界用例**：一个 Lap 多个 Track、缺 `Lap@StartTime` 时用 `Activity/Id` 兜底、
   部分 Lap 缺 `TotalTimeSeconds`、缺 `Time`/非法数字/缺经纬度进入 warnings、

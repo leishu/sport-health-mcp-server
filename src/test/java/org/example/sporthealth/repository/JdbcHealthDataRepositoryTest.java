@@ -18,6 +18,7 @@ import org.example.sporthealth.config.HealthDataProperties;
 import org.example.sporthealth.domain.RunActivity;
 import org.example.sporthealth.domain.RunDataset;
 import org.example.sporthealth.domain.TrackPoint;
+import org.example.sporthealth.domain.TrackStream;
 import org.example.sporthealth.importer.SourceFileScanner;
 import org.example.sporthealth.importer.TcxParser;
 import org.example.sporthealth.importer.huawei.HealthDetailParser;
@@ -80,6 +81,42 @@ class JdbcHealthDataRepositoryTest {
         assertEquals("20261025户外跑步", activity.id());
         assertEquals(7123d, activity.distanceMeters(), 0.5);
         assertEquals(1216, activity.trackPointCount());
+    }
+
+    /** 原始流直查：按类型过滤，按 seq 升序，data 里的键值对要被解出来。 */
+    @Test
+    void readsTrackStreamsByType() {
+        JdbcHealthDataRepository repository = repository();
+        String runId = repository.dataset().activities().get(0).id();
+        for (int seq = 0; seq < 2; seq++) {
+            double endMeters = (seq + 1) * 1000d;
+            jdbc().sql("""
+                            INSERT INTO track_stream (run_id, stream_type, seq, time_millis, point_index, value, data)
+                            VALUES (?, 'pm2', ?, NULL, ?, ?, ?)
+                            """)
+                    .param(runId)
+                    .param(seq)
+                    .param(seq + 1)
+                    .param(300d + seq)
+                    .param("{\"tp\":\"pm2\",\"d\":\"" + (long) endMeters + "\",\"n\":\"" + (seq + 1)
+                            + "\",\"p\":\"" + (300d + seq) + "\"}")
+                    .update();
+        }
+        jdbc().sql("""
+                        INSERT INTO track_stream (run_id, stream_type, seq, time_millis, point_index, value, data)
+                        VALUES (?, 'rs', 0, NULL, 5, 3.2, '{"tp":"rs","v":"3.2","k":"5"}')
+                        """)
+                .param(runId)
+                .update();
+
+        List<TrackStream> pm2 = repository.streams(runId, "pm2");
+
+        assertEquals(2, pm2.size());
+        assertEquals(List.of(0, 1), pm2.stream().map(TrackStream::seq).toList());
+        assertEquals("1000", pm2.get(0).fields().get("d"), "data 里的 d 要解析出来");
+        assertEquals(300d, pm2.get(0).value(), 1e-9);
+        assertEquals(3, repository.streams(runId, null).size(), "不传类型时返回全部流（2 行 pm2 + 1 行 rs）");
+        assertTrue(repository.streams("no-such-run", null).isEmpty());
     }
 
     @Test

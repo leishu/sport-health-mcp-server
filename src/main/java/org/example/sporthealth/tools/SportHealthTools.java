@@ -1,5 +1,6 @@
 package org.example.sporthealth.tools;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
@@ -36,12 +37,14 @@ import org.example.sporthealth.domain.RunLookup;
 import org.example.sporthealth.domain.RunSplits;
 import org.example.sporthealth.domain.RunSummary;
 import org.example.sporthealth.domain.RunWeather;
+import org.example.sporthealth.domain.SplitCrossCheck;
 import org.example.sporthealth.domain.StopPoint;
 import org.example.sporthealth.domain.StopPoints;
 import org.example.sporthealth.domain.TrackPoint;
 import org.example.sporthealth.domain.TrainingLoad;
 import org.example.sporthealth.domain.TrainingMix;
 import org.example.sporthealth.domain.TrainingTrend;
+import org.example.sporthealth.domain.VendorSplits;
 import org.example.sporthealth.domain.WeatherImpact;
 import org.example.sporthealth.domain.WeatherSnapshot;
 import org.example.sporthealth.repository.HealthDataRepository;
@@ -408,13 +411,17 @@ public class SportHealthTools {
     /** 个人最佳，可按类别只取一项。 */
     @McpTool(name = "get_personal_bests",
             description = "查询区间内的个人最佳：最长距离、最快配速、最长时长、最大爬升各对应一次跑步记录，"
-                    + "以及区间内最快的 1 公里 / 5 公里（基于 GPS 轨迹，逐条解析轨迹）。"
-                    + "category 可只取其中一项。用于回答“我最好成绩是多少”“我 1 公里最快多少”。")
+                    + "以及区间内最快的最佳努力（默认 1 公里与 5 公里，基于 GPS 轨迹逐条解析）。"
+                    + "distancesKm 可改成任意目标距离，例如 [1,5,10] 或 [1,5,10,21.0975,42.195]；"
+                    + "只想看某一项时用 category，距离类别支持 best1k/best3k/best5k/best10k/half/marathon。"
+                    + "用于回答“我最好成绩是多少”“我 10 公里最快多少”“我半马水平如何”。")
     public Map<String, Object> getPersonalBests(
             @McpToolParam(description = "开始日期，格式 yyyy-MM-dd", required = false) String startDate,
             @McpToolParam(description = "结束日期，格式 yyyy-MM-dd", required = false) String endDate,
-            @McpToolParam(description = "类别：all（默认）、distance、pace、duration、climb、best1k、best5k",
-                    required = false) String category) {
+            @McpToolParam(description = "类别：all（默认）、distance、pace、duration、climb，"
+                    + "或距离类别 best1k/best3k/best5k/best10k/half/marathon", required = false) String category,
+            @McpToolParam(description = "最佳努力的目标距离（公里），默认 [1,5]；传了就以它为准，"
+                    + "例如 [1,5,10,21.0975,42.195]", required = false) List<Double> distancesKm) {
         DateRange range = analytics.resolveRange(startDate, endDate);
         PersonalBests bests = analytics.bests(range);
         if (bests.runCount() == 0) {
@@ -435,38 +442,34 @@ public class SportHealthTools {
             bestRows.put("mostClimb", toRunRow(bests.mostClimb()));
         }
 
-        boolean wantsEfforts = "all".equals(key) || "best1k".equals(key) || "best5k".equals(key);
-        boolean hasEffort = false;
-        if (wantsEfforts) {
-            List<Double> targets = new ArrayList<>(2);
-            if (!"best5k".equals(key)) {
-                targets.add(1000d);
-            }
-            if (!"best1k".equals(key)) {
-                targets.add(5000d);
-            }
-            Map<Double, PersonalBestEffort> efforts = analytics.effortBests(range, targets).stream()
-                    .collect(Collectors.toMap(PersonalBestEffort::targetMeters, effort -> effort));
-            PersonalBestEffort best1k = efforts.get(1000d);
-            PersonalBestEffort best5k = efforts.get(5000d);
-            if (best1k != null) {
-                bestRows.put("best1k", best1k);
-                hasEffort = true;
-            }
-            if (best5k != null) {
-                bestRows.put("best5k", best5k);
-                hasEffort = true;
-            }
-        }
-
+        List<Double> targetsKm = effortTargetsKm(key, distancesKm);
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "OK");
         result.put("range", range.text());
         result.put("category", key);
-        result.put("bests", bestRows);
-        if (wantsEfforts && !hasEffort) {
-            result.put("message", "区间内没有可用 GPS 轨迹，或单次距离不足 1 公里，无法计算 1 公里 / 5 公里最佳");
+        if (!targetsKm.isEmpty()) {
+            List<Double> targetsMeters = targetsKm.stream().map(km -> km * 1000d).toList();
+            Map<Double, PersonalBestEffort> efforts = analytics.effortBests(range, targetsMeters).stream()
+                    .collect(Collectors.toMap(PersonalBestEffort::targetMeters, effort -> effort));
+            List<Double> missing = new ArrayList<>();
+            for (double meters : targetsMeters) {
+                PersonalBestEffort effort = efforts.get(meters);
+                if (effort == null) {
+                    missing.add(meters / 1000d);
+                    continue;
+                }
+                bestRows.put(effortLabel(meters), effort);
+            }
+            result.put("effortDistancesKm", targetsKm);
+            if (!missing.isEmpty()) {
+                result.put("unavailableDistancesKm", missing);
+            }
+            if (efforts.isEmpty()) {
+                result.put("message", "区间内没有可用 GPS 轨迹，或单次距离不足 "
+                        + formatKm(targetsKm.get(0)) + " 公里，无法计算目标距离的最佳努力");
+            }
         }
+        result.put("bests", bestRows);
         return result;
     }
 
@@ -545,7 +548,9 @@ public class SportHealthTools {
             description = "把一次跑步按固定距离（默认 1 公里）切分，返回每段距离、用时、配速、爬升、净海拔变化、"
                     + "平均坡度与坡度修正配速（GAP），以及最快/最慢分段、前后半程配速、是否负分段、配速稳定性。"
                     + "GAP 把上坡折算成等效平路配速，便于山路和平路横向比较。"
-                    + "用于回答“每公里配速多少”“有没有跑崩”“后半程更快吗”“山路实际强度多大”。")
+                    + "华为来源的记录还会附带厂商官方单公里配速（vendorSplits，来自 track_stream 的 pm2），"
+                    + "并与 GPS 分段做交叉校验（splitCrossCheck），便于判断轨迹是否可信。"
+                    + "用于回答“每公里配速多少”“有没有跑崩”“后半程更快吗”“山路实际强度多大”“GPS 准不准”。")
     public Map<String, Object> getRunSplits(
             @McpToolParam(description = "跑步记录 id") String runId,
             @McpToolParam(description = "分段距离（公里），默认 1", required = false) Double splitKm) {
@@ -565,6 +570,15 @@ public class SportHealthTools {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "OK");
         result.putAll(splitsMap(splits));
+
+        VendorSplits vendor = analytics.vendorSplits(run);
+        if (vendor.usable()) {
+            result.put("vendorSplits", vendorMap(vendor));
+            SplitCrossCheck check = analytics.crossCheck(splits, vendor);
+            if (check != null) {
+                result.put("splitCrossCheck", check);
+            }
+        }
         return result;
     }
 
@@ -1102,6 +1116,23 @@ public class SportHealthTools {
     }
 
     /**
+     * 厂商官方分段的返回结构。
+     *
+     * <p>单独成块而不是混进 {@code splits}：两者口径不同（GPS 插值 vs 设备自算），
+     * 混在一起会让调用方误以为是同一份数据。
+     */
+    private Map<String, Object> vendorMap(VendorSplits vendor) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("source", vendor.source());
+        result.put("splitMeters", vendor.splitMeters());
+        result.put("totalKm", vendor.totalKm());
+        result.put("avgPaceSecondsPerKm", vendor.avgPaceSecondsPerKm());
+        result.put("avgPaceText", vendor.avgPaceText());
+        result.put("splits", vendor.splits());
+        return result;
+    }
+
+    /**
      * 数据质量体检：每一项都是一份 id 列表，空列表代表该项通过。
      *
      * <p>{@code clean} 对所有检查项取合取，只要有一项非空就为 false——它是「能不能放心用」的
@@ -1444,12 +1475,87 @@ public class SportHealthTools {
         if (category == null || category.isBlank()) {
             return "all";
         }
-        String key = category.trim().toLowerCase(Locale.ROOT);
+        String key = category.trim().toLowerCase(Locale.ROOT).replace("_", "").replace("-", "");
         return switch (key) {
-            case "1k", "best1k", "best_1k", "best1km" -> "best1k";
-            case "5k", "best5k", "best_5k", "best5km" -> "best5k";
+            case "1k", "best1k", "best1km", "best1000" -> "best1k";
+            case "3k", "best3k", "best3km", "best3000" -> "best3k";
+            case "5k", "best5k", "best5km", "best5000" -> "best5k";
+            case "10k", "best10k", "best10km", "best10000" -> "best10k";
+            case "15k", "best15k", "best15km" -> "best15k";
+            case "half", "halfmarathon", "hm", "21k", "21.1k", "besthalf", "半马", "半程马拉松" -> "bestHalf";
+            case "marathon", "full", "fm", "42k", "42.2k", "bestmarathon", "全马", "马拉松" -> "bestMarathon";
             default -> Set.of("distance", "pace", "duration", "climb").contains(key) ? key : "all";
         };
+    }
+
+    /** 距离类别 → 目标距离（米）；非距离类别返回 null。 */
+    private static Double categoryTargetMeters(String key) {
+        return switch (key) {
+            case "best1k" -> 1000d;
+            case "best3k" -> 3000d;
+            case "best5k" -> 5000d;
+            case "best10k" -> 10000d;
+            case "best15k" -> 15000d;
+            case "bestHalf" -> 21097.5d;
+            case "bestMarathon" -> 42195d;
+            default -> null;
+        };
+    }
+
+    /**
+     * 本次要算最佳努力的目标距离（公里）。
+     *
+     * <p>优先级：显式 {@code distancesKm} &gt; 距离类别 &gt; {@code all} 的默认 {@code [1,5]}。
+     * 只查 distance/pace/duration/climb 时不附带最佳努力，避免白算一遍轨迹。
+     * {@code category} 是「只看某一项」的语法糖，和 {@code distancesKm} 同时给时以距离列表为准。
+     *
+     * @return 空列表表示本次不需要计算最佳努力
+     */
+    private static List<Double> effortTargetsKm(String key, List<Double> distancesKm) {
+        List<Double> explicit = distancesKm == null ? List.of() : distancesKm.stream()
+                .filter(Objects::nonNull)
+                .filter(km -> km > 0)
+                .distinct()
+                .sorted()
+                .toList();
+        if (!explicit.isEmpty()) {
+            return explicit;
+        }
+        if ("all".equals(key)) {
+            return List.of(1d, 5d);
+        }
+        Double target = categoryTargetMeters(key);
+        return target == null ? List.of() : List.of(target / 1000d);
+    }
+
+    /**
+     * 目标距离在返回体里的键名：1/3/5/10/15 公里用 {@code best5k} 这种写法，
+     * 半马全马用固定名，其余距离按公里数保留两位小数（{@code 2.5 → best2.5k}）。
+     */
+    static String effortLabel(double targetMeters) {
+        double km = targetMeters / 1000d;
+        if (Math.abs(km - 21.0975) < 0.01) {
+            return "bestHalf";
+        }
+        if (Math.abs(km - 42.195) < 0.01) {
+            return "bestMarathon";
+        }
+        if (Math.abs(km - Math.rint(km)) < 1e-6) {
+            return "best" + (long) Math.rint(km) + "k";
+        }
+        return "best" + new BigDecimal(String.valueOf(PaceFormat.round(km, 2)))
+                .stripTrailingZeros()
+                .toPlainString() + "k";
+    }
+
+    /** 公里数的展示写法：整公里不带小数，其余保留必要位数。 */
+    private static String formatKm(double km) {
+        if (Math.abs(km - Math.rint(km)) < 1e-6) {
+            return String.valueOf((long) Math.rint(km));
+        }
+        return new BigDecimal(String.valueOf(PaceFormat.round(km, 2)))
+                .stripTrailingZeros()
+                .toPlainString();
     }
 
     private Map<String, Object> noData(DateRange range, String detail) {

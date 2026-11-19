@@ -5,6 +5,7 @@ import java.time.Duration;
 import java.time.LocalDate;
 import java.time.temporal.TemporalAdjusters;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -17,6 +18,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 
+import lombok.extern.slf4j.Slf4j;
 import org.example.sporthealth.domain.ActiveDay;
 import org.example.sporthealth.domain.BestEffort;
 import org.example.sporthealth.domain.BestEfforts;
@@ -39,14 +41,18 @@ import org.example.sporthealth.domain.RunLookup;
 import org.example.sporthealth.domain.RunSplit;
 import org.example.sporthealth.domain.RunSplits;
 import org.example.sporthealth.domain.RunSummary;
+import org.example.sporthealth.domain.SplitCrossCheck;
 import org.example.sporthealth.domain.StopPoint;
 import org.example.sporthealth.domain.StopPoints;
 import org.example.sporthealth.domain.Streak;
 import org.example.sporthealth.domain.TrackPoint;
+import org.example.sporthealth.domain.TrackStream;
 import org.example.sporthealth.domain.TrainingLoad;
 import org.example.sporthealth.domain.TrainingMix;
 import org.example.sporthealth.domain.TrainingTrend;
 import org.example.sporthealth.domain.TrendPeriod;
+import org.example.sporthealth.domain.VendorSplit;
+import org.example.sporthealth.domain.VendorSplits;
 import org.example.sporthealth.repository.HealthDataRepository;
 import org.example.sporthealth.support.DateRange;
 import org.example.sporthealth.support.DateRangeResolver;
@@ -62,6 +68,7 @@ import org.springframework.stereotype.Service;
  * {@link HealthDataRepository#route(String)}，仓储层解析一次后缓存。
  */
 @Service
+@Slf4j
 public class RunAnalyticsService {
 
     private static final double DEFAULT_SPLIT_METERS = 1000d;
@@ -70,8 +77,13 @@ public class RunAnalyticsService {
     private static final double DEFAULT_STOP_SECONDS = 30d;
     private static final double DEFAULT_STOP_DISPLACEMENT_METERS = 30d;
 
+    /** 华为单公里配速所在的流类型与来源标记。 */
+    private static final String STREAM_TYPE_PM2 = "pm2";
+    private static final String VENDOR_SOURCE_HUAWEI = "HUAWEI_PM2";
+
     /** Riegel 公式的经验指数，用于把较短距离成绩外推到更长距离。 */
     private static final double RIEGEL_EXPONENT = 1.06d;
+
     /** 计算最佳努力时额外包含 1 公里，让资料很少时也能有一个参考点。 */
     private static final List<Double> RACE_REFERENCE_TARGETS =
             List.of(1000d, 5000d, 10000d, 21097.5d, 42195d);
@@ -426,6 +438,116 @@ public class RunAnalyticsService {
     }
 
     /**
+     * 厂商官方分段配速：读华为 {@code track_stream} 里的 {@code pm2} 流。
+     *
+     * <p>华为的 {@code pm2} 行形如 {@code tp=pm2;d=2000;n=349;p=346.0}：{@code d} 是该段终点的
+     * 累计距离（米），{@code p} 是该段配速（秒/公里），{@code n} 是终点处的轨迹点序号。
+     * 整公里段时 {@code p} 等于该段用时（秒），末段不足一公里时仍是配速，因此用时按
+     * {@code p × 距离} 折算。
+     *
+     * <p>{@code bpm2}/{@code b-p-m} 没有采用：样本里它们的数值恒等于 {@code pm2} 加一个
+     * 204~224 秒之间的整数偏移（逐公里不同），既不是累计用时也不是另一种口径的配速，
+     * 无法互相校验，只保留在 {@code track_stream} 里备查。
+     */
+    public VendorSplits vendorSplits(RunActivity run) {
+        List<TrackStream> rows = repository.streams(run.id(), STREAM_TYPE_PM2);
+        if (rows.isEmpty()) {
+            return VendorSplits.empty(run.id(), VENDOR_SOURCE_HUAWEI);
+        }
+
+        List<VendorSplit> parsed = new ArrayList<>(rows.size());
+        double previousKm = 0d;
+        int index = 1;
+        int skipped = 0;
+        for (TrackStream row : rows) {
+            Double endMeters = number(row.fields().get("d"));
+            Double pace = number(row.fields().get("p"));
+            if (pace == null) {
+                pace = row.value();
+            }
+            if (endMeters == null || pace == null || pace <= 0) {
+                skipped++;
+                continue;
+            }
+            double endKm = endMeters / 1000d;
+            double distanceKm = endKm - previousKm;
+            if (distanceKm <= 1e-4) {
+                skipped++;
+                continue;
+            }
+            double paceSeconds = PaceFormat.round(pace, 1);
+            parsed.add(new VendorSplit(index++, PaceFormat.round(previousKm, 3), PaceFormat.round(endKm, 3),
+                    PaceFormat.round(distanceKm, 3), PaceFormat.round(pace * distanceKm, 1),
+                    paceSeconds, PaceFormat.pace(paceSeconds),
+                    distanceKm < DEFAULT_SPLIT_METERS / 1000d - 1e-3,
+                    row.pointIndex()));
+            previousKm = endKm;
+        }
+        if (skipped > 0) {
+            log.debug("记录 {} 有 {} 行 pm2 无法解析距离或配速，已跳过", run.id(), skipped);
+        }
+        if (parsed.isEmpty()) {
+            return VendorSplits.empty(run.id(), VENDOR_SOURCE_HUAWEI);
+        }
+
+        double totalKm = parsed.stream().mapToDouble(VendorSplit::distanceKm).sum();
+        double totalSeconds = parsed.stream().mapToDouble(VendorSplit::durationSeconds).sum();
+        Double avgPace = totalKm > 0 ? PaceFormat.round(totalSeconds / totalKm, 1) : null;
+        return new VendorSplits(run.id(), VENDOR_SOURCE_HUAWEI, DEFAULT_SPLIT_METERS,
+                PaceFormat.round(totalKm, 3), List.copyOf(parsed), avgPace, PaceFormat.pace(avgPace));
+    }
+
+    /**
+     * 把 GPS 分段和厂商分段按段序号对齐比较。
+     *
+     * <p>只有段长相同（容差 50 米）的段才参与比较：口径不同的分段混在一起算差值没有意义。
+     * 差值稳定说明两边口径一致，忽大忽小说明其中一方受 GPS 信号影响。
+     *
+     * @return 没有可比较的段时返回 null
+     */
+    public SplitCrossCheck crossCheck(RunSplits gps, VendorSplits vendor) {
+        if (gps == null || vendor == null || !vendor.usable() || gps.splits().isEmpty()) {
+            return null;
+        }
+        int compared = 0;
+        double sumAbs = 0d;
+        double maxAbs = 0d;
+        double maxAtKm = 0d;
+        int pairs = Math.min(gps.splits().size(), vendor.splits().size());
+        for (int i = 0; i < pairs; i++) {
+            RunSplit gpsSplit = gps.splits().get(i);
+            VendorSplit vendorSplit = vendor.splits().get(i);
+            if (gpsSplit.paceSecondsPerKm() == null) {
+                continue;
+            }
+            if (Math.abs(gpsSplit.distanceKm() - vendorSplit.distanceKm()) > 0.05) {
+                continue;
+            }
+            double delta = Math.abs(gpsSplit.paceSecondsPerKm() - vendorSplit.paceSecondsPerKm());
+            compared++;
+            sumAbs += delta;
+            if (delta > maxAbs) {
+                maxAbs = delta;
+                maxAtKm = gpsSplit.toKm();
+            }
+        }
+        if (compared == 0) {
+            return null;
+        }
+        double meanAbs = PaceFormat.round(sumAbs / compared, 1);
+        String verdict;
+        if (meanAbs <= 5d) {
+            verdict = "GPS 分段与华为官方配速基本一致，轨迹可信";
+        } else if (meanAbs <= 15d) {
+            verdict = "GPS 分段与华为官方配速有少量差异，长距离或绕圈路段可能受信号影响";
+        } else {
+            verdict = "GPS 分段与华为官方配速差异较大，建议以厂商分段为准核对轨迹质量";
+        }
+        return new SplitCrossCheck(compared, meanAbs, PaceFormat.round(maxAbs, 1),
+                PaceFormat.round(maxAtKm, 2), verdict);
+    }
+
+    /**
      * 一次跑步内多个目标距离的最佳成绩（滑窗）。
      *
      * <p>时间轴在相邻采样点之间是线性的，因此固定距离窗口的最小值一定出现在
@@ -456,39 +578,54 @@ public class RunAnalyticsService {
      * <p>与 {@link #bestEfforts(RunActivity, List)} 互补：后者是“这一次里哪一段最好”，
      * 这里是“哪一次跑出的这一段最好”。需要逐条解析轨迹，没有可用 GPS 或距离不足的记录会被跳过。
      *
+     * <p>循环顺序是「先记录后目标」：一条轨迹只解析一次，所有目标距离共用同一份
+     * {@link TrackPath}。目标距离可以任意多（10K、半马、全马），不会让轨迹解析次数随目标数翻倍。
+     *
      * @param targetMeters 目标距离（米），非正数忽略，重复值只保留一个
      * @return 每个目标距离至多一条，按目标距离升序；全部记录都无法覆盖的目标不出现
      */
     public List<PersonalBestEffort> effortBests(DateRange range, List<Double> targetMeters) {
-        List<RunActivity> runs = runs(range);
-        List<PersonalBestEffort> result = new ArrayList<>();
+        List<Double> targets = normalizeTargets(targetMeters);
+        if (targets.isEmpty()) {
+            return List.of();
+        }
+        int size = targets.size();
+        double[] bestDuration = new double[size];
+        double[] bestStart = new double[size];
+        RunActivity[] bestRun = new RunActivity[size];
+        Arrays.fill(bestDuration, Double.POSITIVE_INFINITY);
 
-        for (double target : normalizeTargets(targetMeters)) {
-            RunActivity bestRun = null;
-            double bestDuration = Double.POSITIVE_INFINITY;
-            double bestStart = 0d;
-            for (RunActivity run : runs) {
-                TrackPath path = TrackPath.of(repository.route(run.id()));
-                double[] window = fastestWindow(path, target);
-                if (window != null && window[0] < bestDuration) {
-                    bestDuration = window[0];
-                    bestStart = window[1];
-                    bestRun = run;
+        for (RunActivity run : runs(range)) {
+            TrackPath path = TrackPath.of(repository.route(run.id()));
+            if (!path.usable()) {
+                continue;
+            }
+            for (int i = 0; i < size; i++) {
+                double[] window = fastestWindow(path, targets.get(i));
+                if (window != null && window[0] < bestDuration[i]) {
+                    bestDuration[i] = window[0];
+                    bestStart[i] = window[1];
+                    bestRun[i] = run;
                 }
             }
-            if (bestRun != null) {
-                BestEffort effort = toBestEffort(target, bestDuration, bestStart);
-                result.add(new PersonalBestEffort(
-                        effort.targetMeters(),
-                        bestRun.id(),
-                        bestRun.date(),
-                        effort.durationSeconds(),
-                        effort.durationText(),
-                        effort.paceSecondsPerKm(),
-                        effort.paceText(),
-                        effort.startKm(),
-                        effort.endKm()));
+        }
+
+        List<PersonalBestEffort> result = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            if (bestRun[i] == null) {
+                continue;
             }
+            BestEffort effort = toBestEffort(targets.get(i), bestDuration[i], bestStart[i]);
+            result.add(new PersonalBestEffort(
+                    effort.targetMeters(),
+                    bestRun[i].id(),
+                    bestRun[i].date(),
+                    effort.durationSeconds(),
+                    effort.durationText(),
+                    effort.paceSecondsPerKm(),
+                    effort.paceText(),
+                    effort.startKm(),
+                    effort.endKm()));
         }
         return result;
     }
@@ -1340,6 +1477,19 @@ public class RunAnalyticsService {
                 .distinct()
                 .sorted()
                 .toList();
+    }
+
+    /** 解析华为流里的数值字段，解析不出返回 null（不抛异常，坏行跳过即可）。 */
+    private static Double number(String text) {
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        try {
+            double value = Double.parseDouble(text.trim());
+            return Double.isFinite(value) ? value : null;
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     private static Streak longestStreak(List<ActiveDay> days) {
