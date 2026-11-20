@@ -244,9 +244,27 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `get_training_load` | `endDate?` `metric?` | 训练负荷与 ACWR：7 天急性、28 天慢性、`ACWR = 急性 / (慢性/4)`、周跑量增幅、连续训练天数、休息日、单调性与 Strain，并给出调整建议。`metric` 可选 `distance`（默认，公里）或 `duration`（分钟）；数据覆盖不足时明确标注置信度 |
 | `classify_run` | `runId` | 识别训练类型：轻松跑、长距离跑、节奏跑、间歇/变速跑、比赛/测试跑、恢复跑。基于距离、时长、配速相对个人中位数与分段波动，并用平均心率所在区间（Z1~Z5）交叉验证，返回判定依据、心率区间与置信度（无 GPS 时降为 LOW） |
 | `get_training_mix` | `startDate?` `endDate?` | 区间内的训练类型构成：各类型的次数、距离、距离占比，并逐条列出分类结果。逐条分类会按需解析轨迹，首次调用稍慢 |
+| `get_sleep_summary` | `startDate?` `endDate?` `groupBy?` | 睡眠汇总。`groupBy=day`（默认）返回逐夜 `nights`，`week`/`month` 返回按周期聚合的 `periods`；两者都带 `summary`（平均睡着/卧床/清醒时长、醒来次数、潜伏期、深睡与 REM 占比、评分、效率、HRV、血氧）与 `coverage`（`nights`/`sessionDays`/`reportDays`/`stageOnlyNights`/`scoredNights`/`spo2Nights`/`note`）。评分、效率、HRV、血氧只有 `sleep_report` 才有（2026-06-13 起），更早的夜晚是 `null` 而不是 0；血氧只有个别夜晚有值。醒来次数由分期里的连续清醒段推算（详见「睡眠口径」） |
 | `get_weather_impact` | `startDate?` `endDate?` `minDistanceKm?` | 只读已回填的 `run_weather`，按起跑气温、湿度、风速、有无降水分组，返回每组次数、加权平均配速、相对整体基线的快慢秒数，以及气温与配速的 Pearson 相关系数。另带 `weatherCoverage`：区间内跑步总数、拿到天气的条数、缺失条数与原因拆分（`failed`/`unavailable`/`notFetched`）、覆盖率与一句结论。不联网，缺天气时提示调 `sync_weather` |
 | `sync_weather` | `retryFailed?` | 只补天气：为还没有天气的跑步记录联网抓取起跑/结束时刻的天气，**不重导数据、不重建快照**。返回本轮 `ok`/`unavailable`/`failed`/`noLocation`/`deferred` 条数、失败原因 `problems` 与同步后的整体覆盖率 `coverage`。`retryFailed` 默认 `true`，即忽略 `retry-failed-after-days` 冷却、立刻重试上次失败的记录；`sport.weather.enabled=false` 时返回 `DISABLED` |
 | `reload_data` | `weather?` | 增量同步：按 `(文件名, size, mtime, sha256)` 只解析变化的 TCX 与华为导出文件（JSON / xls / xlsx），无需重启。`weather` 默认 `true`，写完顺带补一轮天气；传 `false` 时整段同步不发起任何网络请求，天气留给 `sync_weather` |
+
+### 睡眠口径
+
+- **两套来源**：分期（`sleep_session` + 同批 `health_metric` 区间）覆盖全部历史，能算卧床/睡着时长与深睡/浅睡/快速眼动；
+  官方报告（`sleep_report`）只有 2026-06-13 之后才有，评分、效率、HRV、血氧、入睡潜伏期都只在这里。
+  所以先看 `coverage`：`sessionDays` 有分期的夜数、`reportDays` 有报告的夜数、`stageOnlyNights` 只有分期、
+  `spo2Nights` 真上报了血氧的夜数（设备常年不测，全库 355 夜里只有 10 夜有值）。
+- **`null` 表示缺数据，不是 0**：没有报告的夜晚 `score`/`efficiencyPercent`/`hrvMs`/`spo2Percent`/`sleepLatencyMinutes` 都是 `null`；
+  `summary` 里每个平均值都配自己的分母（`reportNights`/`hrvNights`/`spo2Nights`/`stageNights`）。
+  报告里的哨兵值统一折成 `null`：`sleep_efficiency = 255`、`avg_oxygen_saturation = -1`、`deep_part = 255`。
+- **醒来次数**：报告的 `wakeCount` 恒为 0（设备没上报），只能用分期还原——把间隔 ≤1 分钟的清醒分钟粘成一次醒来，
+  去掉贴着会话首尾的两段（开头那段就是报告的入睡潜伏期，结尾那段是起床前的清醒），剩余 ≥2 分钟的段才计数。
+- **`awakeMinutes` 是 WASO 口径**（睡着之后、起床之前的清醒），所以 `timeInBed ≥ asleepMinutes + awakeMinutes`，
+  差额是潜伏期与起床前清醒；有报告的夜晚这个差额与 `sleepLatencyMinutes` 对得上。
+- **午睡不纳入**：华为把午睡单独标成 `PROFESSIONAL_SLEEP_NOON`，还经常和夜睡粘成一段，
+  混进夜睡会让「睡了多久」凭空变大，所以只报夜睡（06-17 这类「夜睡被标成 NAP 会话」的夜晚改用报告窗口重新框分期）。
+- 默认区间取**睡眠数据自身**的覆盖范围，不是跑步数据的（睡眠比跑步早开始几个月）。
 
 ### list_runs 过滤与排序
 
