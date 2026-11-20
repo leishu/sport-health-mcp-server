@@ -1,6 +1,6 @@
 # sport-health-mcp-server
 
-基于 Spring AI 的华为运动健康 **TCX** 数据 MCP 服务。把导出的跑步记录与穿戴数据变成 31 个可调用的 MCP 工具，让 Claude Code / Cursor 等客户端可以直接回答：
+基于 Spring AI 的华为运动健康 **TCX** 数据 MCP 服务。把导出的跑步记录与穿戴数据变成 32 个可调用的 MCP 工具，让 Claude Code / Cursor 等客户端可以直接回答：
 
 - 「我最近跑了哪些？」
 - 「这个月一共跑了多少公里？」
@@ -249,6 +249,7 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `get_sleep_trend` | `startDate?` `endDate?` `groupBy?` `metric?` | 睡眠趋势：按 `week`（默认）或 `month` 切周期，每个周期给 `values`（平均睡着时长、评分、效率、HRV、醒来次数、深睡占比、潜伏期）与相对上一周期的 `deltas`，再用 `trend` 对 `metric` 指定的指标给结论（`slopePerPeriod`、`r2`、`direction`、`assessment`、`first`/`last`/`best`/`worst`）。`metric` 可选 `asleep`（默认）/`score`/`efficiency`/`hrv`/`wakeCount`/`deep`/`latency`；`groupBy=day` 会被拒（按天是 `get_sleep_summary` 的活）。只用完整周期拟合，被区间截断的首末周期标 `complete=false` 且不参与；`direction` 按区间累计变化判定，`assessment` 已折算好「越高越好/越低越好」。周粒度最多 78 个周期、月粒度 36 个（详见「睡眠口径」） |
 | `get_daily_vitals` | `startDate?` `endDate?` `groupBy?` | 每日体征：静息心率、HRV（RMSSD）、压力均值/峰值、最大摄氧量，以及全天自动心率的均值/最低/最高。`groupBy=day`（默认）逐日 `days`，`week`/`month` 按周期聚合 `periods`（首末被区间截断的周期标 `complete=false`）；都带 `coverage`（每个指标各自的有值天数）、`availability`（各指标在全库的可用范围）、`metrics`（区间均值/极值/最新值、28 天基线 `baseline`、相对基线的 `deltaVsBaseline`、首末 7 天对比 `change` 与 `direction`/`assessment`）、`heartRate` 与 `notes`。静息心率从 2025-11-08、HRV 与压力从 2026-06-12 才有，最大摄氧量只有 104 天且 2025-09 之后断档 14 个月；缺数据的指标是 `null`，整段没有时干脆不出现在 `metrics` 里（详见「体征口径」） |
 | `get_heart_rate_series` | `date?` `resolution?` | **单日**自动心率曲线（`health_metric` 的 `DYNAMIC_HEART_RATE`）：`stats`（采样点数、最低/平均/最高、首次与末次采样时刻、跨度、采样间隔中位数与最长空档）、`peak`/`lowest`（心率与时刻，外加 `sustainedMinutes` 连续维持时长）、按 `resolution`（`minute`/`5min`（默认）/`15min`/`hour`）聚合的 `buckets`、当天运动时段 `activities`、口径提示 `notes`。采样密度不是固定的：早期每分钟一条、近期静息 10 分钟一条、运动时加密，看 `medianGapMinutes` 而不是点数多少；单点极值可能只是翻身蹭到传感器（详见「心率曲线口径」） |
+| `get_body_composition` | `startDate?` `endDate?` `gender?` `heightCm?` | 体脂秤数据（体重、BMI、体脂率、脂肪量、肌肉量、蛋白质、体水分、骨盐量、内脏脂肪等级、腰臀比、基础代谢、体年龄、体成分评分、称重心率）。**同一台秤上有多个用户**，所以分两种模式：不给 `gender` + `heightCm` 时只返回 `configs`（每套配置的条数、日期范围、体重区间、带体成分的条数）并要求补参数，**不会给出任何合并后的体重统计**；两个都给才返回 `measurements`（按时间升序，同日多次称重逐条保留）、`trends`（体重/BMI/体脂率/肌肉量/内脏脂肪/评分的首末值与 `change`）、`byMonth`（按月均值，看长期趋势用它）。默认区间是**这套配置自己最后一次称重往前 90 天**；明细上限 240 条（详见「体成分口径」） |
 | `get_weather_impact` | `startDate?` `endDate?` `minDistanceKm?` | 只读已回填的 `run_weather`，按起跑气温、湿度、风速、有无降水分组，返回每组次数、加权平均配速、相对整体基线的快慢秒数，以及气温与配速的 Pearson 相关系数。另带 `weatherCoverage`：区间内跑步总数、拿到天气的条数、缺失条数与原因拆分（`failed`/`unavailable`/`notFetched`）、覆盖率与一句结论。不联网，缺天气时提示调 `sync_weather` |
 | `sync_weather` | `retryFailed?` | 只补天气：为还没有天气的跑步记录联网抓取起跑/结束时刻的天气，**不重导数据、不重建快照**。返回本轮 `ok`/`unavailable`/`failed`/`noLocation`/`deferred` 条数、失败原因 `problems` 与同步后的整体覆盖率 `coverage`。`retryFailed` 默认 `true`，即忽略 `retry-failed-after-days` 冷却、立刻重试上次失败的记录；`sport.weather.enabled=false` 时返回 `DISABLED` |
 | `reload_data` | `weather?` | 增量同步：按 `(文件名, size, mtime, sha256)` 只解析变化的 TCX 与华为导出文件（JSON / xls / xlsx），无需重启。`weather` 默认 `true`，写完顺带补一轮天气；传 `false` 时整段同步不发起任何网络请求，天气留给 `sync_weather` |
@@ -330,6 +331,30 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
   `heartRate.highest` 只是采样峰值，不是实验室最大心率，别拿它做区间划分。
 - **默认区间是「数据最新一天往前 30 天」**，不是「今天往前 30 天」：库通常落后于当天，
   用今天会把尾巴留成空白。`groupBy=day` 最多 92 天，`week`/`month` 分别放宽到约 3 年 / 5 年。
+
+### 体成分口径
+
+`get_body_composition` 只读 `body_measurement`（308 条），它最大的特点是**一台秤、多个人**：
+
+- **7 组配置，必须分开**：`186/男` 141 条（带全套体成分，2025-12 起）、`168/女` 132 条、`171/女` 25 条、
+  `193/男` 3 条，另有 7 条 `gender` 为 NULL（其中 1 条连身高都没有）。全表体重 55.85~85.35 kg
+  是四五个人拼出来的，**任何「平均体重 / 体重变化」都必须先落到一套配置上**。
+  所以工具强制「不传 `gender` + `heightCm` 只能看配置汇总」，不会自动挑条数最多的那套去算。
+- **`gender` 在库里是 0/1/NULL**（1 = 男，0 = 女），对外统一成 `male` / `female` / `unknown`；
+  `heightCm` 用 `ROUND(height_cm)` 匹配，避免浮点尾数把同一个人拆成两组。
+- **同一身高可能有「有性别」与「性别未知」两组**（如 168cm 下有 `女` 132 条和 `性别未知` 5 条，
+  体重区间 67.25~71.5 与 67.85~70.35 高度重叠）。这很可能是同一个人的部分记录没带性别字段，
+  但工具**不会自动合并** —— 只在 `notes` 里点明，让调用方决定。
+- **体成分字段不是每条都有**：142 条带体脂率，其余只称了体重。`trends` 里各指标的 `count`
+  是「该指标有值的条数」，所以会比明细条数少；只称体重的配置，`trends` 里就只有 `weight` 一个键。
+- **`bodyFatKg` 有 13 条虽有体脂率却没这个字段**，这里保持 `null` 不做换算（定义上是
+  `体重 × 体脂率 / 100`，需要时调用方自己算），`notes` 会点明条数。
+- **同一天可以称多次**（141 条里 29 条与上一条相隔不到 1 天，如同一天 05:08 与 05:09）。
+  明细逐条保留，`byMonth` 的 `measurements` 与 `days` 分开给，均值把每次称重都算进去。
+- **两个默认区间不一样，是刻意的**：配置汇总默认看**全库范围**（只开 90 天会漏掉很久没上秤的那套，
+  调用方就永远不知道该传哪个 `heightCm`）；明细默认锚在**这套配置自己的最后一次称重**往前 90 天
+  （用全库最新日当锚点，查 186cm/男 会常常是空的 —— 他从 2026-11 起就称得稀了）。
+- **明细上限 240 条**（约 70 KB），超了报 `INVALID_ARGUMENT` 并提示缩短区间。
 
 ### 心率曲线口径
 
@@ -789,7 +814,7 @@ SQLite（`spring-boot-starter-jdbc` + `org.xerial:sqlite-jdbc`，无 ORM）。
 JAVA_HOME=/path/to/jdk-21 mvn test
 ```
 
-共 **302** 个用例（原有 42 + 持久化 19 + 资源形态 2 + 天气 42 + 工具层天气 4 + P0 分析 17 + 自动同步 7 + 睡眠 23 + 体征 9 + 心率曲线 11 + 其余工具/参数校验用例）：
+共 **315** 个用例（原有 42 + 持久化 19 + 资源形态 2 + 天气 42 + 工具层天气 4 + P0 分析 17 + 自动同步 7 + 睡眠 23 + 体征 9 + 心率曲线 11 + 体成分 13 + 其余工具/参数校验用例）：
 
 - **真实数据**：测试固定读 `src/test/resources/tcx-dataset` 里的 5 个 TCX，而不是
   `src/main/resources/health-data`。生产目录会随导入继续增长（例如新加的骑行文件），
