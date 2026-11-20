@@ -1,6 +1,6 @@
 # sport-health-mcp-server
 
-基于 Spring AI 的华为运动健康 **TCX** 数据 MCP 服务。把导出的跑步记录与穿戴数据变成 32 个可调用的 MCP 工具，让 Claude Code / Cursor 等客户端可以直接回答：
+基于 Spring AI 的华为运动健康 **TCX** 数据 MCP 服务。把导出的跑步记录与穿戴数据变成 35 个可调用的 MCP 工具，让 Claude Code / Cursor 等客户端可以直接回答：
 
 - 「我最近跑了哪些？」
 - 「这个月一共跑了多少公里？」
@@ -248,6 +248,9 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `get_sleep_detail` | `date?` `startDate?` `endDate?` `includeTimeline?` | 睡眠详情（一夜或最多 14 夜）。每夜给：合并后的分期时间线 `timeline`（深睡/浅睡/快速眼动/清醒，相邻同阶段已合并，`timelineSegments` 是真实段数）、每一次醒来的起止 `wakeEpisodes`、睡眠碎片 `fragments`（设备认定的连续睡眠块 `items` 与块间间隙 `gaps`，来自 `sample_sequence` type=700008）、各阶段时长与占比 `stages`、报告补充指标 `report`（平均心率/呼吸率/打鼾指数/上床·睡着·起床时刻）、入睡前的白天午睡 `daytimeNap`。`date` 与区间参数互斥；都不传取最新一夜。基础字段与 `get_sleep_summary` 完全一致（同一套算法），缺来源时 `stages`/`report` 为 `null`、`fragments.available=false`，并用 `coverage` 的 `stageNights`/`reportNights`/`fragmentNights` 说明（详见「睡眠口径」） |
 | `get_sleep_trend` | `startDate?` `endDate?` `groupBy?` `metric?` | 睡眠趋势：按 `week`（默认）或 `month` 切周期，每个周期给 `values`（平均睡着时长、评分、效率、HRV、醒来次数、深睡占比、潜伏期）与相对上一周期的 `deltas`，再用 `trend` 对 `metric` 指定的指标给结论（`slopePerPeriod`、`r2`、`direction`、`assessment`、`first`/`last`/`best`/`worst`）。`metric` 可选 `asleep`（默认）/`score`/`efficiency`/`hrv`/`wakeCount`/`deep`/`latency`；`groupBy=day` 会被拒（按天是 `get_sleep_summary` 的活）。只用完整周期拟合，被区间截断的首末周期标 `complete=false` 且不参与；`direction` 按区间累计变化判定，`assessment` 已折算好「越高越好/越低越好」。周粒度最多 78 个周期、月粒度 36 个（详见「睡眠口径」） |
 | `get_daily_vitals` | `startDate?` `endDate?` `groupBy?` | 每日体征：静息心率、HRV（RMSSD）、压力均值/峰值、最大摄氧量，以及全天自动心率的均值/最低/最高。`groupBy=day`（默认）逐日 `days`，`week`/`month` 按周期聚合 `periods`（首末被区间截断的周期标 `complete=false`）；都带 `coverage`（每个指标各自的有值天数）、`availability`（各指标在全库的可用范围）、`metrics`（区间均值/极值/最新值、28 天基线 `baseline`、相对基线的 `deltaVsBaseline`、首末 7 天对比 `change` 与 `direction`/`assessment`）、`heartRate` 与 `notes`。静息心率从 2025-11-08、HRV 与压力从 2026-06-12 才有，最大摄氧量只有 104 天且 2025-09 之后断档 14 个月；缺数据的指标是 `null`，整段没有时干脆不出现在 `metrics` 里（详见「体征口径」） |
+| `get_hrv_trend` | `startDate?` `endDate?` `period?` `includeNights?` | 心率变异性（RMSSD，毫秒）的长期趋势，`period` 取 `week`（默认）/`month`。**口径是睡眠 HRV**：每晚取睡眠会话窗口内所有样本的均值，按起床日归属。返回周期均值/最低/最高、`direction`（数值涨跌）、`assessment`（好坏，HRV 升 = improving）、`slopePerPeriod`、`r2`、首末 `change`，以及逐夜明细（`includeNights=false` 可关）。**不要拿 `get_daily_vitals` 的 `hrv` 来校验** —— 那是日历日全天均值，日间样本多时高出 15~20 ms（详见「HRV 口径」） |
+| `get_stress_series` | `date?` `resolution?` | **单日**压力曲线（华为压力分 0~100）：样本数、最低/平均/最高、首末测量时刻、采样间隔中位数、按 `resolution`（`30min`/`hour` 默认）分桶的曲线、各档位样本数、最高与最低那一次测量。压力是约 30 分钟一次的离散测量；**最低分恒为 15 是算法下限**，全库最大值只有 53，`high` 档永远不会出现（详见「压力与血氧口径」）。多日压力水平用 `get_daily_vitals` |
+| `get_blood_oxygen` | `startDate?` `endDate?` | 血氧饱和度（SpO₂）的**记录与覆盖**：按天汇总（样本数、最低/平均/最高、低于 95% 的条数）、明细样本、设备下发的低氧提醒（阈值 90%）。**刻意不给趋势** —— 全库只有 12 天有数据（2026-06-12~17 与 2026-08-03~08），之后设备再没上报；两段之间隔一个半月，拟合出的任何斜率都只是「有没有开连续血氧」。没有记录 ≠ 血氧正常 |
 | `get_heart_rate_series` | `date?` `resolution?` | **单日**自动心率曲线（`health_metric` 的 `DYNAMIC_HEART_RATE`）：`stats`（采样点数、最低/平均/最高、首次与末次采样时刻、跨度、采样间隔中位数与最长空档）、`peak`/`lowest`（心率与时刻，外加 `sustainedMinutes` 连续维持时长）、按 `resolution`（`minute`/`5min`（默认）/`15min`/`hour`）聚合的 `buckets`、当天运动时段 `activities`、口径提示 `notes`。采样密度不是固定的：早期每分钟一条、近期静息 10 分钟一条、运动时加密，看 `medianGapMinutes` 而不是点数多少；单点极值可能只是翻身蹭到传感器（详见「心率曲线口径」） |
 | `get_body_composition` | `startDate?` `endDate?` `gender?` `heightCm?` | 体脂秤数据（体重、BMI、体脂率、脂肪量、肌肉量、蛋白质、体水分、骨盐量、内脏脂肪等级、腰臀比、基础代谢、体年龄、体成分评分、称重心率）。**同一台秤上有多个用户**，所以分两种模式：不给 `gender` + `heightCm` 时只返回 `configs`（每套配置的条数、日期范围、体重区间、带体成分的条数）并要求补参数，**不会给出任何合并后的体重统计**；两个都给才返回 `measurements`（按时间升序，同日多次称重逐条保留）、`trends`（体重/BMI/体脂率/肌肉量/内脏脂肪/评分的首末值与 `change`）、`byMonth`（按月均值，看长期趋势用它）。默认区间是**这套配置自己最后一次称重往前 90 天**；明细上限 240 条（详见「体成分口径」） |
 | `get_weather_impact` | `startDate?` `endDate?` `minDistanceKm?` | 只读已回填的 `run_weather`，按起跑气温、湿度、风速、有无降水分组，返回每组次数、加权平均配速、相对整体基线的快慢秒数，以及气温与配速的 Pearson 相关系数。另带 `weatherCoverage`：区间内跑步总数、拿到天气的条数、缺失条数与原因拆分（`failed`/`unavailable`/`notFetched`）、覆盖率与一句结论。不联网，缺天气时提示调 `sync_weather` |
@@ -355,6 +358,44 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
   调用方就永远不知道该传哪个 `heightCm`）；明细默认锚在**这套配置自己的最后一次称重**往前 90 天
   （用全库最新日当锚点，查 186cm/男 会常常是空的 —— 他从 2026-11 起就称得稀了）。
 - **明细上限 240 条**（约 70 KB），超了报 `INVALID_ARGUMENT` 并提示缩短区间。
+
+### HRV 口径
+
+`get_hrv_trend` 只读 `health_metric` 的 `HEART_RATE_VARIABILITY`（9 885 点 / 152 天，约 10 分钟一条）。
+
+- **只有睡眠口径，不用全天均值**。实测全库日间（06:00–22:00）均值 68.7 ms、夜间 48.2 ms，差 20 ms
+  —— 比任何真实变化都大。而全天均值还取决于「那天白天测了几条」：2026-11-10 只有 1 条日间样本，
+  全天均值 55.0 几乎等于夜间值；2026-11-04 有 26 条，全天均值被拉到 63.6。
+  对 `daily_vitals.hrv_rmssd` 拟合斜率，量到的是「白天测得多不多」。
+- **一夜不等于一个日历日**。一晚跨越两天（22:12 睡、05:05 起），按 `sleep_session.sleep_date`
+  （起床日）归属，窗口取「会话 start ≤ 样本 ≤ 会话 end」。按 `substr(start_time,1,10)` 切会把
+  一夜劈成两半、每半还混着别的一夜的碎片 —— 这是最容易写错的地方，单测专门守了这条。
+- **同一日期两套数字并存，都对**：本工具的 2026-11-09 夜 = 48.9（11-08 21:29~11-09 05:25 窗口内），
+  `get_daily_vitals` 的 2026-11-09 = 59.2（11-09 日历日全天）。工具会在 `notes` 里说明，
+  **不要互相校验**。
+- **每夜至少 10 条样本才算有效**（实测每夜 24~49 条）。日间均值另有 `daySamples`，
+  少于 5 条时 `dayRmssd` 给 `null` —— 实测有一条 126 ms 的孤立样本，直接平均会让那一周出现 100+ 的假高点。
+- **`r2` 在只有 2 个周期时必然接近 1**（两点定一条直线）。`periodsUsed == 2` 时 `notes` 会明说，
+  别把它当成「趋势很稳」的证据。
+- 方向判据与睡眠趋势一致：按 **`slope × (周期数−1)`** 的区间累计变化跟 4 ms 阈值比，
+  不按每周期斜率 —— 周粒度 0.52 ms/周 = 一年 27 ms，按每周期比会判成 flat。
+
+### 压力与血氧口径
+
+两者都是 `health_metric` 里的**稀疏单点**，不是曲线：
+
+- **压力约 30 分钟一个点**（4 837 点 / 152 天），所以分桶最小 30 分钟，再细没有意义。
+- **15 分是算法下限**：全库 19.4% 的样本正好是 15，真实值域只有 15~53。从没到过 60，
+  所以「中等 / 高压」两档在这份数据里不会出现 —— **没到高压不代表那天不累**，
+  别用它否定主观感受。
+- **夜间压力比白天高**（22–05 时 27~30 分，10–17 时 20~23 分），与「睡觉时压力该低」的直觉相反。
+  设备测的是夜间静息时的自主神经张力，不是主观紧张度，别拿夜间高分推断睡眠差。
+- `levels` 给的是**样本数**不是时长：压力是离散测量，中间有大量空隙，换算成分钟会凭空造出时长。
+- **血氧只有 12 天 / 558 条**，2026-06-12~17 与 2026-08-03~08 两段，之后设备不再上报。
+  所以 `get_blood_oxygen` **不做趋势**，只给记录与覆盖。没有记录 ≠ 血氧正常。
+- **低氧判断看 `lowEvents`**（`LOW_BLOOD_OXYGEN`，阈值 90%），不要用「最低值」自己下结论；
+  `below95` 只是「低于 95% 的样本数」，一个持续 30 分钟的低氧会变成 3 条样本而不是 1 次事件。
+- 血氧默认区间锚在**数据自己的最后一天**（2026-08-08），不是今天 —— 用今天当锚点会整段落空。
 
 ### 心率曲线口径
 
@@ -814,7 +855,7 @@ SQLite（`spring-boot-starter-jdbc` + `org.xerial:sqlite-jdbc`，无 ORM）。
 JAVA_HOME=/path/to/jdk-21 mvn test
 ```
 
-共 **315** 个用例（原有 42 + 持久化 19 + 资源形态 2 + 天气 42 + 工具层天气 4 + P0 分析 17 + 自动同步 7 + 睡眠 23 + 体征 9 + 心率曲线 11 + 体成分 13 + 其余工具/参数校验用例）：
+共 **333** 个用例（原有 42 + 持久化 19 + 资源形态 2 + 天气 42 + 工具层天气 4 + P0 分析 17 + 自动同步 7 + 睡眠 23 + 体征 9 + 心率曲线 11 + 体成分 13 + HRV/压力/血氧 18 + 其余工具/参数校验用例）：
 
 - **真实数据**：测试固定读 `src/test/resources/tcx-dataset` 里的 5 个 TCX，而不是
   `src/main/resources/health-data`。生产目录会随导入继续增长（例如新加的骑行文件），
