@@ -17,9 +17,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * 每次都要重新猜单位；这里把已经实测确认的字段摊平成带单位与文本镜像的结构，
  * 剩下没建模的字段仍原样保留，靠 {@code fields} 按需取。
  *
- * <p>只做「确认过」的换算，不做猜测：{@code britishPaceMap}/{@code bpm2} 这类
- * 数值恒等于 {@code pm2} 加一个 204~224 秒偏移的字段，原样留着并给一条 note，
- * 不冒充配速。
+ * <p>只做「确认过」的换算，不做猜测：{@code paceMap} 会拆成 {@code kmSplits}；{@code britishPaceMap}
+ * 是英制（每英里）口径，距离轴与配速单位都不同，原样留着并给一条 note，英里分段请走
+ * {@code get_official_splits} 的 {@code unit=mile}。
  */
 public final class HuaweiSummaryData {
 
@@ -34,7 +34,12 @@ public final class HuaweiSummaryData {
     private static final double SENTINEL_MAX = 3.4028234663852886E38d;
     private static final double SENTINEL_MIN = 1.401298464324817E-45d;
 
-    /** {@code paceMap} / {@code britishPaceMap} 的键 = 距离米 × 10000 + 轨迹点序号。 */
+    /**
+     * {@code paceMap} 的键 = 距离米 × 10000 + 轨迹点序号。
+     *
+     * <p>{@code britishPaceMap} 用同样的拼接方式，但距离单位是「千分之一英里」，
+     * 所以不能共用这套换算。
+     */
     private static final long PACE_KEY_FACTOR = 10_000L;
 
     /** 心率区间的展示顺序：从低强度到高强度。 */
@@ -345,12 +350,13 @@ public final class HuaweiSummaryData {
             notes.add("原文 totalTime 单位毫秒、totalCalories 单位卡，decoded 已换算成秒与千卡");
         }
         if (raw.containsKey("paceMap")) {
-            notes.add("paceMap/britishPaceMap 的键是「距离米 × 10000 + 轨迹点序号」，"
-                    + "值是该段的秒/公里；kmSplits 已按此拆开");
+            notes.add("paceMap 的键是「距离米 × 10000 + 轨迹点序号」，值是该段的秒/公里；"
+                    + "kmSplits 已按此拆开");
         }
         if (raw.containsKey("britishPaceMap")) {
-            notes.add("britishPaceMap 与 britishPartTimeMap 的数值恒等于同段 pm2 加 204~224 秒的偏移"
-                    + "（即 track_stream 里的 bpm2），语义未确认，不参与配速换算");
+            notes.add("britishPaceMap 是英制口径的单英里分段：键 = 「距离（千分之一英里）× 10000 + 点序号」，"
+                    + "值 = 秒/英里（即 track_stream 里的 bpm2），与 pm2 的公里分段不是同一组数值；"
+                    + "英里分段用 get_official_splits 的 unit=mile，这里不参与公里换算");
         }
         if (raw.containsKey("mAverageHangTime") || extend.containsKey("avg_v_osc")) {
             notes.add("跑姿字段的 -1 / -101 表示该机型未采集，已置为 null；"

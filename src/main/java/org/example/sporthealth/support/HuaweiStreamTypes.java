@@ -34,10 +34,11 @@ public final class HuaweiStreamTypes {
                 + "p 是该段配速(秒/公里)", "秒/公里", "p-m"));
         KINDS.put("p-m", new Kind("pm2 的扁平写法：k = 距离米×10000 + 点序号，v = 配速",
                 "秒/公里", "pm2"));
-        KINDS.put("bpm2", new Kind("与同一段的 pm2 恒差 204~224 秒，语义未确认（既不等于累计用时，"
-                + "也不是另一种口径的配速）", "未确认", "b-p-m"));
-        KINDS.put("b-p-m", new Kind("bpm2 的扁平写法：k = 距离米×10000 + 点序号，v = 该数值",
-                "未确认", "bpm2"));
+        KINDS.put("bpm2", new Kind("华为官方单英里配速（英制口径，british pace map）：d 是段终点距离，"
+                + "单位千分之一英里、n 是终点轨迹点序号、p 是该段配速(秒/英里)",
+                "秒/英里", "b-p-m"));
+        KINDS.put("b-p-m", new Kind("bpm2 的扁平写法：k = 距离（千分之一英里）×10000 + 点序号，v = 秒/英里",
+                "秒/英里", "bpm2"));
         KINDS.put("scp", new Kind("语义未确认：按毫秒时间戳采样，v 在 0~176 之间", "未确认", null));
         KINDS.put("i-h-r", new Kind("瞬时心率采集，绝大多数行 v=-1（该次未采集）", "bpm", null));
         KINDS.put("evt", new Kind("事件行：e 恒为 0，ty 取 0/1（疑似开始/结束），st 是毫秒时间戳",

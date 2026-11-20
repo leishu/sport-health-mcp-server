@@ -28,6 +28,10 @@ import org.example.sporthealth.domain.DynamicsSegment;
 import org.example.sporthealth.domain.DynamicsSummary;
 import org.example.sporthealth.domain.ElevationProfile;
 import org.example.sporthealth.domain.OfficialRaceComparison;
+import org.example.sporthealth.domain.OfficialSplit;
+import org.example.sporthealth.domain.OfficialSplitComparison;
+import org.example.sporthealth.domain.OfficialSplitDelta;
+import org.example.sporthealth.domain.OfficialSplits;
 import org.example.sporthealth.domain.Page;
 import org.example.sporthealth.domain.PeriodSummary;
 import org.example.sporthealth.domain.PersonalBestEffort;
@@ -42,6 +46,7 @@ import org.example.sporthealth.domain.RunFilter;
 import org.example.sporthealth.domain.RunLevel;
 import org.example.sporthealth.domain.RunLevelHistory;
 import org.example.sporthealth.domain.RunLookup;
+import org.example.sporthealth.domain.RunSplit;
 import org.example.sporthealth.domain.RunSplits;
 import org.example.sporthealth.domain.RunSummary;
 import org.example.sporthealth.domain.RunWeather;
@@ -300,8 +305,9 @@ public class SportHealthTools {
      * {@code bestPace}、{@code britishPaceMap}、跑姿汇总这些字段没人接手，等于白存。
      * 这里把实测确认过的字段换算成带单位的值，剩下没建模的仍可按 {@code fields} 取原文。
      *
-     * <p>换算只做确认过的那部分：{@code britishPaceMap}/{@code bpm2} 与 pm2 恒差
-     * 204~224 秒，语义未确认，原样保留并写进 {@code notes}，不冒充配速。
+     * <p>换算只做确认过的那部分：{@code britishPaceMap}/{@code bpm2} 是英制单英里口径
+     * （距离轴是千分之一英里、配速是秒/英里），原样保留并写进 {@code notes}，
+     * 英里分段由 {@code get_official_splits} 的 {@code unit=mile} 负责，这里不冒充公里配速。
      */
     @McpTool(name = "get_run_summary_data",
             description = "读取某次跑步的华为 summaryData（导出原文，约 2.5 KB JSON）并做单位换算："
@@ -1485,6 +1491,439 @@ public class SportHealthTools {
             }
         }
         return result;
+    }
+
+    /**
+     * {@code get_official_splits} 的 {@code unit} 允许值：{@code both} 只在单次模式下有效。
+     */
+    private static final List<String> OFFICIAL_UNIT_VALUES = List.of("km", "mile", "both");
+    /** 官方分段对比列表的默认与最大返回条数。 */
+    private static final int OFFICIAL_ROW_DEFAULT = 50;
+    private static final int OFFICIAL_ROW_MAX = 200;
+    /** 段长容差（公里）：两侧段长差超过它就跳过，不硬比。 */
+    private static final double OFFICIAL_TOLERANCE_KM = 0.05d;
+
+    /**
+     * 华为官方分段配速（设备自算）与 GPS 分段的逐段对比。
+     *
+     * <p>与 {@code get_run_splits} 的分工：后者是 GPS 口径的分段（含 GAP、爬升），官方分段只是
+     * 附带一块汇总；这里反过来，官方分段是主角，并且逐段给出 GPS 对照与差值。
+     */
+    @McpTool(name = "get_official_splits",
+            description = "读华为自己算好的分段配速，并与同一段的 GPS 分段逐段对比，回答"
+                    + "“华为官方每公里配速与 GPS 分段差多少”“官方认为最快的那公里和 GPS 差多少”。"
+                    + "unit=km（默认）用 pm2 的官方单公里分段；unit=mile 用 bpm2 的官方单英里分段"
+                    + "（英制口径，1 英里 = 1609.344 米，段数约为公里数的 0.62 倍）；"
+                    + "unit=both 同时给两套，只用于单次模式。"
+                    + "传 runId 看单次：units.{km|mile} 里有官方每段的距离/用时/配速、"
+                    + "同段 GPS 配速与 deltaSecondsPerKm（官方 − GPS，正数表示官方更慢）、"
+                    + "累计差值 cumulativeDeltaSeconds、最快/最慢段，以及 comparison（平均绝对差、"
+                    + "最大差出现在第几公里、差 ≤5 秒与 ≤15 秒的段数、一句话结论）。"
+                    + "不传 runId 按日期区间汇总：coverage（多少条记录有官方分段）、summary（各次平均差"
+                    + "的平均/中位数/P90、方向）与逐次记录分页。"
+                    + "华为没有单独的“最佳配速”字段，官方最快段由本工具从官方分段里取最小值。")
+    public Map<String, Object> getOfficialSplits(
+            @McpToolParam(description = "跑步记录 id；传了只看这一次，不传则按区间汇总", required = false) String runId,
+            @McpToolParam(description = "开始日期，格式 yyyy-MM-dd；只在区间汇总时使用", required = false) String startDate,
+            @McpToolParam(description = "结束日期，格式 yyyy-MM-dd；只在区间汇总时使用", required = false) String endDate,
+            @McpToolParam(description = "段单位：km（默认，pm2 单公里）、mile（bpm2 单英里）、"
+                    + "both（两套都给，只用于单次）", required = false) String unit,
+            @McpToolParam(description = "区间模式记录列表的偏移，默认 0", required = false) Integer offset,
+            @McpToolParam(description = "区间模式返回的记录条数，默认 50，最多 200", required = false) Integer limit) {
+        boolean single = runId != null && !runId.isBlank();
+        String normalized = analyticsUnit(unit);
+        if (normalized == null) {
+            return invalidArgument("unit", unit,
+                    "无法识别的段单位 \"" + unit + "\"，支持 km / mile / both；不传按 km", OFFICIAL_UNIT_VALUES);
+        }
+        if (single && (startDate != null || endDate != null)) {
+            return invalidArgument("runId", runId,
+                    "传了 runId 就只查这一次记录，不要再传 startDate/endDate；要按区间汇总就别传 runId", null);
+        }
+        if (!single && "both".equals(normalized)) {
+            return invalidArgument("unit", unit,
+                    "unit=both 只在单次模式（传 runId）下有效：区间汇总一次只按一种口径统计，"
+                            + "要两套就分别查 km 与 mile", List.of("km", "mile"));
+        }
+        if (single) {
+            return officialSplitsOfRun(runId, normalized);
+        }
+        return officialSplitsOfRange(startDate, endDate, normalized, orZero(offset), limit);
+    }
+
+    /** 段单位归一化：{@code both} 表示两套都要，其余交给分析层归一化。 */
+    private static String analyticsUnit(String unit) {
+        if (unit == null || unit.isBlank()) {
+            return RunAnalyticsService.OFFICIAL_UNIT_KM;
+        }
+        String key = unit.trim().toLowerCase(Locale.ROOT);
+        if ("both".equals(key)) {
+            return "both";
+        }
+        return RunAnalyticsService.normalizeOfficialUnit(key);
+    }
+
+    /** 单次详情：官方分段 + GPS 逐段对照 + 汇总结论；{@code unit=both} 时两套口径并列。 */
+    private Map<String, Object> officialSplitsOfRun(String runId, String unit) {
+        RunLookup lookup = analytics.lookup(runId);
+        if (lookup.isAmbiguous()) {
+            return ambiguous(runId, lookup);
+        }
+        if (!lookup.isFound()) {
+            return notFound(runId);
+        }
+        RunActivity run = lookup.run();
+        List<String> units = "both".equals(unit)
+                ? List.of(RunAnalyticsService.OFFICIAL_UNIT_KM, RunAnalyticsService.OFFICIAL_UNIT_MILE)
+                : List.of(unit);
+
+        Map<String, Object> blocks = new LinkedHashMap<>();
+        for (String candidate : units) {
+            Map<String, Object> block = officialUnitBlock(run, candidate);
+            if (block != null) {
+                blocks.put(candidate, block);
+            }
+        }
+        if (blocks.isEmpty()) {
+            Map<String, Object> result = noData(run, "这条记录没有华为官方分段（track_stream 里没有 pm2 / bpm2 流），"
+                    + "多半是 TCX 来源或室内跑；分段配速请改用 get_run_splits 看 GPS 口径");
+            result.put("activityDistanceKm", PaceFormat.round(run.distanceMeters() / 1000d, 3));
+            return result;
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "OK");
+        result.put("scope", "run");
+        result.put("runId", run.id());
+        result.put("date", run.date());
+        result.put("sport", run.sport());
+        result.put("activityDistanceKm", PaceFormat.round(run.distanceMeters() / 1000d, 3));
+        result.put("units", blocks);
+        if (blocks.size() < units.size()) {
+            int missing = units.size() - blocks.size();
+            result.put("message", "有 " + missing + " 套口径没有数据：导出里缺对应的流"
+                    + "（km 需要 pm2、mile 需要 bpm2），另一套仍然可用");
+        }
+        result.put("notes", officialSplitNotes());
+        return result;
+    }
+
+    /**
+     * 一套口径的完整块：官方分段（带 GPS 对照）、逐段对比结论、最快段对比。
+     *
+     * @return 该口径没有官方分段时返回 {@code null}
+     */
+    private Map<String, Object> officialUnitBlock(RunActivity run, String unit) {
+        OfficialSplits official = analytics.officialSplits(run, unit);
+        if (!official.usable()) {
+            return null;
+        }
+        RunSplits gps = analytics.splits(run, official.unitMeters());
+        OfficialSplitComparison comparison = analytics.officialComparison(gps, official, OFFICIAL_TOLERANCE_KM);
+
+        Map<String, Object> block = new LinkedHashMap<>();
+        block.put("unit", official.unit());
+        block.put("source", official.source());
+        block.put("unitMeters", official.unitMeters());
+        block.put("splitCount", official.splits().size());
+        block.put("fullSplitCount", official.fullSplitCount());
+        block.put("coveredKm", official.coveredKm());
+        block.put("avgPaceSecondsPerUnit", official.avgPaceSecondsPerUnit());
+        block.put("avgPaceText", official.avgPaceText());
+        block.put("avgPaceSecondsPerKm", official.avgPaceSecondsPerKm());
+        block.put("avgPaceTextPerKm", official.avgPaceTextPerKm());
+        block.put("fastest", officialSplitRow(official.fastest(), null));
+        block.put("slowest", officialSplitRow(official.slowest(), null));
+        block.put("splits", officialSplitsWithGps(official, comparison));
+        if (comparison == null) {
+            block.put("message", "没有可用的 GPS 分段（无轨迹，或两侧段长都对不上），只能给官方分段本身");
+        } else {
+            block.put("comparison", comparisonMap(comparison));
+            Map<String, Object> fastest = fastestComparison(official, gps);
+            if (!fastest.isEmpty()) {
+                block.put("fastestComparison", fastest);
+            }
+        }
+        return block;
+    }
+
+    /** 官方分段逐段摊开，有 GPS 对照时把同段的 GPS 配速与差值并进去。 */
+    private List<Map<String, Object>> officialSplitsWithGps(OfficialSplits official,
+                                                           OfficialSplitComparison comparison) {
+        Map<Integer, OfficialSplitDelta> deltas = comparison == null
+                ? Map.of()
+                : comparison.splits().stream()
+                        .collect(Collectors.toMap(OfficialSplitDelta::index, delta -> delta, (a, b) -> a,
+                                LinkedHashMap::new));
+        return official.splits().stream()
+                .map(split -> officialSplitRow(split, deltas.get(split.index())))
+                .toList();
+    }
+
+    /** 一段官方分段的 JSON；{@code delta} 为 null 时不占位，不用 0 冒充「一致」。 */
+    private Map<String, Object> officialSplitRow(OfficialSplit split, OfficialSplitDelta delta) {
+        if (split == null) {
+            return null;
+        }
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("index", split.index());
+        row.put("fromKm", split.fromKm());
+        row.put("toKm", split.toKm());
+        row.put("distanceKm", split.distanceKm());
+        row.put("durationSeconds", split.durationSeconds());
+        row.put("paceSecondsPerUnit", split.paceSecondsPerUnit());
+        row.put("paceText", split.paceText());
+        row.put("paceSecondsPerKm", split.paceSecondsPerKm());
+        row.put("paceTextPerKm", split.paceTextPerKm());
+        row.put("partial", split.partial());
+        putIfNotNull(row, "pointIndex", split.pointIndex());
+        if (delta != null) {
+            row.put("gpsPaceSecondsPerKm", delta.gpsPaceSecondsPerKm());
+            row.put("gpsPaceText", delta.gpsPaceText());
+            row.put("deltaSecondsPerKm", delta.deltaSecondsPerKm());
+            row.put("deltaText", delta.deltaText());
+            row.put("cumulativeDeltaSeconds", delta.cumulativeDeltaSeconds());
+        }
+        return row;
+    }
+
+    /** 逐段对比的汇总：平均/最大差、差出现在哪、方向与分布，外加一句结论。 */
+    private static Map<String, Object> comparisonMap(OfficialSplitComparison comparison) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("unit", comparison.unit());
+        map.put("comparedSplits", comparison.comparedSplits());
+        map.put("meanAbsDeltaSecondsPerKm", comparison.meanAbsDeltaSecondsPerKm());
+        map.put("maxAbsDeltaSecondsPerKm", comparison.maxAbsDeltaSecondsPerKm());
+        map.put("maxDeltaAtKm", comparison.maxDeltaAtKm());
+        map.put("signedMeanDeltaSecondsPerKm", comparison.signedMeanDeltaSecondsPerKm());
+        map.put("within5SplitCount", comparison.within5SplitCount());
+        map.put("within15SplitCount", comparison.within15SplitCount());
+        map.put("direction", comparison.signedMeanDeltaSecondsPerKm() > 0
+                ? "官方整体比 GPS 慢" : "官方整体比 GPS 快");
+        map.put("verdict", comparison.verdict());
+        return map;
+    }
+
+    /** 官方最快段 vs GPS 最快段：两边口径不同，「最快」未必落在同一公里。 */
+    private static Map<String, Object> fastestComparison(OfficialSplits official, RunSplits gps) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        OfficialSplit officialFastest = official.fastest();
+        RunSplit gpsFastest = gps == null ? null : gps.fastest();
+        if (officialFastest != null) {
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("fromKm", officialFastest.fromKm());
+            item.put("toKm", officialFastest.toKm());
+            item.put("paceSecondsPerUnit", officialFastest.paceSecondsPerUnit());
+            item.put("paceText", officialFastest.paceText());
+            item.put("paceSecondsPerKm", officialFastest.paceSecondsPerKm());
+            item.put("paceTextPerKm", officialFastest.paceTextPerKm());
+            map.put("official", item);
+        }
+        if (gpsFastest != null) {
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("fromKm", gpsFastest.fromKm());
+            item.put("toKm", gpsFastest.toKm());
+            item.put("paceSecondsPerKm", gpsFastest.paceSecondsPerKm());
+            item.put("paceText", gpsFastest.paceText());
+            map.put("gps", item);
+        }
+        if (officialFastest != null && gpsFastest != null && gpsFastest.paceSecondsPerKm() != null) {
+            double delta = PaceFormat.round(
+                    officialFastest.paceSecondsPerKm() - gpsFastest.paceSecondsPerKm(), 1);
+            map.put("deltaSecondsPerKm", delta);
+            map.put("deltaText", RunAnalyticsService.splitDeltaText(delta));
+        }
+        return map;
+    }
+
+    /**
+     * 区间汇总：覆盖度 + 各次平均差的整体分布 + 逐次记录。
+     *
+     * <p>口径与 {@code get_running_dynamics} 一致：先算每次的平均绝对差，再对这些值取统计，
+     * 而不是把所有段混成一堆——否则长跑（段多）会压过短跑。
+     */
+    private Map<String, Object> officialSplitsOfRange(String startDate, String endDate, String unit,
+                                                      int offset, Integer limit) {
+        DateRange range = analytics.resolveRange(startDate, endDate);
+        List<RunActivity> runs = analytics.runs(range);
+        if (runs.isEmpty()) {
+            return noData(range, null);
+        }
+
+        List<Map<String, Object>> rows = new ArrayList<>();
+        List<Double> meanAbsValues = new ArrayList<>();
+        int officialRuns = 0;
+        double maxAbsAll = 0d;
+        for (RunActivity run : runs) {
+            OfficialSplits official = analytics.officialSplits(run, unit);
+            if (!official.usable()) {
+                continue;
+            }
+            officialRuns++;
+            RunSplits gps = analytics.splits(run, official.unitMeters());
+            OfficialSplitComparison comparison = analytics.officialComparison(gps, official, OFFICIAL_TOLERANCE_KM);
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("runId", run.id());
+            row.put("date", run.date());
+            row.put("distanceKm", PaceFormat.round(run.distanceMeters() / 1000d, 3));
+            row.put("officialAvgPaceSecondsPerUnit", official.avgPaceSecondsPerUnit());
+            row.put("officialAvgPaceText", official.avgPaceText());
+            row.put("officialAvgPaceSecondsPerKm", official.avgPaceSecondsPerKm());
+            row.put("officialAvgPaceTextPerKm", official.avgPaceTextPerKm());
+            if (comparison == null) {
+                row.put("comparedSplits", 0);
+                rows.add(row);
+                continue;
+            }
+            meanAbsValues.add(comparison.meanAbsDeltaSecondsPerKm());
+            maxAbsAll = Math.max(maxAbsAll, comparison.maxAbsDeltaSecondsPerKm());
+            row.put("gpsAvgPaceSecondsPerKm", gps.avgPaceSecondsPerKm());
+            row.put("gpsAvgPaceText", gps.avgPaceText());
+            row.put("comparedSplits", comparison.comparedSplits());
+            row.put("meanAbsDeltaSecondsPerKm", comparison.meanAbsDeltaSecondsPerKm());
+            row.put("maxAbsDeltaSecondsPerKm", comparison.maxAbsDeltaSecondsPerKm());
+            row.put("maxDeltaAtKm", comparison.maxDeltaAtKm());
+            row.put("signedMeanDeltaSecondsPerKm", comparison.signedMeanDeltaSecondsPerKm());
+            rows.add(row);
+        }
+        if (officialRuns == 0) {
+            Map<String, Object> result = noData(range, "区间内 " + runs.size()
+                    + " 次跑步都没有华为官方分段（track_stream 里没有 " 
+                    + (RunAnalyticsService.OFFICIAL_UNIT_MILE.equals(unit) ? "bpm2" : "pm2")
+                    + " 流），多半是 TCX 来源或室内跑");
+            result.put("totalRuns", runs.size());
+            return result;
+        }
+
+        int total = rows.size();
+        int from = Math.min(offset, total);
+        int size = officialPageSize(limit);
+        List<Map<String, Object>> page = rows.subList(from, Math.min(from + size, total));
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "OK");
+        result.put("scope", "range");
+        result.put("range", range.text());
+        result.put("from", range.from());
+        result.put("to", range.to());
+        result.put("unit", unit);
+        result.put("totalRuns", runs.size());
+        result.put("coverage", officialCoverage(runs.size(), officialRuns, meanAbsValues.size()));
+        result.put("summary", officialRangeSummary(meanAbsValues, maxAbsAll));
+        result.put("total", total);
+        result.put("offset", from);
+        result.put("limit", size);
+        result.put("hasMore", from + page.size() < total);
+        result.put("runs", page);
+        result.put("notes", officialRangeNotes());
+        return result;
+    }
+
+    private static Map<String, Object> officialCoverage(int totalRuns, int officialRuns, int comparedRuns) {
+        Map<String, Object> coverage = new LinkedHashMap<>();
+        coverage.put("runs", totalRuns);
+        coverage.put("officialRuns", officialRuns);
+        coverage.put("comparedRuns", comparedRuns);
+        coverage.put("officialPercent", totalRuns == 0
+                ? null : PaceFormat.round(officialRuns * 100d / totalRuns, 1));
+        String hint;
+        if (officialRuns == 0) {
+            hint = "区间内没有记录带官方分段：TCX 来源与室内跑不会有 pm2 / bpm2。";
+        } else if (comparedRuns == 0) {
+            hint = "有官方分段但都没法跟 GPS 对比（记录缺轨迹）。";
+        } else if (officialRuns == totalRuns) {
+            hint = "区间内 " + totalRuns + " 次跑步全部带官方分段，可以直接看整体差值。";
+        } else {
+            hint = "区间内 " + totalRuns + " 次跑步有 " + officialRuns + " 次带官方分段（"
+                    + PaceFormat.round(officialRuns * 100d / totalRuns, 1) + "%），其余是 TCX 或室内跑；"
+                    + "看整体差值时按 comparedRuns 理解样本量。";
+        }
+        coverage.put("hint", hint);
+        return coverage;
+    }
+
+    /** 各次平均绝对差的分布：均值/中位数/P90/极值，加上方向与达标次数。 */
+    private static Map<String, Object> officialRangeSummary(List<Double> meanAbsValues, double maxAbsAll) {
+        Map<String, Object> summary = new LinkedHashMap<>();
+        int compared = meanAbsValues.size();
+        summary.put("comparedRuns", compared);
+        if (compared == 0) {
+            summary.put("verdict", "没有可对比的记录，给不出整体差值");
+            return summary;
+        }
+        List<Double> sorted = meanAbsValues.stream().sorted().toList();
+        double mean = PaceFormat.round(sorted.stream().mapToDouble(Double::doubleValue).average().orElse(0d), 1);
+        summary.put("meanAbsDeltaSecondsPerKm", mean);
+        summary.put("medianAbsDeltaSecondsPerKm", percentile(sorted, 0.5));
+        summary.put("p90AbsDeltaSecondsPerKm", percentile(sorted, 0.9));
+        summary.put("maxAbsDeltaSecondsPerKm", maxAbsAll);
+        long within5 = sorted.stream().filter(value -> value <= 5d).count();
+        long above20 = sorted.stream().filter(value -> value > 20d).count();
+        summary.put("runsWithin5Seconds", within5);
+        summary.put("runsAbove20Seconds", above20);
+        summary.put("verdict", officialRangeVerdict(mean, compared, (int) within5, (int) above20));
+        return summary;
+    }
+
+    private static String officialRangeVerdict(double meanAbs, int comparedRuns, int within5, int above20) {
+        String base = "共同可比 " + comparedRuns + " 次，平均绝对差 " + meanAbs + " 秒/公里";
+        if (meanAbs <= 5d) {
+            return base + "：两边几乎一致，GPS 算出来的配速可以放心当成绩用";
+        }
+        if (meanAbs <= 15d) {
+            return base + "：差异属于口径与信号噪声的正常范围，看趋势不用纠偏";
+        }
+        return base + "（其中 " + above20 + " 次超过 20 秒、"
+                + within5 + " 次在 5 秒以内）：先查差得大的那几次轨迹，"
+                + "常见原因是隧道/楼间丢星、操场绕圈或折返段，而不是配速本身";
+    }
+
+    private static List<String> officialSplitNotes() {
+        return List.of(
+                "官方分段由设备累计距离切分，GPS 分段是沿轨迹插值切分，两者口径不同；"
+                        + "差值稳定说明互相印证，忽大忽小通常是其中一方受信号影响",
+                "deltaSecondsPerKm = 官方 − GPS：正数表示官方更慢；"
+                        + "cumulativeDeltaSeconds 是到本段终点为止两边累计用时之差（秒）",
+                "末段两侧长度常常不同（一边切在整单位、一边切在轨迹末尾），长度差超过 50 米的段会被跳过，"
+                        + "所以 comparedSplits 可能小于分段数",
+                "mile 口径来自英制导出的 bpm2（b-p-m），1 英里 = 1609.344 米；"
+                        + "华为没有单独的“最佳配速”字段，fastest 是从官方分段里取的最小值");
+    }
+
+    private static List<String> officialRangeNotes() {
+        return List.of(
+                "summary 覆盖区间内全部有官方分段的记录，不受 offset/limit 分页影响；"
+                        + "total 是 runs 列表的条数，totalRuns 是区间内全部跑步数",
+                "统计口径：先算每次的平均绝对差，再对这些值取均值/中位数/P90，"
+                        + "长跑不会因为段数多就压过短跑",
+                "TCX 来源与室内跑没有 pm2 / bpm2，永远不会出现在 officialRuns 里");
+    }
+
+    private static int officialPageSize(Integer limit) {
+        if (limit == null || limit <= 0) {
+            return OFFICIAL_ROW_DEFAULT;
+        }
+        return Math.min(limit, OFFICIAL_ROW_MAX);
+    }
+
+    /**
+     * 已排序列表的分位数（线性插值），保留 1 位小数。
+     *
+     * <p>样本量小的时候（十几条记录里只有五六次可比）用插值比最近秩更稳，
+     * 且 {@code p=0.5} 与中位数定义一致。
+     */
+    private static double percentile(List<Double> sorted, double p) {
+        if (sorted.isEmpty()) {
+            return 0d;
+        }
+        if (sorted.size() == 1) {
+            return PaceFormat.round(sorted.get(0), 1);
+        }
+        double position = Math.clamp(p, 0d, 1d) * (sorted.size() - 1);
+        int lower = (int) Math.floor(position);
+        int upper = Math.min(lower + 1, sorted.size() - 1);
+        double weight = position - lower;
+        return PaceFormat.round(sorted.get(lower) * (1 - weight) + sorted.get(upper) * weight, 1);
     }
 
     /** 一次跑步内 1K / 5K 等目标距离的最佳用时。 */

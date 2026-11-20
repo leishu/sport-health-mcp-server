@@ -13,11 +13,25 @@ public final class PaceFormat {
 
     /** 秒/公里 -> 5'45"/km */
     public static String pace(Double secondsPerKm) {
-        if (secondsPerKm == null || secondsPerKm <= 0 || !Double.isFinite(secondsPerKm)) {
+        return paceWithUnit(secondsPerKm, "km");
+    }
+
+    /**
+     * 秒/段单位 -> 5'45"/km 或 9'15"/mi。
+     *
+     * <p>华为的 {@code bpm2} 是英制（每英里）分段，同一次跑步的英里配速会明显大于公里配速，
+     * 后缀必须跟着单位走，否则「9'15"/km」这种数字会被当成配速崩坏的证据。
+     *
+     * @param secondsPerUnit 每段单位的秒数
+     * @param unit           {@code km} / {@code mi}，其它值按 {@code km} 渲染
+     */
+    public static String paceWithUnit(Double secondsPerUnit, String unit) {
+        if (secondsPerUnit == null || secondsPerUnit <= 0 || !Double.isFinite(secondsPerUnit)) {
             return null;
         }
-        long total = Math.round(secondsPerKm);
-        return (total / 60) + "'" + String.format("%02d", total % 60) + "\"/km";
+        long total = Math.round(secondsPerUnit);
+        String suffix = "mi".equalsIgnoreCase(unit) ? "mi" : "km";
+        return (total / 60) + "'" + String.format("%02d", total % 60) + "\"/" + suffix;
     }
 
     /** 公里/小时 -> 12.3 km/h */

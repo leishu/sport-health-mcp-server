@@ -27,7 +27,7 @@ import org.example.sporthealth.domain.TrackPoint;
  *   <li>{@code s-r}：步频，{@code k} 是毫秒时间戳，{@code v} 是步/分；</li>
  *   <li>{@code alt}：气压计高度，{@code k} 是毫秒时间戳（比 GPS 高度平滑得多）；</li>
  *   <li>{@code dis}：累计距离，{@code k} 与 {@code lbs} 的点序号对齐；</li>
- *   <li>{@code rs}：每 5 秒速度、{@code rp} 跑姿、{@code pm2}/{@code bpm2} 单公里配速等，
+ *   <li>{@code rs}：每 5 秒速度、{@code rp} 跑姿、{@code pm2} 单公里配速、{@code bpm2} 单英里配速等，
  *       不属于逐点轨迹，原样收进 {@link MotionStream}，由写入层落到 {@code track_stream}。</li>
  * </ul>
  *

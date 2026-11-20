@@ -233,6 +233,7 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `get_personal_bests` | `startDate?` `endDate?` `category?` `distancesKm?` | `category`：`all`（默认）/`distance`/`pace`/`duration`/`climb`，或距离类别 `best1k`/`best3k`/`best5k`/`best10k`/`half`/`marathon`（别名：`5k`、`半马`、`全马`…）。`distancesKm` 直接指定最佳努力的目标距离，默认 `[1,5]`，例如 `[1,5,10,21.0975,42.195]`；结果按 `best1k`/`best10k`/`bestHalf`/`bestMarathon` 命名，区间内跑不到的目标列在 `unavailableDistancesKm` |
 | `compare_runs` | `baseRunId` `otherRunId` `includeSplits?` `splitKm?` | 距离/时长/配速差异 + 一句话结论，可选附带两次的分段（`splitKm` 默认 1，与 `get_run_splits` 同口径；缺 GPS 的那次会列在 `splits.noGpsRunIds`） |
 | `get_run_splits` | `runId` `splitKm?` | 沿轨迹按固定距离（默认 1 公里）分段：配速、用时、本段爬升、净海拔变化、平均坡度、坡度修正配速（GAP）、最快/最慢段、前后半程对比、负分段、配速标准差，并返回 `gpsDistanceKm` 与全程 GAP 汇总。华为来源的记录另带 `vendorSplits`（华为官方单公里配速，来自 `track_stream` 的 `pm2`）与 `splitCrossCheck`（两边按段对齐后的平均/最大配速差与结论） |
+| `get_official_splits` | `runId?` `startDate?` `endDate?` `unit?` `offset?` `limit?` | 华为官方分段配速与 GPS 分段的逐段对比。`unit=km`（默认）读 `pm2` 的单公里分段，`unit=mile` 读 `bpm2` 的单英里分段（英制，1 英里 = 1609.344 米），`unit=both` 两套并列（只用于单次）。传 `runId`：`units.{km\|mile}` 内给官方每段的距离/用时/配速、同段 GPS 配速与 `deltaSecondsPerKm`（官方 − GPS，正数=官方更慢）、累计差值 `cumulativeDeltaSeconds`、`fastest`/`slowest`，以及 `comparison`（`comparedSplits`、`meanAbsDeltaSecondsPerKm`、`maxAbsDeltaSecondsPerKm`、`maxDeltaAtKm`、`signedMeanDeltaSecondsPerKm`、`within5/15SplitCount`、`verdict`）与 `fastestComparison`（官方最快段 vs GPS 最快段）。不传 `runId`：`coverage`（多少条带官方分段）+ `summary`（各次平均差的中位数/P90/方向）+ 逐次记录分页。华为没有「最佳配速」字段，最快段由官方分段取最小值 |
 | `get_best_efforts` | `runId` `distancesKm?` | 单次跑步内 1K/5K 等目标距离的最佳用时与折算配速（默认 `[1,5]`），附 `gpsDistanceKm`，超出本次距离的目标列入 `unavailableTargetsMeters` |
 | `get_training_trend` | `period?` `count?` `endDate?` | 连续周/月趋势（`count` 默认 4、最多 52），含跑量与配速相对上一周期的变化 |
 | `get_consistency` | `startDate?` `endDate?` | 打卡天数占比、当前/最长连续天数、平均间隔、日历热力数据；当前连续以最后一次记录为锚点 |
@@ -292,6 +293,7 @@ P0 新增的五项分析都只使用已有的 TCX 数据与已回填的天气，
 | `groupBy`（`get_daily_running`） | 认不出的粒度 | 静默按 `day` 分组 |
 | `period`（`get_training_trend`） | 认不出的粒度 | 除 `month` 外一律当 `week` |
 | `sortBy` / `weekday` / `min*Km` / `min*Pace*`（`list_runs`） | 认不出的排序、`weekday` 超出 1~7、下限大于上限 | 排序静默按 `date`、`weekday` 越界等于不过滤、下限大于上限直接抛异常 |
+| `unit`（`get_official_splits`） | 认不出的段单位；区间汇总时传 `both` | 静默按公里算，英里口径的请求会拿到公里数据 |
 
 刻意保留的宽容行为只有分页：`offset` 负数按 0、`limit` 非正数按默认值，且生效值一定在返回体里回显。
 
@@ -690,7 +692,8 @@ JAVA_HOME=/path/to/jdk-21 mvn test
 - **轨迹分析**：逐公里分段（末段 `partial`、前后半程与负分段）、单次最佳努力、跨记录 1K/5K 最佳、
   海拔剖面、停顿检测与 `describe_data_source` 的 quality 自检。
 - **工具层**：quality 块结构、任意 `distancesKm` 的目标距离最佳（含 `best10k`/`bestHalf` 命名与不可用距离），
-  华为官方分段与 GPS 分段的交叉校验，以及 `get_run_route` 两种格式的海拔小数精度。
+  华为官方分段与 GPS 分段的交叉校验（`get_official_splits` 另有独立用例：km/mile 两套口径、
+  `p-m`/`b-p-m` 扁平写法兜底、区间覆盖率与差值统计），以及 `get_run_route` 两种格式的海拔小数精度。
 - **访问日志**：每次调用前后各一条，START 带工具名与入参、END 带 `status` 与耗时，两条用 `callId` 关联；异常时 END 按 `ERROR` 记录并重新抛出。
 - **内联 XML 边界用例**：一个 Lap 多个 Track、缺 `Lap@StartTime` 时用 `Activity/Id` 兜底、
   部分 Lap 缺 `TotalTimeSeconds`、缺 `Time`/非法数字/缺经纬度进入 warnings、

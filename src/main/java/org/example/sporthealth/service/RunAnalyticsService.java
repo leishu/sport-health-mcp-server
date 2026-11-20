@@ -26,6 +26,10 @@ import org.example.sporthealth.domain.Consistency;
 import org.example.sporthealth.domain.DailyRunSummary;
 import org.example.sporthealth.domain.ElevationBucket;
 import org.example.sporthealth.domain.ElevationProfile;
+import org.example.sporthealth.domain.OfficialSplit;
+import org.example.sporthealth.domain.OfficialSplitComparison;
+import org.example.sporthealth.domain.OfficialSplitDelta;
+import org.example.sporthealth.domain.OfficialSplits;
 import org.example.sporthealth.domain.Page;
 import org.example.sporthealth.domain.PeriodSummary;
 import org.example.sporthealth.domain.PersonalBestEffort;
@@ -96,9 +100,24 @@ public class RunAnalyticsService {
     /** 「配速像轻松跑、心率却已到阈值区」的改写门槛：Z4 的下标。 */
     private static final int ZONE_INDEX_THRESHOLD = 3;
 
-    /** 华为单公里配速所在的流类型与来源标记。 */
+    /** 华为官方分段所在的流类型与来源标记：{@code pm2} 是单公里，{@code bpm2} 是单英里（英制）。 */
     private static final String STREAM_TYPE_PM2 = "pm2";
+    private static final String STREAM_TYPE_PM2_FLAT = "p-m";
+    private static final String STREAM_TYPE_BPM2 = "bpm2";
+    private static final String STREAM_TYPE_BPM2_FLAT = "b-p-m";
     private static final String VENDOR_SOURCE_HUAWEI = "HUAWEI_PM2";
+    private static final String VENDOR_SOURCE_HUAWEI_MILE = "HUAWEI_BPM2";
+
+    /** 官方分段的两套口径。{@code mile} 来自英制导出（british pace map），1 英里 = 1609.344 米。 */
+    public static final String OFFICIAL_UNIT_KM = "km";
+    public static final String OFFICIAL_UNIT_MILE = "mile";
+    private static final double METERS_PER_MILE = 1609.344d;
+
+    /**
+     * 官方分段原始行里 {@code d} 的单位是「千分之一（米 / 英里）」：{@code pm2} 的 {@code d=2000}
+     * 是 2000 米，{@code bpm2} 的 {@code d=2000} 是 2000/1000 英里。
+     */
+    private static final double THOUSANDTHS = 1000d;
 
     /** Riegel 公式的经验指数，用于把较短距离成绩外推到更长距离。 */
     private static final double RIEGEL_EXPONENT = 1.06d;
@@ -457,113 +476,260 @@ public class RunAnalyticsService {
     }
 
     /**
-     * 厂商官方分段配速：读华为 {@code track_stream} 里的 {@code pm2} 流。
+     * 华为官方分段配速，按段单位分两套口径：{@code km} 读 {@code pm2}（单公里），
+     * {@code mile} 读 {@code bpm2}（英制单英里，1 英里 = 1609.344 米）。
      *
-     * <p>华为的 {@code pm2} 行形如 {@code tp=pm2;d=2000;n=349;p=346.0}：{@code d} 是该段终点的
-     * 累计距离（米），{@code p} 是该段配速（秒/公里），{@code n} 是终点处的轨迹点序号。
-     * 整公里段时 {@code p} 等于该段用时（秒），末段不足一公里时仍是配速，因此用时按
-     * {@code p × 距离} 折算。
+     * <p>原始行形如 {@code tp=pm2;d=2000;n=349;p=346.0}：{@code d} 是该段终点的累计距离，
+     * 单位是「千分之一（米 / 英里）」——{@code pm2} 的 2000 是 2 公里，{@code bpm2} 的 2000
+     * 是 2 英里；{@code p} 是该段配速（秒/段单位）；{@code n} 是终点处的轨迹点序号。
+     * 整段时 {@code p} 恰好等于该段用时，末段不足一段时仍是配速，所以用时一律按
+     * {@code p × 本段距离 ÷ 段长度} 折算。
      *
-     * <p>{@code bpm2}/{@code b-p-m} 没有采用：样本里它们的数值恒等于 {@code pm2} 加一个
-     * 204~224 秒之间的整数偏移（逐公里不同），既不是累计用时也不是另一种口径的配速，
-     * 无法互相校验，只保留在 {@code track_stream} 里备查。
+     * <p>{@code bpm2} 早前被记成「与 pm2 差 204~224 秒的未知偏移」，那是把两种切分的第 i 段
+     * 硬减出来的假象：一英里里既有整公里也有不足一公里的部分。用 {@code pm2} 的分段配速反推
+     * 每英里用时，与 {@code bpm2} 的 {@code p} 中位差 0.6 秒；{@code bpm2} 末段 {@code d} 换算成米
+     * 与运动总距离的比值中位数 1.0000，两处都对得上，可以确认是英里口径。
+     *
+     * <p>导出里没有对应流的记录（TCX、室内跑）返回 {@code usable()} 为 false 的空结果。
+     *
+     * @param unit {@code km}（默认）或 {@code mile}，非法值由工具层先拦下
      */
-    public VendorSplits vendorSplits(RunActivity run) {
-        List<TrackStream> rows = repository.streams(run.id(), STREAM_TYPE_PM2);
+    public OfficialSplits officialSplits(RunActivity run, String unit) {
+        String normalized = normalizeOfficialUnit(unit);
+        boolean mile = OFFICIAL_UNIT_MILE.equals(normalized);
+        String source = mile ? VENDOR_SOURCE_HUAWEI_MILE : VENDOR_SOURCE_HUAWEI;
+        double unitMeters = officialUnitMeters(normalized);
+        List<TrackStream> rows = mile
+                ? officialRows(run.id(), STREAM_TYPE_BPM2, STREAM_TYPE_BPM2_FLAT)
+                : officialRows(run.id(), STREAM_TYPE_PM2, STREAM_TYPE_PM2_FLAT);
         if (rows.isEmpty()) {
-            return VendorSplits.empty(run.id(), VENDOR_SOURCE_HUAWEI);
+            return OfficialSplits.empty(run.id(), normalized, source, unitMeters);
         }
 
-        List<VendorSplit> parsed = new ArrayList<>(rows.size());
-        double previousKm = 0d;
+        List<OfficialSplit> parsed = new ArrayList<>(rows.size());
+        double previousMeters = 0d;
         int index = 1;
         int skipped = 0;
         for (TrackStream row : rows) {
-            Double endMeters = number(row.fields().get("d"));
+            Double endUnits = number(row.fields().get("d"));
             Double pace = number(row.fields().get("p"));
             if (pace == null) {
                 pace = row.value();
             }
-            if (endMeters == null || pace == null || pace <= 0) {
+            Integer pointIndex = row.pointIndex();
+            if (endUnits == null && pointIndex != null) {
+                // 扁平写法 p-m / b-p-m：k = 距离（千分之一单位）× 10000 + 点序号
+                endUnits = (double) (pointIndex / 10000);
+                pointIndex = pointIndex % 10000;
+            }
+            if (endUnits == null || pace == null || pace <= 0) {
                 skipped++;
                 continue;
             }
-            double endKm = endMeters / 1000d;
-            double distanceKm = endKm - previousKm;
-            if (distanceKm <= 1e-4) {
+            double endMeters = endUnits * unitMeters / THOUSANDTHS;
+            double distanceMeters = endMeters - previousMeters;
+            if (distanceMeters <= 0.5d) {
                 skipped++;
                 continue;
             }
             double paceSeconds = PaceFormat.round(pace, 1);
-            parsed.add(new VendorSplit(index++, PaceFormat.round(previousKm, 3), PaceFormat.round(endKm, 3),
-                    PaceFormat.round(distanceKm, 3), PaceFormat.round(pace * distanceKm, 1),
-                    paceSeconds, PaceFormat.pace(paceSeconds),
-                    distanceKm < DEFAULT_SPLIT_METERS / 1000d - 1e-3,
-                    row.pointIndex()));
-            previousKm = endKm;
+            double pacePerKm = PaceFormat.round(pace * 1000d / unitMeters, 1);
+            parsed.add(new OfficialSplit(index++, normalized,
+                    PaceFormat.round(previousMeters / 1000d, 3), PaceFormat.round(endMeters / 1000d, 3),
+                    PaceFormat.round(distanceMeters / 1000d, 3),
+                    PaceFormat.round(pace * distanceMeters / unitMeters, 1),
+                    paceSeconds, PaceFormat.paceWithUnit(paceSeconds, mile ? "mi" : "km"),
+                    pacePerKm, PaceFormat.pace(pacePerKm),
+                    distanceMeters < unitMeters - 1d, pointIndex));
+            previousMeters = endMeters;
         }
         if (skipped > 0) {
-            log.debug("记录 {} 有 {} 行 pm2 无法解析距离或配速，已跳过", run.id(), skipped);
+            log.debug("记录 {} 有 {} 行 {} 无法解析距离或配速，已跳过", run.id(), skipped, source);
         }
         if (parsed.isEmpty()) {
-            return VendorSplits.empty(run.id(), VENDOR_SOURCE_HUAWEI);
+            return OfficialSplits.empty(run.id(), normalized, source, unitMeters);
         }
 
-        double totalKm = parsed.stream().mapToDouble(VendorSplit::distanceKm).sum();
-        double totalSeconds = parsed.stream().mapToDouble(VendorSplit::durationSeconds).sum();
-        Double avgPace = totalKm > 0 ? PaceFormat.round(totalSeconds / totalKm, 1) : null;
-        return new VendorSplits(run.id(), VENDOR_SOURCE_HUAWEI, DEFAULT_SPLIT_METERS,
-                PaceFormat.round(totalKm, 3), List.copyOf(parsed), avgPace, PaceFormat.pace(avgPace));
+        double coveredMeters = previousMeters;
+        double totalSeconds = parsed.stream().mapToDouble(OfficialSplit::durationSeconds).sum();
+        Double avgPerUnit = coveredMeters > 0
+                ? PaceFormat.round(totalSeconds / (coveredMeters / unitMeters), 1) : null;
+        Double avgPerKm = coveredMeters > 0
+                ? PaceFormat.round(totalSeconds / (coveredMeters / 1000d), 1) : null;
+        List<OfficialSplit> full = parsed.stream().filter(split -> !split.partial()).toList();
+        List<OfficialSplit> pool = full.isEmpty() ? parsed : full;
+        OfficialSplit fastest = pool.stream()
+                .min(Comparator.comparingDouble(OfficialSplit::paceSecondsPerUnit)).orElse(null);
+        OfficialSplit slowest = pool.stream()
+                .max(Comparator.comparingDouble(OfficialSplit::paceSecondsPerUnit)).orElse(null);
+        return new OfficialSplits(run.id(), normalized, source, unitMeters,
+                PaceFormat.round(coveredMeters / 1000d, 3), List.copyOf(parsed), fastest, slowest,
+                avgPerUnit, PaceFormat.paceWithUnit(avgPerUnit, mile ? "mi" : "km"),
+                avgPerKm, PaceFormat.pace(avgPerKm));
+    }
+
+    /** 段单位归一化：空值按 {@code km}；认不出来返回 {@code null}，由工具层转成 INVALID_ARGUMENT。 */
+    public static String normalizeOfficialUnit(String unit) {
+        if (unit == null || unit.isBlank()) {
+            return OFFICIAL_UNIT_KM;
+        }
+        String key = unit.trim().toLowerCase(Locale.ROOT);
+        return switch (key) {
+            case "km", "k", "kilometer", "kilometre", "公里" -> OFFICIAL_UNIT_KM;
+            case "mile", "miles", "mi", "英里" -> OFFICIAL_UNIT_MILE;
+            default -> null;
+        };
+    }
+
+    /** 段单位长度（米）；{@code unit} 认不出来时按公里。 */
+    public static double officialUnitMeters(String unit) {
+        return OFFICIAL_UNIT_MILE.equals(normalizeOfficialUnit(unit)) ? METERS_PER_MILE : DEFAULT_SPLIT_METERS;
+    }
+
+    /** 官方分段原始行：优先规范流类型，缺失时退回扁平写法（{@code p-m} / {@code b-p-m}）。 */
+    private List<TrackStream> officialRows(String runId, String streamType, String flatType) {
+        List<TrackStream> rows = repository.streams(runId, streamType);
+        return rows.isEmpty() ? repository.streams(runId, flatType) : rows;
     }
 
     /**
-     * 把 GPS 分段和厂商分段按段序号对齐比较。
+     * 厂商官方分段配速（公里口径），{@link #officialSplits} 的兼容包装。
      *
-     * <p>只有段长相同（容差 50 米）的段才参与比较：口径不同的分段混在一起算差值没有意义。
-     * 差值稳定说明两边口径一致，忽大忽小说明其中一方受 GPS 信号影响。
+     * @see #officialSplits(RunActivity, String)
+     */
+    public VendorSplits vendorSplits(RunActivity run) {
+        OfficialSplits official = officialSplits(run, OFFICIAL_UNIT_KM);
+        if (!official.usable()) {
+            return VendorSplits.empty(run.id(), VENDOR_SOURCE_HUAWEI);
+        }
+        List<VendorSplit> splits = official.splits().stream()
+                .map(split -> new VendorSplit(split.index(), split.fromKm(), split.toKm(), split.distanceKm(),
+                        split.durationSeconds(), split.paceSecondsPerUnit(), split.paceText(),
+                        split.partial(), split.pointIndex()))
+                .toList();
+        return new VendorSplits(run.id(), VENDOR_SOURCE_HUAWEI, DEFAULT_SPLIT_METERS, official.coveredKm(),
+                splits, official.avgPaceSecondsPerUnit(), official.avgPaceText());
+    }
+
+    /**
+     * 把 GPS 分段和官方分段按段序号逐段对齐比较。
      *
+     * <p>只有段长一致（容差默认 50 米）的段才参与比较：口径不同的分段混在一起算差值没有意义。
+     * 差值稳定说明两边相互印证，忽大忽小说明其中一方受信号影响（隧道、楼间、操场绕圈）。
+     *
+     * <p>末段两侧长度常常不同（一边切在整单位、一边切在 GPS 轨迹末尾），长度差超过容差的段会被跳过，
+     * 所以 {@code comparedSplits} 可能小于分段数。
+     *
+     * @param toleranceKm 段长容差（公里），非正数按 0.05 处理
      * @return 没有可比较的段时返回 null
      */
-    public SplitCrossCheck crossCheck(RunSplits gps, VendorSplits vendor) {
-        if (gps == null || vendor == null || !vendor.usable() || gps.splits().isEmpty()) {
+    public OfficialSplitComparison officialComparison(RunSplits gps, OfficialSplits official,
+                                                      double toleranceKm) {
+        if (gps == null || official == null || !official.usable() || gps.splits().isEmpty()) {
             return null;
         }
+        double tolerance = toleranceKm > 0 ? toleranceKm : 0.05d;
+        List<OfficialSplitDelta> rows = new ArrayList<>();
         int compared = 0;
+        int within5 = 0;
+        int within15 = 0;
         double sumAbs = 0d;
+        double sumSigned = 0d;
         double maxAbs = 0d;
         double maxAtKm = 0d;
-        int pairs = Math.min(gps.splits().size(), vendor.splits().size());
+        double cumulativeSeconds = 0d;
+        int pairs = Math.min(gps.splits().size(), official.splits().size());
         for (int i = 0; i < pairs; i++) {
             RunSplit gpsSplit = gps.splits().get(i);
-            VendorSplit vendorSplit = vendor.splits().get(i);
+            OfficialSplit officialSplit = official.splits().get(i);
             if (gpsSplit.paceSecondsPerKm() == null) {
                 continue;
             }
-            if (Math.abs(gpsSplit.distanceKm() - vendorSplit.distanceKm()) > 0.05) {
+            if (Math.abs(gpsSplit.distanceKm() - officialSplit.distanceKm()) > tolerance) {
                 continue;
             }
-            double delta = Math.abs(gpsSplit.paceSecondsPerKm() - vendorSplit.paceSecondsPerKm());
+            double delta = PaceFormat.round(
+                    officialSplit.paceSecondsPerKm() - gpsSplit.paceSecondsPerKm(), 1);
+            cumulativeSeconds = PaceFormat.round(
+                    cumulativeSeconds + delta * officialSplit.distanceKm(), 1);
+            double abs = Math.abs(delta);
             compared++;
-            sumAbs += delta;
-            if (delta > maxAbs) {
-                maxAbs = delta;
+            sumAbs += abs;
+            sumSigned += delta;
+            if (abs <= 5d) {
+                within5++;
+            }
+            if (abs <= 15d) {
+                within15++;
+            }
+            if (abs > maxAbs) {
+                maxAbs = abs;
                 maxAtKm = gpsSplit.toKm();
             }
+            rows.add(new OfficialSplitDelta(officialSplit.index(), officialSplit.fromKm(),
+                    officialSplit.toKm(), officialSplit.paceSecondsPerKm(), officialSplit.paceTextPerKm(),
+                    gpsSplit.paceSecondsPerKm(), gpsSplit.paceText(), delta, splitDeltaText(delta),
+                    cumulativeSeconds));
         }
         if (compared == 0) {
             return null;
         }
         double meanAbs = PaceFormat.round(sumAbs / compared, 1);
-        String verdict;
-        if (meanAbs <= 5d) {
-            verdict = "GPS 分段与华为官方配速基本一致，轨迹可信";
-        } else if (meanAbs <= 15d) {
-            verdict = "GPS 分段与华为官方配速有少量差异，长距离或绕圈路段可能受信号影响";
-        } else {
-            verdict = "GPS 分段与华为官方配速差异较大，建议以厂商分段为准核对轨迹质量";
+        return new OfficialSplitComparison(official.unit(), compared, meanAbs,
+                PaceFormat.round(maxAbs, 1), PaceFormat.round(maxAtKm, 2),
+                PaceFormat.round(sumSigned / compared, 1), within5, within15,
+                splitVerdict(official.unit(), meanAbs), List.copyOf(rows));
+    }
+
+    /**
+     * 一句话配速差：{@code delta} 是「官方 − GPS」，正数表示官方更慢。
+     *
+     * <p>不足 1 秒直接说「基本一致」，避免把舍入噪声说成差异。
+     */
+    public static String splitDeltaText(double delta) {
+        if (Math.abs(delta) < 1d) {
+            return "基本一致";
         }
-        return new SplitCrossCheck(compared, meanAbs, PaceFormat.round(maxAbs, 1),
-                PaceFormat.round(maxAtKm, 2), verdict);
+        return (delta > 0 ? "官方慢 " : "官方快 ") + Math.round(Math.abs(delta)) + " 秒/公里";
+    }
+
+    private static String splitVerdict(String unit, double meanAbs) {
+        String suffix = OFFICIAL_UNIT_MILE.equals(unit) ? "（英里分段口径）" : "";
+        if (meanAbs <= 5d) {
+            return "GPS 分段与华为官方配速基本一致，轨迹可信" + suffix;
+        }
+        if (meanAbs <= 15d) {
+            return "GPS 分段与华为官方配速有少量差异，长距离或绕圈路段可能受信号影响" + suffix;
+        }
+        return "GPS 分段与华为官方配速差异较大，建议以厂商分段为准核对轨迹质量" + suffix;
+    }
+
+    /**
+     * 把 GPS 分段和厂商分段（公里口径）按段序号对齐比较，返回精简结论。
+     *
+     * @return 没有可比较的段时返回 null
+     * @see #officialComparison(RunSplits, OfficialSplits, double)
+     */
+    public SplitCrossCheck crossCheck(RunSplits gps, VendorSplits vendor) {
+        if (gps == null || vendor == null || !vendor.usable() || gps.splits().isEmpty()) {
+            return null;
+        }
+        List<OfficialSplit> splits = vendor.splits().stream()
+                .map(split -> new OfficialSplit(split.index(), OFFICIAL_UNIT_KM, split.fromKm(), split.toKm(),
+                        split.distanceKm(), split.durationSeconds(), split.paceSecondsPerKm(),
+                        split.paceText(), split.paceSecondsPerKm(), split.paceText(),
+                        split.partial(), split.pointIndex()))
+                .toList();
+        OfficialSplits official = new OfficialSplits(vendor.runId(), OFFICIAL_UNIT_KM, vendor.source(),
+                DEFAULT_SPLIT_METERS, vendor.totalKm(), splits, null, null,
+                vendor.avgPaceSecondsPerKm(), vendor.avgPaceText(),
+                vendor.avgPaceSecondsPerKm(), vendor.avgPaceText());
+        OfficialSplitComparison comparison = officialComparison(gps, official, 0.05d);
+        if (comparison == null) {
+            return null;
+        }
+        return new SplitCrossCheck(comparison.comparedSplits(), comparison.meanAbsDeltaSecondsPerKm(),
+                comparison.maxAbsDeltaSecondsPerKm(), comparison.maxDeltaAtKm(), comparison.verdict());
     }
 
     /**
