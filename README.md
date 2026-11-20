@@ -1,6 +1,6 @@
 # sport-health-mcp-server
 
-基于 Spring AI 的华为运动健康 **TCX** 数据 MCP 服务。把导出的跑步记录与穿戴数据变成 30 个可调用的 MCP 工具，让 Claude Code / Cursor 等客户端可以直接回答：
+基于 Spring AI 的华为运动健康 **TCX** 数据 MCP 服务。把导出的跑步记录与穿戴数据变成 31 个可调用的 MCP 工具，让 Claude Code / Cursor 等客户端可以直接回答：
 
 - 「我最近跑了哪些？」
 - 「这个月一共跑了多少公里？」
@@ -248,6 +248,7 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `get_sleep_detail` | `date?` `startDate?` `endDate?` `includeTimeline?` | 睡眠详情（一夜或最多 14 夜）。每夜给：合并后的分期时间线 `timeline`（深睡/浅睡/快速眼动/清醒，相邻同阶段已合并，`timelineSegments` 是真实段数）、每一次醒来的起止 `wakeEpisodes`、睡眠碎片 `fragments`（设备认定的连续睡眠块 `items` 与块间间隙 `gaps`，来自 `sample_sequence` type=700008）、各阶段时长与占比 `stages`、报告补充指标 `report`（平均心率/呼吸率/打鼾指数/上床·睡着·起床时刻）、入睡前的白天午睡 `daytimeNap`。`date` 与区间参数互斥；都不传取最新一夜。基础字段与 `get_sleep_summary` 完全一致（同一套算法），缺来源时 `stages`/`report` 为 `null`、`fragments.available=false`，并用 `coverage` 的 `stageNights`/`reportNights`/`fragmentNights` 说明（详见「睡眠口径」） |
 | `get_sleep_trend` | `startDate?` `endDate?` `groupBy?` `metric?` | 睡眠趋势：按 `week`（默认）或 `month` 切周期，每个周期给 `values`（平均睡着时长、评分、效率、HRV、醒来次数、深睡占比、潜伏期）与相对上一周期的 `deltas`，再用 `trend` 对 `metric` 指定的指标给结论（`slopePerPeriod`、`r2`、`direction`、`assessment`、`first`/`last`/`best`/`worst`）。`metric` 可选 `asleep`（默认）/`score`/`efficiency`/`hrv`/`wakeCount`/`deep`/`latency`；`groupBy=day` 会被拒（按天是 `get_sleep_summary` 的活）。只用完整周期拟合，被区间截断的首末周期标 `complete=false` 且不参与；`direction` 按区间累计变化判定，`assessment` 已折算好「越高越好/越低越好」。周粒度最多 78 个周期、月粒度 36 个（详见「睡眠口径」） |
 | `get_daily_vitals` | `startDate?` `endDate?` `groupBy?` | 每日体征：静息心率、HRV（RMSSD）、压力均值/峰值、最大摄氧量，以及全天自动心率的均值/最低/最高。`groupBy=day`（默认）逐日 `days`，`week`/`month` 按周期聚合 `periods`（首末被区间截断的周期标 `complete=false`）；都带 `coverage`（每个指标各自的有值天数）、`availability`（各指标在全库的可用范围）、`metrics`（区间均值/极值/最新值、28 天基线 `baseline`、相对基线的 `deltaVsBaseline`、首末 7 天对比 `change` 与 `direction`/`assessment`）、`heartRate` 与 `notes`。静息心率从 2025-11-08、HRV 与压力从 2026-06-12 才有，最大摄氧量只有 104 天且 2025-09 之后断档 14 个月；缺数据的指标是 `null`，整段没有时干脆不出现在 `metrics` 里（详见「体征口径」） |
+| `get_heart_rate_series` | `date?` `resolution?` | **单日**自动心率曲线（`health_metric` 的 `DYNAMIC_HEART_RATE`）：`stats`（采样点数、最低/平均/最高、首次与末次采样时刻、跨度、采样间隔中位数与最长空档）、`peak`/`lowest`（心率与时刻，外加 `sustainedMinutes` 连续维持时长）、按 `resolution`（`minute`/`5min`（默认）/`15min`/`hour`）聚合的 `buckets`、当天运动时段 `activities`、口径提示 `notes`。采样密度不是固定的：早期每分钟一条、近期静息 10 分钟一条、运动时加密，看 `medianGapMinutes` 而不是点数多少；单点极值可能只是翻身蹭到传感器（详见「心率曲线口径」） |
 | `get_weather_impact` | `startDate?` `endDate?` `minDistanceKm?` | 只读已回填的 `run_weather`，按起跑气温、湿度、风速、有无降水分组，返回每组次数、加权平均配速、相对整体基线的快慢秒数，以及气温与配速的 Pearson 相关系数。另带 `weatherCoverage`：区间内跑步总数、拿到天气的条数、缺失条数与原因拆分（`failed`/`unavailable`/`notFetched`）、覆盖率与一句结论。不联网，缺天气时提示调 `sync_weather` |
 | `sync_weather` | `retryFailed?` | 只补天气：为还没有天气的跑步记录联网抓取起跑/结束时刻的天气，**不重导数据、不重建快照**。返回本轮 `ok`/`unavailable`/`failed`/`noLocation`/`deferred` 条数、失败原因 `problems` 与同步后的整体覆盖率 `coverage`。`retryFailed` 默认 `true`，即忽略 `retry-failed-after-days` 冷却、立刻重试上次失败的记录；`sport.weather.enabled=false` 时返回 `DISABLED` |
 | `reload_data` | `weather?` | 增量同步：按 `(文件名, size, mtime, sha256)` 只解析变化的 TCX 与华为导出文件（JSON / xls / xlsx），无需重启。`weather` 默认 `true`，写完顺带补一轮天气；传 `false` 时整段同步不发起任何网络请求，天气留给 `sync_weather` |
@@ -329,6 +330,30 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
   `heartRate.highest` 只是采样峰值，不是实验室最大心率，别拿它做区间划分。
 - **默认区间是「数据最新一天往前 30 天」**，不是「今天往前 30 天」：库通常落后于当天，
   用今天会把尾巴留成空白。`groupBy=day` 最多 92 天，`week`/`month` 分别放宽到约 3 年 / 5 年。
+
+### 心率曲线口径
+
+`get_heart_rate_series` 读 `health_metric` 里 `metric_key='DYNAMIC_HEART_RATE'` 的 349 483 个采样点（368 天），
+和 `get_daily_vitals` 读的 `daily_vitals` 是同一份数据的两个粒度：
+
+- **两个工具的数字必须相等**：`stats.samples` 就是 `daily_vitals.heart_rate_samples`，`stats.min/max/average`
+  就是 `heartRate.lowest/highest/average`（实测逐日完全相同）。哪天对不上，就是派生表没重建。
+- **采样密度会变，点数少不等于没戴表**：2025-11~2026-06 那台设备每分钟一条（一天 1398~1439 点）；
+  换设备后静息时拉长到 10 分钟一条、运动时才加密回 1 分钟（一天 238~320 点）。
+  所以判断「那天戴没戴表」看 `stats.medianGapMinutes` 与 `firstSample`/`lastSample`，
+  不要看采样点数——同一个 `samples=250` 既可能是稀疏采样，也可能是只戴了半天。
+- **运动时段会明显加密**：跑步那一小时能有 50 条，是同一天其它小时的 5 倍；曲线上的高台基本都在这些时段。
+  `activities` 用 `run_activity` 的 `start_time`/`end_time` 标出时段，`notes` 会把「最高心率落在哪次运动里」写出来。
+- **单点极值不能直接当峰值**：`peak.sustainedMinutes` 是「围绕这一点、连续保持在 ±5 bpm 以内的分钟数」。
+  跑步顶上去的 153 会连着 4~20 分钟；翻身蹭到传感器的 94 只有孤立 1 分钟。`sustainedMinutes <= 1`
+  且不在任何运动时段内时，`notes` 会明说「更像噪声」。`lowest` 同理，只是低值段在睡眠期天然很长。
+- **空桶不补 `null`**：只输出有采样的时间桶。一天 288 个 5 分钟桶里可能只有 180 个有数据，
+  中间的缺口由 `maxGapMinutes` 与 `notes` 说明，避免曲线被一半的 `null` 撑散。
+- **只做单日**：多日概览是 `get_daily_vitals` 的职责（它已经给了每天的均值/最低/最高）。
+  在这里再开一个「多日 × 分桶」的口径，只会让两边对同一天的描述打架。
+- **时间是本地时间**：`start_time` 存的已是 `+08:00` 的墙上时间（`time_zone` 恒为 `+0800`），
+  不要再做时区换算。查询用 `start_time >= 当日 AND < 次日`，字符串字典序就是时间序。
+  `resolution=minute` 会返回当天全部原始点（密集日 1400+ 个桶、约 100 KB），只在需要逐分钟细节时用。
 
 ### list_runs 过滤与排序
 
@@ -764,7 +789,7 @@ SQLite（`spring-boot-starter-jdbc` + `org.xerial:sqlite-jdbc`，无 ORM）。
 JAVA_HOME=/path/to/jdk-21 mvn test
 ```
 
-共 **291** 个用例（原有 42 + 持久化 19 + 资源形态 2 + 天气 42 + 工具层天气 4 + P0 分析 17 + 自动同步 7 + 睡眠 23 + 体征 9 + 其余工具/参数校验用例）：
+共 **302** 个用例（原有 42 + 持久化 19 + 资源形态 2 + 天气 42 + 工具层天气 4 + P0 分析 17 + 自动同步 7 + 睡眠 23 + 体征 9 + 心率曲线 11 + 其余工具/参数校验用例）：
 
 - **真实数据**：测试固定读 `src/test/resources/tcx-dataset` 里的 5 个 TCX，而不是
   `src/main/resources/health-data`。生产目录会随导入继续增长（例如新加的骑行文件），
