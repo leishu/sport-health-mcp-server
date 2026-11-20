@@ -15,6 +15,8 @@ import org.example.sporthealth.domain.SleepDetailNight;
 import org.example.sporthealth.domain.SleepNight;
 import org.example.sporthealth.domain.SleepPeriod;
 import org.example.sporthealth.domain.SleepSummary;
+import org.example.sporthealth.domain.SleepTrendMetric;
+import org.example.sporthealth.domain.SleepTrendReport;
 import org.example.sporthealth.service.SleepAnalyticsService;
 import org.example.sporthealth.support.DateParser;
 import org.example.sporthealth.support.DateRange;
@@ -45,6 +47,23 @@ public class SleepHealthTools {
      * 再往上单次返回就会挤占对话上下文，那时该用 {@code get_sleep_summary} 先看趋势。
      */
     private static final int MAX_DETAIL_NIGHTS = 14;
+
+    /** 趋势的分组粒度：{@code day} 被刻意排除，那是 {@code get_sleep_summary} 的活。 */
+    private static final List<String> TREND_GROUPS = List.of("week", "month");
+
+    /** 趋势主指标的允许值，直接从枚举取，避免两处维护。 */
+    private static final List<String> TREND_METRIC_VALUES =
+            java.util.Arrays.stream(SleepTrendMetric.values()).map(SleepTrendMetric::key).toList();
+
+    /**
+     * 趋势一次最多返回多少个周期。
+     *
+     * <p>实测一个点（values + deltas 共 14 个数值）约 0.6 KB：周粒度 78 点约 46 KB、
+     * 月粒度 36 点约 21 KB。再长就该缩短区间——返回体先于结论挤爆上下文没有意义。
+     * 两个粒度分开定上限，是因为同样 40 KB 能装 6 年月数据、却只装得下 1.5 年周数据。
+     */
+    private static final int MAX_WEEK_POINTS = 78;
+    private static final int MAX_MONTH_POINTS = 36;
 
     private final SleepAnalyticsService sleep;
 
@@ -211,6 +230,106 @@ public class SleepHealthTools {
             notes.add("有夜晚的分期段数超过上限，timeline 被截断，请用 timelineSegments 判断真实段数。");
         }
         return notes;
+    }
+
+    /**
+     * 睡眠趋势：按周 / 月把区间切成连续周期，逐周期给指标并给出主指标的趋势结论。
+     *
+     * <p>与 {@code get_sleep_summary} 的分工：summary 回答「这几周各睡了多久」，
+     * 每个周期还可以带逐夜明细；trend 回答「是不是在变好」，只输出聚合点，
+     * 所以能覆盖更长区间（周粒度最多 {@value #MAX_WEEK_POINTS} 个周期，月粒度 {@value #MAX_MONTH_POINTS} 个）。
+     *
+     * <p>{@code groupBy=day} 在这里没有意义（那就是 summary 的逐夜输出），
+     * 传了会被拒绝而不是静默换成 week——否则「按天看趋势」的请求会拿到周数据。
+     */
+    @McpTool(name = "get_sleep_trend",
+            description = "睡眠趋势：按周（默认）或按月把区间切成连续的周期，每个周期给出平均睡着时长、评分、睡眠效率、"
+                    + "HRV、醒来次数、深睡占比、入睡潜伏期，以及与上一个周期相比的变化量；"
+                    + "再对指定指标给出趋势结论：首末变化、每周期线性斜率、方向、最好与最差的周期。"
+                    + "与 get_sleep_summary 的分工：summary 看某个周期内部（可带逐夜明细），"
+                    + "trend 看一串周期连起来的变化，只输出聚合点、可覆盖更长区间。"
+                    + "groupBy 只支持 week 与 month，按天请用 get_sleep_summary；"
+                    + "metric 可选 asleep（默认，睡着时长）/ score / efficiency / hrv / wakeCount / deep / latency。"
+                    + "trend.direction 是数值方向（up/down/flat），trend.assessment 是价值方向"
+                    + "（improving/worsening/flat）：醒来次数下降是 improving，不要只看 up/down。"
+                    + "趋势拟合只用完整周期：首末被查询区间截断的周期标 complete=false 且不参与斜率，"
+                    + "它们的平均值只覆盖部分天数，不能和中间周期直接比。"
+                    + "评分/HRV/入睡潜伏期只有 2026-06-13 之后才有，更早的周期这些字段是 null（缺数据不是 0）。"
+                    + "用于回答“我最近睡得有没有变好”“近三个月睡眠时长趋势”“深睡比例在下降吗”“醒来次数越来越多吗”。")
+    public Map<String, Object> getSleepTrend(
+            @McpToolParam(description = "开始日期，格式 yyyy-MM-dd，默认取睡眠数据最早一天", required = false) String startDate,
+            @McpToolParam(description = "结束日期，格式 yyyy-MM-dd，默认取睡眠数据最新一天", required = false) String endDate,
+            @McpToolParam(description = "分组粒度：week（默认）或 month；要按天看请用 get_sleep_summary",
+                    required = false) String groupBy,
+            @McpToolParam(description = "趋势主指标：asleep（默认，平均睡着时长）/ score / efficiency / hrv / "
+                    + "wakeCount / deep / latency", required = false) String metric) {
+        Map<String, Object> invalid = validateTrend(startDate, endDate, groupBy, metric);
+        if (invalid != null) {
+            return invalid;
+        }
+        String mode = normalizeTrendGroup(groupBy);
+        DateRange range = sleep.resolveRange(startDate, endDate);
+        SleepTrendReport report = sleep.trend(range, mode, SleepTrendMetric.parse(metric));
+        if (report.points().isEmpty()) {
+            return noData(range);
+        }
+        int limit = "month".equals(mode) ? MAX_MONTH_POINTS : MAX_WEEK_POINTS;
+        if (report.points().size() > limit) {
+            String hint = "month".equals(mode)
+                    ? "；已经是月粒度了，请缩短区间"
+                    : "，或改用 groupBy=month（月粒度可覆盖约 3 年）";
+            return invalidArgument("groupBy", groupBy,
+                    "按 " + mode + " 聚合会得到 " + report.points().size() + " 个周期，超过上限 "
+                            + limit + hint,
+                    TREND_GROUPS);
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "OK");
+        result.put("range", range.text());
+        result.put("groupBy", mode);
+        result.put("metric", report.trend() == null ? null : report.trend().metric());
+        result.put("periodCount", report.points().size());
+        result.put("points", report.points());
+        result.put("trend", report.trend());
+        result.put("overall", report.overall());
+        result.put("coverage", report.coverage());
+        if (!report.notes().isEmpty()) {
+            result.put("notes", report.notes());
+        }
+        return result;
+    }
+
+    /**
+     * 趋势的参数校验。
+     *
+     * <p>{@code groupBy} 不能沿用 {@link #validate} 的宽松口径：那边 {@code day} 是合法值，
+     * 这里 {@code day} 等于「退化成 summary」，属于用错了工具，必须明确报错。
+     */
+    private Map<String, Object> validateTrend(String startDate, String endDate, String groupBy, String metric) {
+        if (isPresent(groupBy) && normalizeTrendGroup(groupBy) == null) {
+            return invalidArgument("groupBy", groupBy,
+                    "趋势只支持按 week 或 month 聚合；按天看睡眠请用 get_sleep_summary（groupBy=day）",
+                    TREND_GROUPS);
+        }
+        if (isPresent(metric) && SleepTrendMetric.parse(metric) == null) {
+            return invalidArgument("metric", metric,
+                    "无法识别的趋势指标 \"" + metric + "\"；不传默认 asleep（平均睡着时长）",
+                    TREND_METRIC_VALUES);
+        }
+        return validate(startDate, endDate, null);
+    }
+
+    /**
+     * 趋势分组：不传按 {@code week}；认不出返回 {@code null} 由调用方报错。
+     * 与 {@link #normalizeGroup} 分开，是因为这里的合法集合只剩两个值。
+     */
+    private static String normalizeTrendGroup(String groupBy) {
+        if (!isPresent(groupBy)) {
+            return "week";
+        }
+        String key = groupBy.trim().toLowerCase(Locale.ROOT);
+        return "week".equals(key) || "month".equals(key) ? key : null;
     }
 
     /**

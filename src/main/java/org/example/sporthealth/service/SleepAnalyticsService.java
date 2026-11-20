@@ -6,6 +6,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
 import java.time.temporal.IsoFields;
 import java.time.temporal.TemporalAdjusters;
 import java.util.ArrayList;
@@ -31,6 +32,13 @@ import org.example.sporthealth.domain.SleepReportExtras;
 import org.example.sporthealth.domain.SleepStageSegment;
 import org.example.sporthealth.domain.SleepStageTotals;
 import org.example.sporthealth.domain.SleepSummary;
+import org.example.sporthealth.domain.SleepTrend;
+import org.example.sporthealth.domain.SleepTrendDeltas;
+import org.example.sporthealth.domain.SleepTrendMetric;
+import org.example.sporthealth.domain.SleepTrendPoint;
+import org.example.sporthealth.domain.SleepTrendReport;
+import org.example.sporthealth.domain.SleepTrendValue;
+import org.example.sporthealth.domain.SleepTrendValues;
 import org.example.sporthealth.repository.SleepStore;
 import org.example.sporthealth.support.DateParser;
 import org.example.sporthealth.support.DateRange;
@@ -693,6 +701,256 @@ public class SleepAnalyticsService {
         });
         periods.sort(Comparator.comparing(SleepPeriod::period));
         return periods;
+    }
+
+    /**
+     * 按周 / 月的趋势：逐周期的多指标序列 + 主指标的趋势结论。
+     *
+     * <p>与 {@link #periods(List, String)} 的区别在于「点」的含义：
+     * {@code periods} 的 {@code from}/{@code to} 是组内实际有数据的日期范围，
+     * 适合回答「这一周覆盖了哪几天」；趋势需要的是<b>周期本身的边界</b>，
+     * 才能判断某个周期有没有被查询区间截断（首末各半个周期会把平均值拉偏），
+     * 所以这里自己算周期边界，并给出 {@code complete} 与 {@code expectedNights}。
+     *
+     * <p>趋势只用「完整且该指标有值」的周期做最小二乘，避免被首末截断周期带偏；
+     * 完整周期不足 2 个时退回用全部有值的周期，并在 {@code notes} 里说明。
+     *
+     * @param groupBy {@code week} 或 {@code month}
+     * @param metric  主指标，{@code null} 按睡着时长
+     */
+    public SleepTrendReport trend(DateRange range, String groupBy, SleepTrendMetric metric) {
+        SleepTrendMetric target = metric == null ? SleepTrendMetric.ASLEEP : metric;
+        List<SleepNight> nights = nights(range);
+        SleepCoverage coverage = coverage(nights);
+        SleepSummary overall = summarize(nights);
+        if (nights.isEmpty()) {
+            return new SleepTrendReport(List.of(), null, overall, coverage,
+                    List.of("区间 " + range.text() + " 内没有睡眠记录，无法计算趋势。"));
+        }
+
+        Map<String, List<SleepNight>> buckets = new LinkedHashMap<>();
+        for (SleepNight night : nights) {
+            buckets.computeIfAbsent(bucketKey(night.date(), groupBy), key -> new ArrayList<>()).add(night);
+        }
+
+        List<SleepTrendPoint> built = new ArrayList<>(buckets.size());
+        buckets.forEach((period, group) -> {
+            LocalDate[] bounds = periodBounds(group.get(0).date(), groupBy);
+            SleepSummary summary = summarize(group);
+            built.add(new SleepTrendPoint(
+                    period,
+                    bounds[0],
+                    bounds[1],
+                    group.size(),
+                    overlapDays(bounds[0], bounds[1], range),
+                    !bounds[0].isBefore(range.from()) && !bounds[1].isAfter(range.to()),
+                    summary.avgAsleepText(),
+                    new SleepTrendValues(
+                            summary.avgAsleepMinutes(),
+                            summary.avgScore(),
+                            summary.avgEfficiencyPercent(),
+                            summary.avgHrvMs(),
+                            summary.avgWakeCount(),
+                            summary.avgDeepPercent(),
+                            summary.avgSleepLatencyMinutes()),
+                    SleepTrendDeltas.none(),
+                    summary.reportNights(),
+                    summary.spo2Nights()));
+        });
+        built.sort(Comparator.comparing(SleepTrendPoint::from));
+        List<SleepTrendPoint> points = withDeltas(built);
+
+        SleepTrend trend = trendOf(points, target);
+        return new SleepTrendReport(points, trend, overall, coverage,
+                trendNotes(points, trend, target));
+    }
+
+    /** 周期本身的首尾日期：周取周一~周日，月取 1 号~月末。 */
+    private static LocalDate[] periodBounds(LocalDate day, String groupBy) {
+        if ("month".equals(groupBy)) {
+            LocalDate start = day.withDayOfMonth(1);
+            return new LocalDate[] {start, start.withDayOfMonth(start.lengthOfMonth())};
+        }
+        LocalDate start = day.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY));
+        return new LocalDate[] {start, start.plusDays(6)};
+    }
+
+    /** 周期与查询区间重叠的天数。 */
+    private static int overlapDays(LocalDate periodStart, LocalDate periodEnd, DateRange range) {
+        LocalDate from = periodStart.isBefore(range.from()) ? range.from() : periodStart;
+        LocalDate to = periodEnd.isAfter(range.to()) ? range.to() : periodEnd;
+        return to.isBefore(from) ? 0 : (int) ChronoUnit.DAYS.between(from, to) + 1;
+    }
+
+    /** 给每个点补上「与上一个点」的差值（record 不可变，只能重建一遍）。 */
+    private static List<SleepTrendPoint> withDeltas(List<SleepTrendPoint> points) {
+        List<SleepTrendPoint> out = new ArrayList<>(points.size());
+        SleepTrendValues previous = null;
+        for (SleepTrendPoint point : points) {
+            out.add(new SleepTrendPoint(point.period(), point.from(), point.to(), point.nights(),
+                    point.expectedNights(), point.complete(), point.asleepText(), point.values(),
+                    deltas(point.values(), previous), point.reportedNights(), point.spo2Nights()));
+            previous = point.values();
+        }
+        return out;
+    }
+
+    private static SleepTrendDeltas deltas(SleepTrendValues current, SleepTrendValues previous) {
+        if (current == null || previous == null) {
+            return SleepTrendDeltas.none();
+        }
+        return new SleepTrendDeltas(
+                diffInt(current.asleepMinutes(), previous.asleepMinutes()),
+                diff(current.score(), previous.score()),
+                diff(current.efficiencyPercent(), previous.efficiencyPercent()),
+                diff(current.hrvMs(), previous.hrvMs()),
+                diff(current.wakeCount(), previous.wakeCount()),
+                diff(current.deepPercent(), previous.deepPercent()),
+                diff(current.latencyMinutes(), previous.latencyMinutes()));
+    }
+
+    private static Integer diffInt(Integer current, Integer previous) {
+        return current == null || previous == null ? null : current - previous;
+    }
+
+    private static Double diff(Double current, Double previous) {
+        return current == null || previous == null ? null : round(current - previous, 1);
+    }
+
+    /**
+     * 主指标的趋势：先挑参与拟合的周期，再拟合斜率、判方向、找最好最差。
+     *
+     * <p>排除两类周期：被查询区间截断的（{@code complete=false}），
+     * 以及该周期这个指标没有值的（2026-06 之前的评分、几乎全部血氧）。两者都不该算进斜率。
+     */
+    private static SleepTrend trendOf(List<SleepTrendPoint> points, SleepTrendMetric metric) {
+        List<SleepTrendPoint> complete = new ArrayList<>();
+        for (SleepTrendPoint point : points) {
+            if (point.complete() && metric.valueOf(point.values()) != null) {
+                complete.add(point);
+            }
+        }
+        boolean fallback = complete.size() < 2;
+        List<SleepTrendPoint> usable = fallback
+                ? points.stream().filter(point -> metric.valueOf(point.values()) != null).toList()
+                : complete;
+
+        List<SleepTrendValue> values = new ArrayList<>(usable.size());
+        for (SleepTrendPoint point : usable) {
+            values.add(new SleepTrendValue(point.period(), metric.valueOf(point.values())));
+        }
+        int excluded = points.size() - values.size();
+
+        if (values.isEmpty()) {
+            return new SleepTrend(metric.key(), metric.unit(), metric.higherIsBetter(), 0, points.size(),
+                    null, null, null, null, null, null, "unknown", "unknown", null, null,
+                    "leastSquaresOverCompletePeriods");
+        }
+        SleepTrendValue first = values.get(0);
+        SleepTrendValue last = values.get(values.size() - 1);
+        List<Double> ys = new ArrayList<>(values.size());
+        values.forEach(value -> ys.add(value.value()));
+
+        Fit fit = ys.size() < 2 ? null : fit(ys);
+        Double slope = fit == null ? null : round(fit.slope(), 2);
+        Double r2 = fit == null || fit.r2() == null ? null : round(fit.r2(), 2);
+        Double change = ys.size() < 2 ? null : round(last.value() - first.value(), 1);
+        Double changePercent = change == null || first.value() == 0d
+                ? null : round(change * 100d / Math.abs(first.value()), 1);
+
+        String direction = "unknown";
+        String assessment = "unknown";
+        if (fit != null) {
+            // 用「拟合出来的整个区间累计变化」判定，而不是每周期斜率：
+            // 月粒度 5 分钟/月=一年 60 分钟，按每周期比会把一整年的下滑说成平稳。
+            double fittedChange = fit.slope() * (ys.size() - 1);
+            direction = Math.abs(fittedChange) < metric.minMeaningfulChange()
+                    ? "flat" : (fit.slope() > 0 ? "up" : "down");
+            assessment = "flat".equals(direction) ? "flat"
+                    : ("up".equals(direction) == metric.higherIsBetter() ? "improving" : "worsening");
+        }
+
+        SleepTrendValue best = null;
+        SleepTrendValue worst = null;
+        for (SleepTrendValue value : values) {
+            if (best == null || (metric.higherIsBetter()
+                    ? value.value() > best.value() : value.value() < best.value())) {
+                best = value;
+            }
+            if (worst == null || (metric.higherIsBetter()
+                    ? value.value() < worst.value() : value.value() > worst.value())) {
+                worst = value;
+            }
+        }
+
+        return new SleepTrend(metric.key(), metric.unit(), metric.higherIsBetter(),
+                values.size(), excluded, first, last, change, changePercent, slope, r2,
+                direction, assessment, best, worst,
+                fallback ? "leastSquaresOverAvailablePeriods" : "leastSquaresOverCompletePeriods");
+    }
+
+    /** 一元线性拟合的结果；{@code r2} 在因变量完全无波动时为 {@code null}。 */
+    private record Fit(double slope, double intercept, Double r2) {
+    }
+
+    /** 最小二乘拟合，x 取 0..n-1（周期序号）。 */
+    private static Fit fit(List<Double> ys) {
+        int n = ys.size();
+        double meanX = (n - 1) / 2d;
+        double meanY = 0d;
+        for (Double y : ys) {
+            meanY += y;
+        }
+        meanY /= n;
+        double sxy = 0d;
+        double sxx = 0d;
+        double syy = 0d;
+        for (int i = 0; i < n; i++) {
+            double dx = i - meanX;
+            double dy = ys.get(i) - meanY;
+            sxy += dx * dy;
+            sxx += dx * dx;
+            syy += dy * dy;
+        }
+        if (sxx == 0d) {
+            return new Fit(0d, meanY, null);
+        }
+        double slope = sxy / sxx;
+        // 一元回归的 r² = sxy² / (sxx·syy)；所有 y 相同（syy=0）时线性模型无从解释，给 null
+        Double r2 = syy == 0d ? null : Math.min(1d, sxy * sxy / (sxx * syy));
+        return new Fit(slope, meanY - slope * meanX, r2);
+    }
+
+    private static List<String> trendNotes(List<SleepTrendPoint> points, SleepTrend trend,
+                                           SleepTrendMetric metric) {
+        if (trend == null) {
+            return List.of();
+        }
+        List<String> notes = new ArrayList<>(4);
+        if (trend.periodsExcluded() > 0) {
+            notes.add("有 " + trend.periodsExcluded() + " 个周期未参与拟合：首/末周期被查询区间截断"
+                    + "（complete=false），或这些周期在该指标上没有数据（评分/HRV/潜伏期只有 2026-06-13 之后才有）。");
+        }
+        if ("unknown".equals(trend.direction())) {
+            notes.add("可用于拟合的周期不足 2 个，slopePerPeriod 与 r2 为 null，趋势未判定。");
+        } else if ("flat".equals(trend.direction())) {
+            notes.add("拟合出的区间累计变化不足 " + plain(metric.minMeaningfulChange()) + " " + metric.unit()
+                    + "（该指标的最小有意义变化），判定为平稳。");
+        } else if (trend.r2() != null && trend.r2() < 0.3) {
+            notes.add("方向判为 " + trend.direction() + "，但 r2=" + trend.r2()
+                    + " 偏低：各周期之间的波动大于线性变化，别把这条拟合线当成稳定趋势。");
+        }
+        long truncated = points.stream().filter(point -> !point.complete()).count();
+        if (truncated > 0) {
+            notes.add("有 " + truncated + " 个周期被查询区间截断（complete=false）：from/to 仍是周期边界，"
+                    + "只统计落在区间内的天数。");
+        }
+        return notes;
+    }
+
+    /** {@code 5.0} 写成 {@code 5}，{@code 0.3} 保持 {@code 0.3}。 */
+    private static String plain(double value) {
+        return value == Math.rint(value) ? String.valueOf((long) value) : String.valueOf(value);
     }
 
     /**

@@ -246,6 +246,7 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `get_training_mix` | `startDate?` `endDate?` | 区间内的训练类型构成：各类型的次数、距离、距离占比，并逐条列出分类结果。逐条分类会按需解析轨迹，首次调用稍慢 |
 | `get_sleep_summary` | `startDate?` `endDate?` `groupBy?` | 睡眠汇总。`groupBy=day`（默认）返回逐夜 `nights`，`week`/`month` 返回按周期聚合的 `periods`；两者都带 `summary`（平均睡着/卧床/清醒时长、醒来次数、潜伏期、深睡与 REM 占比、评分、效率、HRV、血氧）与 `coverage`（`nights`/`sessionDays`/`reportDays`/`stageOnlyNights`/`scoredNights`/`spo2Nights`/`note`）。评分、效率、HRV、血氧只有 `sleep_report` 才有（2026-06-13 起），更早的夜晚是 `null` 而不是 0；血氧只有个别夜晚有值。醒来次数由分期里的连续清醒段推算（详见「睡眠口径」） |
 | `get_sleep_detail` | `date?` `startDate?` `endDate?` `includeTimeline?` | 睡眠详情（一夜或最多 14 夜）。每夜给：合并后的分期时间线 `timeline`（深睡/浅睡/快速眼动/清醒，相邻同阶段已合并，`timelineSegments` 是真实段数）、每一次醒来的起止 `wakeEpisodes`、睡眠碎片 `fragments`（设备认定的连续睡眠块 `items` 与块间间隙 `gaps`，来自 `sample_sequence` type=700008）、各阶段时长与占比 `stages`、报告补充指标 `report`（平均心率/呼吸率/打鼾指数/上床·睡着·起床时刻）、入睡前的白天午睡 `daytimeNap`。`date` 与区间参数互斥；都不传取最新一夜。基础字段与 `get_sleep_summary` 完全一致（同一套算法），缺来源时 `stages`/`report` 为 `null`、`fragments.available=false`，并用 `coverage` 的 `stageNights`/`reportNights`/`fragmentNights` 说明（详见「睡眠口径」） |
+| `get_sleep_trend` | `startDate?` `endDate?` `groupBy?` `metric?` | 睡眠趋势：按 `week`（默认）或 `month` 切周期，每个周期给 `values`（平均睡着时长、评分、效率、HRV、醒来次数、深睡占比、潜伏期）与相对上一周期的 `deltas`，再用 `trend` 对 `metric` 指定的指标给结论（`slopePerPeriod`、`r2`、`direction`、`assessment`、`first`/`last`/`best`/`worst`）。`metric` 可选 `asleep`（默认）/`score`/`efficiency`/`hrv`/`wakeCount`/`deep`/`latency`；`groupBy=day` 会被拒（按天是 `get_sleep_summary` 的活）。只用完整周期拟合，被区间截断的首末周期标 `complete=false` 且不参与；`direction` 按区间累计变化判定，`assessment` 已折算好「越高越好/越低越好」。周粒度最多 78 个周期、月粒度 36 个（详见「睡眠口径」） |
 | `get_weather_impact` | `startDate?` `endDate?` `minDistanceKm?` | 只读已回填的 `run_weather`，按起跑气温、湿度、风速、有无降水分组，返回每组次数、加权平均配速、相对整体基线的快慢秒数，以及气温与配速的 Pearson 相关系数。另带 `weatherCoverage`：区间内跑步总数、拿到天气的条数、缺失条数与原因拆分（`failed`/`unavailable`/`notFetched`）、覆盖率与一句结论。不联网，缺天气时提示调 `sync_weather` |
 | `sync_weather` | `retryFailed?` | 只补天气：为还没有天气的跑步记录联网抓取起跑/结束时刻的天气，**不重导数据、不重建快照**。返回本轮 `ok`/`unavailable`/`failed`/`noLocation`/`deferred` 条数、失败原因 `problems` 与同步后的整体覆盖率 `coverage`。`retryFailed` 默认 `true`，即忽略 `retry-failed-after-days` 冷却、立刻重试上次失败的记录；`sport.weather.enabled=false` 时返回 `DISABLED` |
 | `reload_data` | `weather?` | 增量同步：按 `(文件名, size, mtime, sha256)` 只解析变化的 TCX 与华为导出文件（JSON / xls / xlsx），无需重启。`weather` 默认 `true`，写完顺带补一轮天气；传 `false` 时整段同步不发起任何网络请求，天气留给 `sync_weather` |
@@ -283,7 +284,24 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 - **报告时刻**：`sleep_report` 不存时区，里面的 epoch 秒按 +08:00 还原成 `bedTime`/`fallAsleepTime`/`risingTime`；
   写成 `systemDefault()` 反而会在服务器跑在 UTC 时整体挪 8 小时。`deepPart`、`rdi`、`validData`、`*DayToBaseline`
   的单位与含义都没确认（`rdi` 全库恒为 0、`validData` 是浮点位模式），故不输出。
-- 详情一次最多 14 夜（带时间线约 3.3 KB/夜）：更长区间先用 `get_sleep_summary` 看趋势，再挑夜里细看。
+- 详情一次最多 14 夜（带时间线约 3.3 KB/夜）：更长区间先用 `get_sleep_trend` 或 `get_sleep_summary` 看变化，再挑夜里细看。
+
+**趋势的四处额外口径**（`get_sleep_trend`）：
+
+- **`complete` 与 `nights` 是两件事**：`complete=false` 表示这个周期被查询区间截断（区间从周三开始，那一周只剩 5 天），
+  此时 `expectedNights` 已按区间折算；`nights < expectedNights` 则是「区间覆盖了，但设备那几天没记录」。
+  把两者混起来，会把「没戴表」误读成「区间没覆盖」。
+- **只用完整周期拟合**：被截断的首末周期、以及该指标没有值的周期（2026-06-13 之前的评分/HRV/潜伏期）都排除，
+  `periodsUsed` / `periodsExcluded` 把这件事写在明面上；完整周期不足 2 个时退回用现有周期，`method` 会变成
+  `leastSquaresOverAvailablePeriods`、`direction` 为 `unknown`。
+- **方向按区间累计变化判，不按每周期斜率**：月粒度的 5 分钟/月等于一年 60 分钟，按每周期比会把一整年的下滑
+  说成「平稳」。实现上用 `slopePerPeriod × (n-1)` 与指标的最小有意义变化比较——睡着 5 分钟、评分 1 分、
+  效率 1%、HRV 2 ms、醒来 0.3 次、深睡 1%、潜伏期 3 分钟。
+- **`direction` 与 `assessment` 分开**：前者是数值方向（`up`/`down`/`flat`），后者是价值方向
+  （`improving`/`worsening`/`flat`）——醒来次数下降是 `improving`，调用方不必自己换算。
+  `r2` 说明这条拟合线有多可信，`r2` 偏低时 `notes` 会明确写「波动大于趋势，别当成稳定趋势」。
+- 周粒度最多 78 个周期（约 1.5 年、约 46 KB）、月粒度 36 个（约 3 年、约 21 KB），超出返回 `INVALID_ARGUMENT`
+  并提示缩短区间或换粒度；单个周期约 0.6 KB（`values` + `deltas` 共 14 个数值）。
 
 ### list_runs 过滤与排序
 
@@ -719,7 +737,7 @@ SQLite（`spring-boot-starter-jdbc` + `org.xerial:sqlite-jdbc`，无 ORM）。
 JAVA_HOME=/path/to/jdk-21 mvn test
 ```
 
-共 **274** 个用例（原有 42 + 持久化 19 + 资源形态 2 + 天气 42 + 工具层天气 4 + P0 分析 17 + 自动同步 7 + 睡眠 15 + 其余工具/参数校验用例）：
+共 **282** 个用例（原有 42 + 持久化 19 + 资源形态 2 + 天气 42 + 工具层天气 4 + P0 分析 17 + 自动同步 7 + 睡眠 23 + 其余工具/参数校验用例）：
 
 - **真实数据**：测试固定读 `src/test/resources/tcx-dataset` 里的 5 个 TCX，而不是
   `src/main/resources/health-data`。生产目录会随导入继续增长（例如新加的骑行文件），
