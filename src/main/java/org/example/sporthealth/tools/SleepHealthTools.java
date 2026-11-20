@@ -1,13 +1,17 @@
 package org.example.sporthealth.tools;
 
 import java.time.LocalDate;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 
 import lombok.extern.slf4j.Slf4j;
 import org.example.sporthealth.domain.SleepCoverage;
+import org.example.sporthealth.domain.SleepDetailNight;
 import org.example.sporthealth.domain.SleepNight;
 import org.example.sporthealth.domain.SleepPeriod;
 import org.example.sporthealth.domain.SleepSummary;
@@ -33,6 +37,14 @@ public class SleepHealthTools {
 
     /** {@code groupBy} 的允许值，用于 {@code INVALID_ARGUMENT} 的提示。 */
     private static final List<String> GROUP_VALUES = List.of("day", "week", "month");
+
+    /**
+     * 详情一次最多返回多少夜。
+     *
+     * <p>实测一夜带时间线约 3.3 KB、不带约 1.7 KB；14 夜就是 46 KB 上下，
+     * 再往上单次返回就会挤占对话上下文，那时该用 {@code get_sleep_summary} 先看趋势。
+     */
+    private static final int MAX_DETAIL_NIGHTS = 14;
 
     private final SleepAnalyticsService sleep;
 
@@ -93,6 +105,112 @@ public class SleepHealthTools {
         }
         result.put("summary", summary);
         return result;
+    }
+
+    /**
+     * 睡眠详情：一夜（或几夜）的时间线、醒来时刻、睡眠碎片与报告指标。
+     *
+     * <p>与 {@code get_sleep_summary} 的分工：summary 回答「最近睡得怎么样」，
+     * 只给每夜一行；detail 回答「这一夜到底怎么睡的」，把逐分钟的合并分期、
+     * 设备认定的碎片块、报告里的心率呼吸都摊开。两者共用同一套基础字段，
+     * 同一件事不会出现两个数字。
+     */
+    @McpTool(name = "get_sleep_detail",
+            description = "按夜晚查询睡眠详情：逐段睡眠时间线（深睡/浅睡/快速眼动/清醒，相邻同阶段已合并）、"
+                    + "每一次醒来的起止时刻、睡眠碎片（设备认定的连续睡眠块与块间间隙）、各阶段时长与占比，"
+                    + "以及报告里的评分/效率/HRV/血氧/心率/呼吸率，外加入睡前的白天午睡。"
+                    + "参数二选一：传 date 看某一夜（sleep_date 是醒来那天）；传 startDate/endDate 看区间，最多 14 夜；"
+                    + "都不传则取最新一夜。区间更大时改用 get_sleep_summary。"
+                    + "三份数据覆盖不同：分期覆盖全部历史，官方报告只有 2026-06-13 之后，"
+                    + "睡眠碎片只有 2026-06-12 之后——缺失时对应块是 null 或 available=false，不是 0，"
+                    + "先看 coverage.stageNights / reportNights / fragmentNights。"
+                    + "wakeEpisodes 与 wakeCount 是分期口径（连续清醒 ≥2 分钟才算一次），"
+                    + "fragments.gaps 是设备口径的间隙，两者可能差 1~2 分钟，属口径差异。"
+                    + "用于回答“我昨晚几点醒的”“深睡集中在哪个时段”“睡得多碎”“这段睡眠的一次完整周期长什么样”。")
+    public Map<String, Object> getSleepDetail(
+            @McpToolParam(description = "单夜日期，格式 yyyy-MM-dd，指醒来那天（如 2026-11-10 表示 11-09 夜里那一觉）",
+                    required = false) String date,
+            @McpToolParam(description = "区间开始日期 yyyy-MM-dd，与 endDate 搭配；不能与 date 同时使用",
+                    required = false) String startDate,
+            @McpToolParam(description = "区间结束日期 yyyy-MM-dd，区间最多 14 夜", required = false) String endDate,
+            @McpToolParam(description = "是否返回逐段的时间线，默认 true；false 时只给各阶段合计与段数",
+                    required = false) Boolean includeTimeline) {
+        Map<String, Object> invalid = validateDetail(date, startDate, endDate);
+        if (invalid != null) {
+            return invalid;
+        }
+        DateRange range = detailRange(date, startDate, endDate);
+        long nights = ChronoUnit.DAYS.between(range.from(), range.to()) + 1;
+        if (nights > MAX_DETAIL_NIGHTS) {
+            return invalidArgument("endDate", endDate,
+                    "详情最多支持 " + MAX_DETAIL_NIGHTS + " 个夜晚，当前区间 " + range.text()
+                            + " 共 " + nights + " 夜；更长区间请用 get_sleep_summary，或传 date 单夜查看",
+                    null);
+        }
+
+        boolean timeline = includeTimeline == null || includeTimeline;
+        List<SleepDetailNight> details = sleep.details(range, timeline);
+        if (details.isEmpty()) {
+            return noData(range);
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "OK");
+        result.put("range", range.text());
+        result.put("nights", details);
+        result.put("nightCount", details.size());
+        result.put("coverage", sleep.detailCoverage(details));
+        result.put("notes", detailNotes(details, timeline));
+        return result;
+    }
+
+    /**
+     * 详情的参数校验。{@code date} 与区间参数互斥：同时给时按谁都不对，直接报错而不是猜。
+     */
+    private Map<String, Object> validateDetail(String date, String startDate, String endDate) {
+        if (isPresent(date) && (isPresent(startDate) || isPresent(endDate))) {
+            return invalidArgument("date", date,
+                    "date 与 startDate/endDate 只能二选一：单夜用 date，区间用 startDate + endDate", null);
+        }
+        if (isPresent(date) && parseDateArg("date", date) == null) {
+            return invalidArgument("date", date,
+                    "无法解析日期 \"" + date + "\"，请使用 yyyy-MM-dd（sleep_date 是醒来那天）", null);
+        }
+        return validate(startDate, endDate, null);
+    }
+
+    /** 详情的时间区间：{@code date} 单夜；两端都不传时取最新一夜（不是全历史）。 */
+    private DateRange detailRange(String date, String startDate, String endDate) {
+        if (isPresent(date)) {
+            LocalDate day = DateParser.parseDate(date.trim());
+            return new DateRange(day, day);
+        }
+        if (!isPresent(startDate) && !isPresent(endDate)) {
+            Optional<DateRange> covered = sleep.coveredRange();
+            if (covered.isEmpty()) {
+                return new DateRange(LocalDate.now(), LocalDate.now());
+            }
+            LocalDate last = covered.get().to();
+            return new DateRange(last, last);
+        }
+        return sleep.resolveRange(startDate, endDate);
+    }
+
+    /** 给调用方看的读法提示：只在真的出现这类数据时才说，不制造噪音。 */
+    private static List<String> detailNotes(List<SleepDetailNight> details, boolean timeline) {
+        List<String> notes = new ArrayList<>(2);
+        if (!timeline) {
+            notes.add("includeTimeline=false，timeline 为空数组，但 timelineSegments 仍是真实段数。");
+        }
+        boolean fragments = details.stream().anyMatch(n -> n.fragments() != null && n.fragments().available());
+        if (fragments) {
+            notes.add("fragments.items 是设备认定的连续睡眠块，fragments.gaps 是块之间的间隙；"
+                    + "它与 wakeEpisodes（分期口径，连续清醒 ≥2 分钟才算一次）可能差 1~2 分钟，两者都给出、不取平均。");
+        }
+        if (details.stream().anyMatch(n -> n.timelineTruncated())) {
+            notes.add("有夜晚的分期段数超过上限，timeline 被截断，请用 timelineSegments 判断真实段数。");
+        }
+        return notes;
     }
 
     /**

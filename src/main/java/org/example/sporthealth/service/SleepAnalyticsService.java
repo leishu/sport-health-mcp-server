@@ -4,6 +4,7 @@ import java.time.DayOfWeek;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.IsoFields;
 import java.time.temporal.TemporalAdjusters;
@@ -19,10 +20,19 @@ import java.util.function.Function;
 
 import lombok.extern.slf4j.Slf4j;
 import org.example.sporthealth.domain.SleepCoverage;
+import org.example.sporthealth.domain.SleepDetailCoverage;
+import org.example.sporthealth.domain.SleepDetailNight;
+import org.example.sporthealth.domain.SleepFragments;
+import org.example.sporthealth.domain.SleepInterval;
+import org.example.sporthealth.domain.SleepNap;
 import org.example.sporthealth.domain.SleepNight;
 import org.example.sporthealth.domain.SleepPeriod;
+import org.example.sporthealth.domain.SleepReportExtras;
+import org.example.sporthealth.domain.SleepStageSegment;
+import org.example.sporthealth.domain.SleepStageTotals;
 import org.example.sporthealth.domain.SleepSummary;
 import org.example.sporthealth.repository.SleepStore;
+import org.example.sporthealth.support.DateParser;
 import org.example.sporthealth.support.DateRange;
 import org.example.sporthealth.support.DateRangeResolver;
 import org.example.sporthealth.support.SleepFormat;
@@ -65,6 +75,18 @@ public class SleepAnalyticsService {
     private static final double MAX_HRV_MS = 300d;
     /** 血氧的合理下界（%）；-1 与 0 都是「没测」。 */
     private static final double MIN_SPO2_PERCENT = 50d;
+
+    /** 时间线最多返回多少段（实测一夜合并后中位数 43 段、最多 75 段，240 只是防脏数据）。 */
+    private static final int MAX_TIMELINE_SEGMENTS = 240;
+
+    /**
+     * 报告里的 epoch 秒按设备时区还原成墙上时间。
+     *
+     * <p>{@code sleep_report} 没有存时区，全库 {@code sample_sequence.time_zone} 只有一个取值
+     * {@code +0800}，所以这里固定 +08:00；换成 {@code systemDefault()} 反而会在服务器跑在 UTC
+     * 时把所有报告时刻整体挪 8 小时。
+     */
+    private static final ZoneOffset ZONE_OFFSET = ZoneOffset.ofHours(8);
 
     /** 分期在 {@code health_metric.metric_key} 里的名字。 */
     private static final String DEEP_KEY = "PROFESSIONAL_SLEEP_DEEP";
@@ -264,6 +286,378 @@ public class SleepAnalyticsService {
     }
 
     /**
+     * 睡眠详情：在 {@link #nights(DateRange)} 的基础上补时间线、醒来时刻、碎片与报告细节。
+     *
+     * <p>基础字段直接复用 {@code nights()} 的结果，保证 detail 与 summary 的数字完全一致
+     * ——详情视图最忌讳「换个工具就换个算法」，那样两个答案都没人敢用。
+     *
+     * <p>三份原始数据各管一段，互不替代：
+     * <ul>
+     *   <li>{@code health_metric} 的分期（type=9）：时间线与阶段合计，覆盖全部历史；</li>
+     *   <li>{@code sleep_report}：评分/效率/HRV/血氧/心率/呼吸率，2026-06-13 起；</li>
+     *   <li>{@code sample_sequence} type=700008 的碎片：设备认定的连续睡眠块与块间间隙，2026-06-12 起。</li>
+     * </ul>
+     *
+     * @param includeTimeline 是否返回逐段的时间线（false 时 {@code timeline} 为空数组，段数照给）
+     */
+    public List<SleepDetailNight> details(DateRange range, boolean includeTimeline) {
+        List<SleepNight> base = nights(range);
+        if (base.isEmpty()) {
+            return List.of();
+        }
+        Map<LocalDate, SleepStore.ScoredReport> reports = pickOnePerDay(
+                store.scoredReports(range), SleepStore.ScoredReport::date,
+                report -> report.end() == null || report.start() == null ? 0
+                        : (int) Duration.between(report.start(), report.end()).toMinutes());
+        List<SleepStore.Span> wakeSpans = store.wakeSpans(range);
+        List<SleepStore.StageSpan> stageSpans = store.stageSpans(
+                range.from().minusDays(1).atStartOfDay(), range.to().plusDays(2).atStartOfDay());
+        List<SleepStore.FragmentSpan> fragments = store.fragments(range);
+        List<SleepStore.Span> noons = store.noonSpans(range);
+
+        List<SleepDetailNight> details = new ArrayList<>(base.size());
+        for (SleepNight night : base) {
+            LocalDateTime windowStart = DateParser.parseDateTime(night.bedtime());
+            LocalDateTime windowEnd = DateParser.parseDateTime(night.waketime());
+            List<SleepStore.StageSpan> stages = stagesWithin(stageSpans, windowStart, windowEnd);
+
+            List<SleepStageSegment> timeline = mergeStages(stages);
+            int segments = timeline.size();
+            boolean truncated = includeTimeline && segments > MAX_TIMELINE_SEGMENTS;
+            if (truncated) {
+                timeline = timeline.subList(0, MAX_TIMELINE_SEGMENTS);
+            }
+            if (!includeTimeline) {
+                timeline = List.of();
+            }
+
+            List<SleepStageSegment> episodes = new ArrayList<>();
+            for (SleepStore.Span episode : wakeEpisodes(wakeSpans, windowStart, windowEnd)) {
+                episodes.add(new SleepStageSegment("wake",
+                        SleepFormat.dateTime(episode.start()), SleepFormat.dateTime(episode.end()),
+                        episode.minutes()));
+            }
+
+            SleepFragments fragmentsBlock = fragmentsFor(
+                    fragmentsWithin(fragments, windowStart, windowEnd));
+
+            List<String> sources = new ArrayList<>(night.sources());
+            if (fragmentsBlock.available() && !sources.contains("fragments")) {
+                sources.add("fragments");
+            }
+
+            details.add(new SleepDetailNight(
+                    night.date(),
+                    night.bedtime(),
+                    night.waketime(),
+                    night.timeInBedMinutes(),
+                    night.asleepMinutes(),
+                    night.awakeMinutes(),
+                    night.wakeCount(),
+                    night.sleepLatencyMinutes(),
+                    night.efficiencyPercent(),
+                    night.score(),
+                    night.hrvMs(),
+                    night.spo2Percent(),
+                    stageTotals(stages, night.asleepMinutes()),
+                    timeline,
+                    segments,
+                    truncated,
+                    episodes,
+                    fragmentsBlock,
+                    reportExtras(reports.get(night.date())),
+                    napBefore(noons, windowStart),
+                    List.copyOf(sources)));
+        }
+        return details;
+    }
+
+    /** 详情的数据覆盖计数：哪些夜晚有时间线、哪些有报告、哪些有碎片。 */
+    public SleepDetailCoverage detailCoverage(List<SleepDetailNight> nights) {
+        int total = nights == null ? 0 : nights.size();
+        int withStages = 0;
+        int withReport = 0;
+        int withFragments = 0;
+        for (SleepDetailNight night : nights == null ? List.<SleepDetailNight>of() : nights) {
+            if (night.timelineSegments() > 0) {
+                withStages++;
+            }
+            if (night.report() != null) {
+                withReport++;
+            }
+            if (night.fragments() != null && night.fragments().available()) {
+                withFragments++;
+            }
+        }
+        List<String> parts = new ArrayList<>(2);
+        if (withReport < total) {
+            parts.add("其中 " + (total - withReport) + " 个夜晚没有官方报告（报告从 2026-06-13 起才有），"
+                    + "score/efficiency/hrv/spo2/sleepLatency 与 report 块是 null");
+        }
+        if (withFragments < total) {
+            parts.add("其中 " + (total - withFragments) + " 个夜晚没有睡眠碎片（碎片从 2026-06-12 起才有），"
+                    + "fragments.available 为 false");
+        }
+        return new SleepDetailCoverage(total, withStages, withReport, withFragments,
+                parts.isEmpty() ? null : String.join("；", parts) + "。");
+    }
+
+    /** 窗口内的分期段（窗口按 {@code start} 归属，避免前后夜互相吃段）。 */
+    private static List<SleepStore.StageSpan> stagesWithin(List<SleepStore.StageSpan> spans,
+                                                          LocalDateTime windowStart, LocalDateTime windowEnd) {
+        if (spans == null || spans.isEmpty() || windowStart == null || windowEnd == null) {
+            return List.of();
+        }
+        List<SleepStore.StageSpan> inside = new ArrayList<>();
+        for (SleepStore.StageSpan span : spans) {
+            if (!span.start().isBefore(windowStart) && !span.start().isAfter(windowEnd)) {
+                inside.add(span);
+            }
+        }
+        return inside;
+    }
+
+    /** 相邻同阶段的分钟合并成一段；分段太多时时间线没法看，也不方便 LLM 读。 */
+    private static List<SleepStageSegment> mergeStages(List<SleepStore.StageSpan> spans) {
+        List<SleepStageSegment> merged = new ArrayList<>();
+        String stage = null;
+        LocalDateTime start = null;
+        LocalDateTime end = null;
+        for (SleepStore.StageSpan span : spans) {
+            String name = stageName(span.key());
+            if (name == null) {
+                continue;
+            }
+            if (name.equals(stage) && end != null && end.equals(span.start())) {
+                end = span.end();
+                continue;
+            }
+            if (stage != null) {
+                merged.add(segment(stage, start, end));
+            }
+            stage = name;
+            start = span.start();
+            end = span.end();
+        }
+        if (stage != null) {
+            merged.add(segment(stage, start, end));
+        }
+        return merged;
+    }
+
+    private static SleepStageSegment segment(String stage, LocalDateTime start, LocalDateTime end) {
+        return new SleepStageSegment(stage, SleepFormat.dateTime(start), SleepFormat.dateTime(end),
+                (int) Math.max(0, Duration.between(start, end).toMinutes()));
+    }
+
+    /** {@code metric_key} 转成人看的阶段名；午睡等其他 key 返回 {@code null}。 */
+    private static String stageName(String key) {
+        if (key == null) {
+            return null;
+        }
+        return switch (key) {
+            case DEEP_KEY -> "deep";
+            case LIGHT_KEY -> "light";
+            case REM_KEY -> "rem";
+            case "PROFESSIONAL_SLEEP_WAKE" -> "wake";
+            default -> null;
+        };
+    }
+
+    /**
+     * 各阶段合计。百分比的分母是睡着时长（深 + 浅 + 快动），与报告的「睡眠效率」无关。
+     *
+     * <p>没有任何分期段时返回 {@code null}：宁可说没有，也不要给一排 0。
+     */
+    private static SleepStageTotals stageTotals(List<SleepStore.StageSpan> spans, int asleepMinutes) {
+        int deep = 0;
+        int light = 0;
+        int rem = 0;
+        int wake = 0;
+        boolean found = false;
+        for (SleepStore.StageSpan span : spans) {
+            String name = stageName(span.key());
+            if (name == null) {
+                continue;
+            }
+            found = true;
+            int minutes = (int) Math.max(0, Duration.between(span.start(), span.end()).toMinutes());
+            switch (name) {
+                case "deep" -> deep += minutes;
+                case "light" -> light += minutes;
+                case "rem" -> rem += minutes;
+                default -> wake += minutes;
+            }
+        }
+        if (!found) {
+            return null;
+        }
+        return new SleepStageTotals(deep, light, rem, wake,
+                percentOfSleep(deep, asleepMinutes),
+                percentOfSleep(light, asleepMinutes),
+                percentOfSleep(rem, asleepMinutes));
+    }
+
+    private static Double percentOfSleep(int minutes, int asleepMinutes) {
+        return asleepMinutes <= 0 ? null : round(minutes * 100d / asleepMinutes, 1);
+    }
+
+    /** 只留落在窗口内的碎片，并裁剪到窗口边界（碎片偶尔会比会话多出一两分钟）。 */
+    private static List<SleepStore.FragmentSpan> fragmentsWithin(List<SleepStore.FragmentSpan> all,
+                                                                LocalDateTime windowStart,
+                                                                LocalDateTime windowEnd) {
+        if (all == null || all.isEmpty() || windowStart == null || windowEnd == null) {
+            return List.of();
+        }
+        List<SleepStore.FragmentSpan> inside = new ArrayList<>();
+        for (SleepStore.FragmentSpan fragment : all) {
+            LocalDateTime start = fragment.start().isBefore(windowStart) ? windowStart : fragment.start();
+            LocalDateTime end = fragment.end().isAfter(windowEnd) ? windowEnd : fragment.end();
+            if (end.isAfter(start)) {
+                inside.add(new SleepStore.FragmentSpan(start, end));
+            }
+        }
+        inside.sort(Comparator.comparing(SleepStore.FragmentSpan::start));
+        return inside;
+    }
+
+    /**
+     * 碎片块 + 块间间隙。
+     *
+     * <p>{@code wakeGapCount} 用 ≥2 分钟的口径，才和 {@code wakeCount}（分期口径）可比；
+     * 两者在约 1/3 的夜晚会差 1 次，差的全是 1~2 分钟的空隙，属于口径差异而不是数据错误。
+     */
+    private static SleepFragments fragmentsFor(List<SleepStore.FragmentSpan> fragments) {
+        if (fragments == null || fragments.isEmpty()) {
+            return new SleepFragments(false, null, null, null, null, List.of(), List.of(), null, null,
+                    "该夜没有解码出睡眠碎片（这类数据从 2026-06-12 起才有），相关字段为 null 而不是 0。");
+        }
+        List<SleepInterval> items = new ArrayList<>(fragments.size());
+        int total = 0;
+        int longest = 0;
+        for (SleepStore.FragmentSpan fragment : fragments) {
+            int minutes = (int) Math.round(Duration.between(fragment.start(), fragment.end()).toSeconds() / 60d);
+            items.add(new SleepInterval(SleepFormat.dateTime(fragment.start()),
+                    SleepFormat.dateTime(fragment.end()), minutes));
+            total += minutes;
+            longest = Math.max(longest, minutes);
+        }
+
+        List<SleepInterval> gaps = new ArrayList<>();
+        int gapMinutes = 0;
+        int wakeGaps = 0;
+        for (int i = 0; i + 1 < fragments.size(); i++) {
+            LocalDateTime gapStart = fragments.get(i).end();
+            LocalDateTime gapEnd = fragments.get(i + 1).start();
+            if (!gapEnd.isAfter(gapStart)) {
+                continue;
+            }
+            int minutes = (int) Math.round(Duration.between(gapStart, gapEnd).toSeconds() / 60d);
+            gaps.add(new SleepInterval(SleepFormat.dateTime(gapStart), SleepFormat.dateTime(gapEnd), minutes));
+            gapMinutes += minutes;
+            if (minutes >= MIN_WAKE_EPISODE_MINUTES) {
+                wakeGaps++;
+            }
+        }
+        return new SleepFragments(true, items.size(), total, longest,
+                round(total / (double) items.size(), 1), items, gaps, gapMinutes, wakeGaps, null);
+    }
+
+    /**
+     * 入睡前的白天午睡。
+     *
+     * <p>三个条件缺一不可：结束时刻早于当晚入睡、距今不超过 24 小时、开始于 08:00~20:00。
+     * 最后一条是为了挡掉 {@code PROFESSIONAL_SLEEP_NOON} 里混进来的夜睡段
+     * （库里存在 01:00、23:00 起点的 NOON 段，那是夜睡被标错了）。
+     */
+    private static SleepNap napBefore(List<SleepStore.Span> noons, LocalDateTime windowStart) {
+        if (noons == null || noons.isEmpty() || windowStart == null) {
+            return null;
+        }
+        List<SleepInterval> segments = new ArrayList<>();
+        int total = 0;
+        LocalDate day = null;
+        for (SleepStore.Span span : mergeAdjacent(noons)) {
+            if (span.end().isAfter(windowStart)) {
+                continue;
+            }
+            if (Duration.between(span.end(), windowStart).toHours() >= 24) {
+                continue;
+            }
+            int hour = span.start().getHour();
+            if (hour < 8 || hour >= 20) {
+                continue;
+            }
+            int minutes = (int) Math.round(Duration.between(span.start(), span.end()).toSeconds() / 60d);
+            if (minutes <= 0) {
+                continue;
+            }
+            segments.add(new SleepInterval(SleepFormat.dateTime(span.start()),
+                    SleepFormat.dateTime(span.end()), minutes));
+            total += minutes;
+            if (day == null) {
+                day = span.start().toLocalDate();
+            }
+        }
+        return segments.isEmpty() ? null : new SleepNap(day, total, segments);
+    }
+
+    /**
+     * 把首尾相接的段粘起来。
+     *
+     * <p>分期与午睡都是逐分钟写的，不粘的话一次午睡会输出三十多个「1 分钟」，
+     * 既看不出睡了多久，也白白撑大返回体。
+     */
+    private static List<SleepStore.Span> mergeAdjacent(List<SleepStore.Span> spans) {
+        List<SleepStore.Span> merged = new ArrayList<>();
+        for (SleepStore.Span span : spans) {
+            SleepStore.Span last = merged.isEmpty() ? null : merged.get(merged.size() - 1);
+            if (last != null && !span.start().isAfter(last.end())) {
+                if (span.end().isAfter(last.end())) {
+                    merged.set(merged.size() - 1, new SleepStore.Span(last.start(), span.end()));
+                }
+                continue;
+            }
+            merged.add(span);
+        }
+        return merged;
+    }
+
+    /** 报告的补充指标；没有报告时返回 {@code null}（整块都没有，而不是一堆 null 字段）。 */
+    private static SleepReportExtras reportExtras(SleepStore.ScoredReport report) {
+        if (report == null) {
+            return null;
+        }
+        return new SleepReportExtras(
+                heartRate(report.avgHeartRate()),
+                breathRate(report.avgBreathRate()),
+                roundOrNull(report.snoreFreq()),
+                epochText(report.bedTimeEpochSeconds()),
+                epochText(report.fallAsleepEpochSeconds()),
+                epochText(report.risingEpochSeconds()));
+    }
+
+    private static Double heartRate(Double value) {
+        return value == null || value < 25 || value > 200 ? null : value;
+    }
+
+    private static Double breathRate(Double value) {
+        return value == null || value < 4 || value > 40 ? null : value;
+    }
+
+    private static Double roundOrNull(Double value) {
+        return value == null ? null : round(value, 1);
+    }
+
+    /** epoch 秒转成 {@code yyyy-MM-dd HH:mm:ss}（本地时间），0 与空当作没记。 */
+    private static String epochText(Long epochSeconds) {
+        if (epochSeconds == null || epochSeconds <= 0) {
+            return null;
+        }
+        return SleepFormat.dateTime(java.time.LocalDateTime.ofEpochSecond(epochSeconds, 0, ZONE_OFFSET));
+    }
+
+    /**
      * 按周 / 月聚合。
      *
      * @param groupBy {@code week} 或 {@code month}；{@code day} 由调用方直接用 {@link #nights(DateRange)}
@@ -327,17 +721,16 @@ public class SleepAnalyticsService {
     }
 
     /**
-     * 从一个睡眠窗口里挑出清醒段，粘成「醒来」次数。
+     * 从窗口里挑出清醒段，粘成「醒来」的每一段。
      *
      * <p>贴着头、尾的两段既不算次数也不算清醒时长：会话是从第一段分期（可能就是清醒）开始记录的，
      * 开头那段是躺下没睡着的时间（<b>就是报告的入睡潜伏期</b>），结尾那段是起床前的清醒。
-     * 所以这里的 {@code awakeMinutes} 是 WASO 口径（睡着之后的清醒），
-     * 与卧床时长之间还差「潜伏期 + 起床前清醒」。
+     * 所以这里返回的是 WASO 口径（睡着之后的清醒）。
      */
-    private static WakeStats wakeStats(List<SleepStore.Span> spans, LocalDateTime windowStart,
-                                       LocalDateTime windowEnd) {
+    private static List<SleepStore.Span> wakeEpisodes(List<SleepStore.Span> spans, LocalDateTime windowStart,
+                                                      LocalDateTime windowEnd) {
         if (spans == null || spans.isEmpty() || windowStart == null || windowEnd == null) {
-            return new WakeStats(0, 0);
+            return List.of();
         }
         List<SleepStore.Span> inside = new ArrayList<>();
         int index = lowerBound(spans, windowStart);
@@ -349,36 +742,44 @@ public class SleepAnalyticsService {
             index++;
         }
         if (inside.isEmpty()) {
-            return new WakeStats(0, 0);
+            return List.of();
         }
 
         // 相邻的清醒段粘成一次醒来
-        List<LocalDateTime[]> episodes = new ArrayList<>();
+        List<SleepStore.Span> episodes = new ArrayList<>();
         for (SleepStore.Span span : inside) {
-            LocalDateTime[] last = episodes.isEmpty() ? null : episodes.get(episodes.size() - 1);
+            SleepStore.Span last = episodes.isEmpty() ? null : episodes.get(episodes.size() - 1);
             boolean merge = last != null
-                    && Duration.between(last[1], span.start()).toMinutes() <= WAKE_MERGE_GAP_MINUTES;
+                    && Duration.between(last.end(), span.start()).toMinutes() <= WAKE_MERGE_GAP_MINUTES;
             if (merge) {
-                last[1] = span.end();
+                episodes.set(episodes.size() - 1, new SleepStore.Span(last.start(), span.end()));
             } else {
-                episodes.add(new LocalDateTime[] {span.start(), span.end()});
+                episodes.add(span);
             }
         }
 
-        int awakeMinutes = 0;
-        int count = 0;
+        List<SleepStore.Span> result = new ArrayList<>(episodes.size());
         for (int i = 0; i < episodes.size(); i++) {
-            LocalDateTime start = episodes.get(i)[0];
-            LocalDateTime end = episodes.get(i)[1];
-            boolean touchesStart = i == 0 && !start.isAfter(windowStart);
-            boolean touchesEnd = i == episodes.size() - 1 && !end.isBefore(windowEnd);
+            SleepStore.Span episode = episodes.get(i);
+            boolean touchesStart = i == 0 && !episode.start().isAfter(windowStart);
+            boolean touchesEnd = i == episodes.size() - 1 && !episode.end().isBefore(windowEnd);
             if (touchesStart || touchesEnd) {
                 continue;
             }
-            long minutes = Duration.between(start, end).toMinutes();
-            awakeMinutes += (int) minutes;
-            // 1 分钟的清醒更像翻身级别的短暂觉醒，不单独算一次「醒来」
-            if (minutes >= MIN_WAKE_EPISODE_MINUTES) {
+            result.add(episode);
+        }
+        return result;
+    }
+
+    /** 醒来统计：总清醒分钟 + 醒来次数（≥2 分钟才算一次，1 分钟的更像翻身）。 */
+    private static WakeStats wakeStats(List<SleepStore.Span> spans, LocalDateTime windowStart,
+                                       LocalDateTime windowEnd) {
+        List<SleepStore.Span> episodes = wakeEpisodes(spans, windowStart, windowEnd);
+        int awakeMinutes = 0;
+        int count = 0;
+        for (SleepStore.Span episode : episodes) {
+            awakeMinutes += episode.minutes();
+            if (Duration.between(episode.start(), episode.end()).toMinutes() >= MIN_WAKE_EPISODE_MINUTES) {
                 count++;
             }
         }

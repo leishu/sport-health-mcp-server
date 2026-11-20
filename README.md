@@ -245,6 +245,7 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `classify_run` | `runId` | 识别训练类型：轻松跑、长距离跑、节奏跑、间歇/变速跑、比赛/测试跑、恢复跑。基于距离、时长、配速相对个人中位数与分段波动，并用平均心率所在区间（Z1~Z5）交叉验证，返回判定依据、心率区间与置信度（无 GPS 时降为 LOW） |
 | `get_training_mix` | `startDate?` `endDate?` | 区间内的训练类型构成：各类型的次数、距离、距离占比，并逐条列出分类结果。逐条分类会按需解析轨迹，首次调用稍慢 |
 | `get_sleep_summary` | `startDate?` `endDate?` `groupBy?` | 睡眠汇总。`groupBy=day`（默认）返回逐夜 `nights`，`week`/`month` 返回按周期聚合的 `periods`；两者都带 `summary`（平均睡着/卧床/清醒时长、醒来次数、潜伏期、深睡与 REM 占比、评分、效率、HRV、血氧）与 `coverage`（`nights`/`sessionDays`/`reportDays`/`stageOnlyNights`/`scoredNights`/`spo2Nights`/`note`）。评分、效率、HRV、血氧只有 `sleep_report` 才有（2026-06-13 起），更早的夜晚是 `null` 而不是 0；血氧只有个别夜晚有值。醒来次数由分期里的连续清醒段推算（详见「睡眠口径」） |
+| `get_sleep_detail` | `date?` `startDate?` `endDate?` `includeTimeline?` | 睡眠详情（一夜或最多 14 夜）。每夜给：合并后的分期时间线 `timeline`（深睡/浅睡/快速眼动/清醒，相邻同阶段已合并，`timelineSegments` 是真实段数）、每一次醒来的起止 `wakeEpisodes`、睡眠碎片 `fragments`（设备认定的连续睡眠块 `items` 与块间间隙 `gaps`，来自 `sample_sequence` type=700008）、各阶段时长与占比 `stages`、报告补充指标 `report`（平均心率/呼吸率/打鼾指数/上床·睡着·起床时刻）、入睡前的白天午睡 `daytimeNap`。`date` 与区间参数互斥；都不传取最新一夜。基础字段与 `get_sleep_summary` 完全一致（同一套算法），缺来源时 `stages`/`report` 为 `null`、`fragments.available=false`，并用 `coverage` 的 `stageNights`/`reportNights`/`fragmentNights` 说明（详见「睡眠口径」） |
 | `get_weather_impact` | `startDate?` `endDate?` `minDistanceKm?` | 只读已回填的 `run_weather`，按起跑气温、湿度、风速、有无降水分组，返回每组次数、加权平均配速、相对整体基线的快慢秒数，以及气温与配速的 Pearson 相关系数。另带 `weatherCoverage`：区间内跑步总数、拿到天气的条数、缺失条数与原因拆分（`failed`/`unavailable`/`notFetched`）、覆盖率与一句结论。不联网，缺天气时提示调 `sync_weather` |
 | `sync_weather` | `retryFailed?` | 只补天气：为还没有天气的跑步记录联网抓取起跑/结束时刻的天气，**不重导数据、不重建快照**。返回本轮 `ok`/`unavailable`/`failed`/`noLocation`/`deferred` 条数、失败原因 `problems` 与同步后的整体覆盖率 `coverage`。`retryFailed` 默认 `true`，即忽略 `retry-failed-after-days` 冷却、立刻重试上次失败的记录；`sport.weather.enabled=false` 时返回 `DISABLED` |
 | `reload_data` | `weather?` | 增量同步：按 `(文件名, size, mtime, sha256)` 只解析变化的 TCX 与华为导出文件（JSON / xls / xlsx），无需重启。`weather` 默认 `true`，写完顺带补一轮天气；传 `false` 时整段同步不发起任何网络请求，天气留给 `sync_weather` |
@@ -264,7 +265,25 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
   差额是潜伏期与起床前清醒；有报告的夜晚这个差额与 `sleepLatencyMinutes` 对得上。
 - **午睡不纳入**：华为把午睡单独标成 `PROFESSIONAL_SLEEP_NOON`，还经常和夜睡粘成一段，
   混进夜睡会让「睡了多久」凭空变大，所以只报夜睡（06-17 这类「夜睡被标成 NAP 会话」的夜晚改用报告窗口重新框分期）。
+  详情里的 `daytimeNap` 是例外：只取「结束早于当晚入睡、距今 24 小时内、08:00~20:00 开始」的段，
+  窗口外的直接丢（库里确实存在 01:00、23:00 起点的 NOON 段，那是夜睡被标错了），相邻段合并后再给时长。
 - 默认区间取**睡眠数据自身**的覆盖范围，不是跑步数据的（睡眠比跑步早开始几个月）。
+
+**详情的三处额外口径**（`get_sleep_detail`）：
+
+- **睡眠碎片**（`sample_sequence` type=700008）：`detail_data` 是华为私有二进制——开头 4 字节版本号 1、
+  接着「名字长度 + `sleep_fragment`」、最后 16 字节里的前 8 字节是两个小端 uint32 的 epoch 秒（碎片起止），
+  尾部 8 字节未解读；749 条记录长度全是 72 字节。解码做三重校验（块名、起止为正、结束落在记录时刻 ±24 小时内），
+  不满足就当没有数据。碎片是**设备眼中的连续睡眠块**，块与块之间的 `gaps` 才是设备口径的清醒；
+  它与 `wakeEpisodes`（分期口径）在约 1/3 的夜晚差 1 次，差的全是 1~2 分钟的空隙，两份都给出、不取平均。
+  碎片只有 2026-06-12 之后的 152 天有，更早的夜晚 `fragments.available=false`。
+- **时间线**：`health_metric` 是逐分钟写一行，直接输出一夜会有近 500 行；`timeline` 把相邻同阶段合并
+  （实测中位数 43 段、最多 75 段），上限 240 段，超过时 `timelineTruncated=true` 且 `timelineSegments` 仍是真实段数。
+  `stages.wakeMinutes` 含入睡前那段，所以会比 `awakeMinutes`（WASO）大，差额就是潜伏期加起床前清醒。
+- **报告时刻**：`sleep_report` 不存时区，里面的 epoch 秒按 +08:00 还原成 `bedTime`/`fallAsleepTime`/`risingTime`；
+  写成 `systemDefault()` 反而会在服务器跑在 UTC 时整体挪 8 小时。`deepPart`、`rdi`、`validData`、`*DayToBaseline`
+  的单位与含义都没确认（`rdi` 全库恒为 0、`validData` 是浮点位模式），故不输出。
+- 详情一次最多 14 夜（带时间线约 3.3 KB/夜）：更长区间先用 `get_sleep_summary` 看趋势，再挑夜里细看。
 
 ### list_runs 过滤与排序
 
@@ -389,7 +408,7 @@ TCX 文件只在**内容变化**时被解析一次，结果写进 SQLite；之�
 | `health_metric` | 华为健康明细，一行一个采样点：动态心率、睡眠分期、体重、血氧、压力… |
 | `activity_minute` | 华为每分钟运动数据：步数、距离、热量、站立 |
 | `health_metric_type` | 指标字典，把 `type_code + metric_key` 翻成中文名与口径 |
-| `sample_sequence` | 华为「Sample sequence data」原始记录：HRV RRI、心律失常、睡眠报告、ECG 波形等；`summary/detail/extend` 三段原文完整保留 |
+| `sample_sequence` | 华为「Sample sequence data」原始记录：HRV RRI、心律失常、睡眠报告、睡眠碎片（type=700008，二进制 `detail_data`）、ECG 波形等；`summary/detail/extend` 三段原文完整保留 |
 | `excel_sheet` | Excel 工作表清单与清洗后的表头（SportsHealth xls + HUAWEI_Research xlsx） |
 | `excel_sheet_row` | Excel 原始数据行，一行一个非空行，空单元格不写入 JSON |
 | `body_measurement` | 一次称重一行：体重、体脂率、BMI、骨骼肌量…（由 `health_metric` 派生） |
@@ -700,7 +719,7 @@ SQLite（`spring-boot-starter-jdbc` + `org.xerial:sqlite-jdbc`，无 ORM）。
 JAVA_HOME=/path/to/jdk-21 mvn test
 ```
 
-共 **133** 个用例（原有 42 + 持久化 19 + 资源形态 2 + 天气 42 + 工具层天气 4 + P0 分析 17 + 自动同步 7）：
+共 **274** 个用例（原有 42 + 持久化 19 + 资源形态 2 + 天气 42 + 工具层天气 4 + P0 分析 17 + 自动同步 7 + 睡眠 15 + 其余工具/参数校验用例）：
 
 - **真实数据**：测试固定读 `src/test/resources/tcx-dataset` 里的 5 个 TCX，而不是
   `src/main/resources/health-data`。生产目录会随导入继续增长（例如新加的骑行文件），
@@ -712,6 +731,11 @@ JAVA_HOME=/path/to/jdk-21 mvn test
 - **工具层**：quality 块结构、任意 `distancesKm` 的目标距离最佳（含 `best10k`/`bestHalf` 命名与不可用距离），
   华为官方分段与 GPS 分段的交叉校验（`get_official_splits` 另有独立用例：km/mile 两套口径、
   `p-m`/`b-p-m` 扁平写法兜底、区间覆盖率与差值统计），以及 `get_run_route` 两种格式的海拔小数精度。
+- **睡眠**（`SleepHealthToolsTest` / `SleepDetailToolsTest`，真实 SQLite 临时库）：两套来源合并成一夜一行、
+  哨兵值（`255` / `-1` / `score=0` 的午睡行）折成 `null`、覆盖计数、醒来次数去掉首尾两段且 ≥2 分钟才计数；
+  详情侧另测相邻同阶段合并、碎片二进制解码（块名不符的块必须拒读、时间戳与记录时刻相差过大也拒读）、
+  块间间隙与 `wakeGapCount`、午睡的时段筛选与相邻段合并、`includeTimeline=false` 仍返回真实段数、
+  详情与汇总同一夜晚数字一致、`date` 与区间互斥以及 14 夜上限。
 - **访问日志**：每次调用前后各一条，START 带工具名与入参、END 带 `status` 与耗时，两条用 `callId` 关联；异常时 END 按 `ERROR` 记录并重新抛出。
 - **内联 XML 边界用例**：一个 Lap 多个 Track、缺 `Lap@StartTime` 时用 `Activity/Id` 兜底、
   部分 Lap 缺 `TotalTimeSeconds`、缺 `Time`/非法数字/缺经纬度进入 warnings、
