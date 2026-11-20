@@ -1,6 +1,6 @@
 # sport-health-mcp-server
 
-基于 Spring AI 的华为运动健康 **TCX** 数据 MCP 服务。把导出的跑步记录与穿戴数据变成 35 个可调用的 MCP 工具，让 Claude Code / Cursor 等客户端可以直接回答：
+基于 Spring AI 的华为运动健康 **TCX** 数据 MCP 服务。把导出的跑步记录与穿戴数据变成 37 个可调用的 MCP 工具，让 Claude Code / Cursor 等客户端可以直接回答：
 
 - 「我最近跑了哪些？」
 - 「这个月一共跑了多少公里？」
@@ -9,6 +9,7 @@
 - 「这次每公里配速多少，有没有跑崩？」
 - 「这次里最快的 1 公里 / 5 公里是多少？」
 - 「这周比上周多跑了多少？」
+- 「最近每天走了多少步，活动量够不够？」
 - 「这次中途停了几次？」
 - 「把 11-01 的轨迹按 200 个点分页给我。」
 - 「我现在的水平全马能跑多少？」
@@ -249,6 +250,8 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `get_sleep_trend` | `startDate?` `endDate?` `groupBy?` `metric?` | 睡眠趋势：按 `week`（默认）或 `month` 切周期，每个周期给 `values`（平均睡着时长、评分、效率、HRV、醒来次数、深睡占比、潜伏期）与相对上一周期的 `deltas`，再用 `trend` 对 `metric` 指定的指标给结论（`slopePerPeriod`、`r2`、`direction`、`assessment`、`first`/`last`/`best`/`worst`）。`metric` 可选 `asleep`（默认）/`score`/`efficiency`/`hrv`/`wakeCount`/`deep`/`latency`；`groupBy=day` 会被拒（按天是 `get_sleep_summary` 的活）。只用完整周期拟合，被区间截断的首末周期标 `complete=false` 且不参与；`direction` 按区间累计变化判定，`assessment` 已折算好「越高越好/越低越好」。周粒度最多 78 个周期、月粒度 36 个（详见「睡眠口径」） |
 | `get_daily_vitals` | `startDate?` `endDate?` `groupBy?` | 每日体征：静息心率、HRV（RMSSD）、压力均值/峰值、最大摄氧量，以及全天自动心率的均值/最低/最高。`groupBy=day`（默认）逐日 `days`，`week`/`month` 按周期聚合 `periods`（首末被区间截断的周期标 `complete=false`）；都带 `coverage`（每个指标各自的有值天数）、`availability`（各指标在全库的可用范围）、`metrics`（区间均值/极值/最新值、28 天基线 `baseline`、相对基线的 `deltaVsBaseline`、首末 7 天对比 `change` 与 `direction`/`assessment`）、`heartRate` 与 `notes`。静息心率从 2025-11-08、HRV 与压力从 2026-06-12 才有，最大摄氧量只有 104 天且 2025-09 之后断档 14 个月；缺数据的指标是 `null`，整段没有时干脆不出现在 `metrics` 里（详见「体征口径」） |
 | `get_hrv_trend` | `startDate?` `endDate?` `period?` `includeNights?` | 心率变异性（RMSSD，毫秒）的长期趋势，`period` 取 `week`（默认）/`month`。**口径是睡眠 HRV**：每晚取睡眠会话窗口内所有样本的均值，按起床日归属。返回周期均值/最低/最高、`direction`（数值涨跌）、`assessment`（好坏，HRV 升 = improving）、`slopePerPeriod`、`r2`、首末 `change`，以及逐夜明细（`includeNights=false` 可关）。**不要拿 `get_daily_vitals` 的 `hrv` 来校验** —— 那是日历日全天均值，日间样本多时高出 15~20 ms（详见「HRV 口径」） |
+| `get_daily_activity` | `startDate?` `endDate?` `groupBy?` | 日常活动量：每天步数（含走路 / 跑步拆分）、距离、**活动热量**、中高强度分钟、**站立次数**。`groupBy=day`（默认）逐日 `days`，`week`/`month` 按周期聚合 `periods`（首末截断的周期标 `complete=false`）；都带 `coverage`（`recordedDays`/`missingDays`/`sparseDays`）、`summary`（合计、日均、**中位数**、最高/最低的一天、久坐日数）、`goals`（步数 8000 / 中高强度 30 分钟 / 站立 12 次三个日目标的达成天数 + 末尾 7 天中高强度合计是否够 WHO 每周 150 分钟，含 `weeklyActiveMinutesDays` 说明窗口够不够 7 天）、`trends`（最近 7 天 vs 前 7 天的日均变化）与 `notes`。日均只按有记录的天算；站立是**事件条数**不是分钟数（详见「日常活动口径」） |
+| `get_activity_minutes` | `date?` `type?` | **单日**分钟级明细：每一分钟的运动类型（走路 / 跑步 / 站立事件）、这一分钟的步数、距离、活动热量、是否中高强度、来源设备。`type` 取 `activity`（默认，不含站立事件）/`all`/`walk`/`run`/`stand`。除 `minutes`（逐分钟）外还给 `types`（各类型多少分钟/步数/距离/热量）、`blocks`（同类型且前后相差 ≤2 分钟拼成一段，如「06:02~07:04 跑步 62 分钟」）与 `summary`（当天合计，与 `get_daily_activity` 同源、同一天必须相等）。同一分钟被两台设备各记一条时只留步数大的那条，`summary.rawRows - summary.records` 就是合并掉的条数（详见「分钟级口径」） |
 | `get_stress_series` | `date?` `resolution?` | **单日**压力曲线（华为压力分 0~100）：样本数、最低/平均/最高、首末测量时刻、采样间隔中位数、按 `resolution`（`30min`/`hour` 默认）分桶的曲线、各档位样本数、最高与最低那一次测量。压力是约 30 分钟一次的离散测量；**最低分恒为 15 是算法下限**，全库最大值只有 53，`high` 档永远不会出现（详见「压力与血氧口径」）。多日压力水平用 `get_daily_vitals` |
 | `get_blood_oxygen` | `startDate?` `endDate?` | 血氧饱和度（SpO₂）的**记录与覆盖**：按天汇总（样本数、最低/平均/最高、低于 95% 的条数）、明细样本、设备下发的低氧提醒（阈值 90%）。**刻意不给趋势** —— 全库只有 12 天有数据（2026-06-12~17 与 2026-08-03~08），之后设备再没上报；两段之间隔一个半月，拟合出的任何斜率都只是「有没有开连续血氧」。没有记录 ≠ 血氧正常 |
 | `get_heart_rate_series` | `date?` `resolution?` | **单日**自动心率曲线（`health_metric` 的 `DYNAMIC_HEART_RATE`）：`stats`（采样点数、最低/平均/最高、首次与末次采样时刻、跨度、采样间隔中位数与最长空档）、`peak`/`lowest`（心率与时刻，外加 `sustainedMinutes` 连续维持时长）、按 `resolution`（`minute`/`5min`（默认）/`15min`/`hour`）聚合的 `buckets`、当天运动时段 `activities`、口径提示 `notes`。采样密度不是固定的：早期每分钟一条、近期静息 10 分钟一条、运动时加密，看 `medianGapMinutes` 而不是点数多少；单点极值可能只是翻身蹭到传感器（详见「心率曲线口径」） |
@@ -308,6 +311,61 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
   `r2` 说明这条拟合线有多可信，`r2` 偏低时 `notes` 会明确写「波动大于趋势，别当成稳定趋势」。
 - 周粒度最多 78 个周期（约 1.5 年、约 46 KB）、月粒度 36 个（约 3 年、约 21 KB），超出返回 `INVALID_ARGUMENT`
   并提示缩短区间或换粒度；单个周期约 0.6 KB（`values` + `deltas` 共 14 个数值）。
+
+### 日常活动口径
+
+`get_daily_activity` 只读 `daily_activity`（368 天，2025-11-08 ~ 2026-11-10），它由 `activity_minute`
+（每分钟运动数据，7 万行）按天聚合而来，和 `daily_vitals` 不同，**没有指标级稀疏问题**：只要有分钟记录，
+这一天就有行。所以这里只区分「整天没记录」(`missingDays`) 与「记录过少」(`sparseDays`)。
+
+- **站立是事件条数，不是分钟数**。华为把站立记成整点的 `sportType=13` 事件（`duration` 恒为 0），
+  一天 3~22 条，对应 App 里的「站立 18/12 次」。v9 之前这里求的是 `is_stand=1` 的分钟数之和，
+  因为时长恒为 0，得到的其实是「走路分钟里被标了站立的那些」，全库均值只有 2.0；
+  v9 迁移改成 `stand_events` = 事件条数（全库 5 222 条 / 368 天，均值 14.2）。
+- **热量是活动热量**：`activity_minute.calorie`（卡 ÷ 1000）逐分钟求和，跑步约 11 kcal/min、
+  走路约 2.9 kcal/min，**不含基础代谢**，不等于「今天一共消耗多少千卡」。
+- **同一分钟只算一次**（v10）。`activity_minute` 的主键是 `(start_time, sport_type)`，看着一分钟一行，
+  实际全库 2 208 个分钟存了两条 —— **无一例外是两台设备同时记的同一分钟**（第三台设备还把走路报成
+  `sport_type=2`，另两台报 5）。v10 之前逐行相加，步数虚高 3.45%（2026-06-14 那天多算 20%），
+  现在按「步数最大的那条」去重后再聚合；`walkSteps` 把 2 与 5 都算走路，只认 5 会让换设备后的
+  14.4 万步凭空消失。中高强度取两台设备的**并集**（该列大量 NULL，NULL 是「没上报」不是「否」）。
+- **目标值是外生的**：步数 8 000/天（华为默认，不是流传更广的 10 000）、中高强度 30 分钟/天
+  （WHO 每周 150 分钟摊到七天）、站立 12 次/天（华为站立目标）。工具不猜目标，也不从数据里反推。
+- **所有均值只在有记录的天上算**（分母是 `summary.days`），缺的天不是 0。
+  `averageSteps` 与 `medianSteps` 并列：步数分布很偏，一次 3.5 万步的长距离就能把日均拉高两千步。
+  `lowActivityDays`（< 5 000 步的久坐日）**已排除 `sparseDays`**，否则「导出那天只记了 69 步」
+  会被当成久坐。
+- **周线锚在末尾 7 天**，不是自然周：`weeklyActiveMinutes` 是区间最后一个有记录的日子往前 7 天的
+  中高强度合计，只有 `weeklyActiveMinutesDays = 7` 时 `weeklyActiveMinutesMet` 才能当结论看
+  —— 否则「查单日得到 40 分钟未达标」这种话没有意义。
+- **趋势是最近 7 天 vs 前 7 天的日均**，方向按 ±5% 判：步数逐日波动主要来自「今天有没有跑步」，
+  日粒度看趋势只会得到锯齿。任一侧没有记录时 `direction=unknown`（看不出，不是没变化）。
+- **默认区间是「数据最新一天往前 30 天」**；`groupBy=day` 最多 92 天，`week`/`month` 放宽到约 3 年 / 5 年。
+  周期边界自己算（周一到周日 / 1 号到月末），被区间截断的首末周期标 `complete=false`。
+
+### 分钟级口径
+
+`get_activity_minutes` 只读 `activity_minute`（70 521 行 / 368 天，正常一天 120~500 条），
+回答的是「这一天每一分钟在做什么」，和 `get_daily_activity` 的多天视角互补。
+
+- **一条记录 ≈ 一分钟**，`start_time` 是本地墙上时间（+08:00）、秒恒为 0，所以返回值里的
+  `time`/`endTime` 只到 `HH:mm`。没有跨零点的记录：凌晨活动落在当天的 `00:xx`。
+- **运动类型只有三个码**：4 = 跑步、5 = 走路、13 = 站立事件；`2` 是第三台设备对走路的上报码，
+  归一成 `walk`。`types[].sportTypes` 会把归到同一类型的原始码列出来。
+- **同一分钟只留一条**（2 208 个分钟原本有两条，全是跨设备重复），按「步数 → 距离 → 热量」降序挑；
+  中高强度取并集。被合并的条数就是 `summary.rawRows - summary.records`，
+  `minutes[].sourceRows = 2` 标出具体是哪一分钟。
+- **站立事件不是「站了 N 分钟」**：`sport_type=13` 是整点触发的标记（`duration=0`、0 步），
+  所以默认 `type=activity` 不把它混进分钟列表，只在 `summary.standEvents` 与 `types` 里出现。
+  要单看就 `type=stand`。注意 `is_stand` 列**不是**站立事件（634 条走路、91 条跑步也被标了），
+  不能用它替代。
+- **`blocks` 允许 ≤2 分钟空档**：手表会漏记个别分钟，严格相邻会把一次跑步拆成七八段；
+  空档不计入 `minutes`，所以 `summary.activityMinutes` 可能小于 `from`~`to` 的跨度。
+- **默认日期是「数据最新一天」，不是今天**；导出当天（2026-11-10）只有 6 条记录，
+  `sparse=true` 并用 `notes` 提示别把 69 步当成整天。
+- **日合计与 `get_daily_activity` 同源**（同一份去重后的分钟），同一天的
+  `summary.steps` / `distanceKm` / `caloriesKcal` / `activeMinutes` / `standEvents` / `records`
+  必须逐项相等 —— 对不上说明派生表没重建。
 
 ### 体征口径
 
@@ -542,14 +600,14 @@ TCX 文件只在**内容变化**时被解析一次，结果写进 SQLite；之�
 | `source_file` | 来源文件指纹：`size`、`modified_millis`、`content_hash`，增量同步的比对基准 |
 | `run_weather` | 每次跑步的起跑 / 结束两个时刻的天气，主键 `run_id`，由 open-meteo 回填 |
 | `health_metric` | 华为健康明细，一行一个采样点：动态心率、睡眠分期、体重、血氧、压力… |
-| `activity_minute` | 华为每分钟运动数据：步数、距离、热量、站立 |
+| `activity_minute` | 华为每分钟运动数据：步数、距离、热量、站立（`sportType` 4=跑步 / 5=走路 / 13=站立 / 2=其它） |
 | `health_metric_type` | 指标字典，把 `type_code + metric_key` 翻成中文名与口径 |
 | `sample_sequence` | 华为「Sample sequence data」原始记录：HRV RRI、心律失常、睡眠报告、睡眠碎片（type=700008，二进制 `detail_data`）、ECG 波形等；`summary/detail/extend` 三段原文完整保留 |
 | `excel_sheet` | Excel 工作表清单与清洗后的表头（SportsHealth xls + HUAWEI_Research xlsx） |
 | `excel_sheet_row` | Excel 原始数据行，一行一个非空行，空单元格不写入 JSON |
 | `body_measurement` | 一次称重一行：体重、体脂率、BMI、骨骼肌量…（由 `health_metric` 派生） |
 | `sleep_session` | 一次睡眠或午睡一行：入/离床时刻、深睡 / 浅睡 / REM / 清醒分钟（派生） |
-| `daily_activity` | 一天一行：步数（含走路 / 跑步拆分）、距离、热量、中高强度分钟（派生） |
+| `daily_activity` | 一天一行：步数（含走路 / 跑步拆分）、距离、活动热量、中高强度分钟、站立次数（派生） |
 | `daily_vitals` | 一天一行：静息心率、HRV、动态心率区间、压力、最大摄氧量（派生） |
 | `sleep_report` | 夜间睡眠报告：评分、效率、平均心率 / HRV / 血氧、呼吸紊乱指数（派生自 `sample_sequence`） |
 | `ecg_record` | ECG 记录元数据（派生自 `sample_sequence`，波形仍在原始表） |
@@ -828,6 +886,15 @@ domain/RunClassification        # 单次训练类型识别结果
 domain/TrainingMix              # 区间训练类型构成
 domain/WeatherImpact            # 天气影响分组结果
 domain/RunningDynamics          # 单次跑姿/步幅汇总；DynamicsSegment 分段、RunningDynamicsDetail 详情、DynamicsSummary 区间统计
+
+tools/ActivityHealthTools       # get_daily_activity：daily_activity 一天一行（步数/距离/活动热量/中高强度/站立次数）
+        ├── service/DailyActivityService + repository/DailyActivityStore
+        └── get_activity_minutes：activity_minute 一分钟一行（类型/步数/距离/热量）→ service/ActivityMinuteService
+            + repository/ActivityMinuteStore（MERGED_MINUTE_SQL 同时被派生表复用）
+tools/VitalsHealthTools         # get_daily_vitals + get_body_composition：daily_vitals / body_measurement
+tools/WellnessTools             # get_hrv_trend / get_stress_series / get_blood_oxygen：health_metric 的稀疏单点
+tools/SleepHealthTools          # get_sleep_summary / get_sleep_trend / get_sleep_detail：sleep_session / sleep_report / sample_sequence
+tools/HeartRateHealthTools      # get_heart_rate_series：单日动态心率曲线（health_metric 逐分钟采样）
 ```
 
 - **启动阶段**：只建表，不解析。首次访问（或 `reload_data`）触发增量同步，然后把全部摘要装进内存快照。
@@ -855,7 +922,7 @@ SQLite（`spring-boot-starter-jdbc` + `org.xerial:sqlite-jdbc`，无 ORM）。
 JAVA_HOME=/path/to/jdk-21 mvn test
 ```
 
-共 **333** 个用例（原有 42 + 持久化 19 + 资源形态 2 + 天气 42 + 工具层天气 4 + P0 分析 17 + 自动同步 7 + 睡眠 23 + 体征 9 + 心率曲线 11 + 体成分 13 + HRV/压力/血氧 18 + 其余工具/参数校验用例）：
+共 **351** 个用例（原有 42 + 持久化 19 + 资源形态 2 + 天气 42 + 工具层天气 4 + P0 分析 17 + 自动同步 7 + 睡眠 23 + 体征 9 + 心率曲线 11 + 体成分 13 + HRV/压力/血氧 18 + 日常活动 9 + 分钟明细 8 + 其余工具/参数校验用例）：
 
 - **真实数据**：测试固定读 `src/test/resources/tcx-dataset` 里的 5 个 TCX，而不是
   `src/main/resources/health-data`。生产目录会随导入继续增长（例如新加的骑行文件），

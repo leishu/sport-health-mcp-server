@@ -55,7 +55,7 @@ import org.springframework.stereotype.Component;
 public class SqliteSchema {
 
     /** 当前结构版本，改动 {@link #MIGRATIONS} 时同步递增。 */
-    static final int SCHEMA_VERSION = 8;
+    static final int SCHEMA_VERSION = 10;
 
     /** 索引 {@code i} 对应从版本 {@code i} 升级到 {@code i + 1} 的脚本。 */
     private static final List<String> MIGRATIONS = List.of("""
@@ -562,7 +562,36 @@ public class SqliteSchema {
 
             DELETE FROM source_file
              WHERE kind = 'huawei' AND source_file LIKE 'motion path detail data%'
-            """);
+            """,
+            """
+            -- v9：daily_activity 的「站立」换成事件条数。
+            -- 原来的 stand_minutes 求的是 is_stand=1 的分钟数之和，可华为把站立记成
+            -- sportType=13 的整点事件（duration 恒为 0），COALESCE(duration_minutes,1) 于是
+            -- 一分也算不到 —— 全库 368 天里 stand_minutes 最大只有 8、均值 2.0，
+            -- 而同一份数据里 sport_type=13 每天 3~22 条。华为的站立目标是「12 次/小时」，
+            -- 所以换成 stand_events = 当天站立事件条数，量纲才对得上。
+            ALTER TABLE daily_activity DROP COLUMN stand_minutes;
+            ALTER TABLE daily_activity ADD COLUMN stand_events INTEGER NOT NULL DEFAULT 0;
+            UPDATE daily_activity
+               SET stand_events = COALESCE((
+                       SELECT COUNT(*)
+                         FROM activity_minute m
+                        WHERE m.sport_type = 13
+                          AND substr(CAST(m.record_day AS TEXT), 1, 4) || '-' ||
+                              substr(CAST(m.record_day AS TEXT), 5, 2) || '-' ||
+                              substr(CAST(m.record_day AS TEXT), 7, 2) = daily_activity.activity_date), 0);
+            """,
+            """
+            -- v10：daily_activity 改成「同一分钟只算一次」。
+            -- activity_minute 的主键是 (start_time, sport_type)，看起来一分钟一行，实际全库有
+            -- 2 208 个分钟存了两条 —— 无一例外是两台设备同时记的同一分钟（第三台设备还把走路
+            -- 报成 sport_type=2、另两台报 5）。逐行相加让步数虚高 3.45%、距离与热量虚高约 3%，
+            -- 2026-06-14 那天甚至多算 5 080 步（20%）。
+            -- 派生表整表重算最省事：清空后按去重口径重插，SQL 直接复用 DerivedTables 里的常量，
+            -- 避免两处口径漂移。回填必须写在这里 —— DerivedTables.rebuild() 只在「重导过文件」
+            -- 或「表为空」时触发，升级后不重导文件就不会重建。
+            DELETE FROM daily_activity;
+            """ + DerivedTables.DAILY_ACTIVITY_SQL);
 
     private final JdbcClient jdbc;
     private final DataSource dataSource;
@@ -621,13 +650,17 @@ public class SqliteSchema {
      * <p>{@code table ... already exists} 同理：v3 迁移里 {@code CREATE TABLE} 出现在
      * {@code ALTER TABLE} 之前，万一在两者之间失败，重跑时建表语句已经成功过。
      * 若不放行，升级会卡在「表已存在」上，只能删库重建——那是不可接受的数据损失。
+     *
+     * <p>{@code no such column} 是 v9 的 {@code DROP COLUMN} 需要的：那条迁移先删列再建列，
+     * 若删列成功后紧接着失败，重跑时列已经不存在，不该因此把整个升级卡死。
      */
     private static void execute(Statement statement, String sql) throws SQLException {
         try {
             statement.executeUpdate(sql);
         } catch (SQLException e) {
             String message = e.getMessage() == null ? "" : e.getMessage();
-            if (message.contains("duplicate column name") || message.contains("already exists")) {
+            if (message.contains("duplicate column name") || message.contains("already exists")
+                    || message.contains("no such column")) {
                 log.debug("结构已存在，跳过: {}", sql);
                 return;
             }

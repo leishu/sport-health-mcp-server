@@ -141,10 +141,39 @@ class DerivedTablesTest {
         assertEquals(500, ((Number) day.get("distance_meters")).intValue());
         assertEquals(18.5, ((Number) day.get("calories_kcal")).doubleValue(), 0.001);
         assertEquals(2, ((Number) day.get("active_minutes")).intValue());
-        assertEquals(2, ((Number) day.get("stand_minutes")).intValue());
+        // 站立只数 sportType=13 的事件条数：这条种子里只有 1 条，走路/跑步那两条的 is_stand
+        // 不再参与计数（v9 之前按分钟求和，真实数据里时长恒为 0，算出来是 2.0 的假数）
+        assertEquals(1, ((Number) day.get("stand_events")).intValue());
         assertEquals("2026-11-09T08:00", day.get("first_minute"));
         assertEquals("2026-11-09T18:01", day.get("last_minute"));
         assertEquals(3, ((Number) day.get("minute_rows")).intValue());
+    }
+
+    @Test
+    void dedupesSameMinuteRecordedByTwoDevices() {
+        // 同一分钟被两台设备各记一条：手表记成 sportType=5（120 步），手机记成 2（130 步）。
+        // 逐行相加会算成 250 步，去重后只留步数大的那条。
+        minute(20261109, "2026-11-09T06:02", "2026-11-09T06:03", 5, 120, 100, 5.0, 1, 0);
+        minute(20261109, "2026-11-09T06:02", "2026-11-09T06:03", 2, 130, 110, 5.5, 1, 0);
+        // 站立事件是整点独立事件，会和同一分钟的走路撞上，不能跟着走路一起被去重掉
+        minute(20261109, "2026-11-09T07:00", "2026-11-09T07:01", 13, 0, 0, 0.0, 0, 1);
+        minute(20261109, "2026-11-09T07:00", "2026-11-09T07:01", 5, 90, 60, 3.0, 0, 0);
+
+        derived.rebuild();
+
+        Map<String, Object> day = row("SELECT * FROM daily_activity WHERE activity_date = '2026-11-09'");
+        assertEquals(220, ((Number) day.get("steps")).intValue());
+        // sportType 2 与 5 都是走路：只认 5 会让换设备之后的走路步数凭空消失
+        assertEquals(220, ((Number) day.get("walk_steps")).intValue());
+        assertEquals(0, ((Number) day.get("run_steps")).intValue());
+        assertEquals(170, ((Number) day.get("distance_meters")).intValue());
+        assertEquals(8.5, ((Number) day.get("calories_kcal")).doubleValue(), 0.001);
+        assertEquals(1, ((Number) day.get("active_minutes")).intValue());
+        assertEquals(1, ((Number) day.get("stand_events")).intValue());
+        // 4 条原始记录 → 3 条：06:02 合并成一条，07:00 的站立与走路各留一条
+        assertEquals(3, ((Number) day.get("minute_rows")).intValue());
+        assertEquals("2026-11-09T06:02", day.get("first_minute"));
+        assertEquals("2026-11-09T07:01", day.get("last_minute"));
     }
 
     @Test

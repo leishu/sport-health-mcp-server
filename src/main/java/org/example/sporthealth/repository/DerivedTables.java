@@ -169,34 +169,43 @@ public class DerivedTables {
      * <p>{@code record_day} 在导出里是整数（20261109），这里还原成 {@code YYYY-MM-DD}，
      * 好和 {@code run_activity.run_date}、{@code daily_vitals.heart_date} 直接 join。
      *
-     * <p>同一分钟可能同时存在「走路」与「跑步」两条（约 2,200 组），所以按天汇总的
-     * {@code steps} 会比华为 App 自报的略高，而 {@code walk_steps} / {@code run_steps}
-     * 分列出来，需要严格口径时只取其中一类。
+     * <p><b>按去重后的分钟汇总</b>（{@link ActivityMinuteStore#MERGED_MINUTE_SQL}）：同一分钟被两台
+     * 设备各记一条时只算一次。v10 之前是直接把 {@code activity_minute} 的每一行相加，
+     * 2 208 个「一分钟两条」的分钟因此被算了双份，全库步数虚高 3.45%、距离与热量虚高约 3%，
+     * 个别日子（2026-06-14）甚至虚高 20%。站立事件不参与去重，见 {@code stand_events}。
+     *
+     * <p>{@code walk_steps} 把 {@code sportType} 2 和 5 都算作走路：第三台设备把走路报成 2，
+     * 另两台报 5，只认 5 会让换设备之后的走路步数凭空消失（全库 14.4 万步）。
+     *
+     * <p>{@code stand_events} 数的是 {@code sportType=13} 的记录条数，不是时长：
+     * 华为把站立记成整点事件（{@code duration=0}），一天 3~22 条，对应 App 里的「站立 N/12 次」。
+     * 早期版本在这里求 {@code is_stand=1} 的分钟数之和，因为时长恒为 0，得到的其实是
+     * 「走路分钟里被标了站立的那些」，全库均值只有 2.0 —— v9 已改成事件条数。
      */
-    private static final String DAILY_ACTIVITY_SQL = """
+    static final String DAILY_ACTIVITY_SQL = """
             INSERT INTO daily_activity (
                 activity_date, steps, walk_steps, run_steps, distance_meters, calories_kcal,
-                active_minutes, stand_minutes, first_minute, last_minute, minute_rows
+                active_minutes, stand_events, first_minute, last_minute, minute_rows
             )
-            SELECT substr(d, 1, 4) || '-' || substr(d, 5, 2) || '-' || substr(d, 7, 2) AS activity_date,
+            WITH merged AS (%s)
+            SELECT substr(CAST(record_day AS TEXT), 1, 4) || '-' ||
+                   substr(CAST(record_day AS TEXT), 5, 2) || '-' ||
+                   substr(CAST(record_day AS TEXT), 7, 2)                       AS activity_date,
                    COALESCE(SUM(steps), 0)                                             AS steps,
-                   COALESCE(SUM(CASE WHEN sport_type = 5 THEN steps ELSE 0 END), 0)    AS walk_steps,
+                   COALESCE(SUM(CASE WHEN sport_type IN (2, 5) THEN steps ELSE 0 END), 0)
+                                                                                       AS walk_steps,
                    COALESCE(SUM(CASE WHEN sport_type = 4 THEN steps ELSE 0 END), 0)    AS run_steps,
                    ROUND(COALESCE(SUM(distance_meters), 0), 1)                         AS distance_meters,
                    ROUND(COALESCE(SUM(calories_kcal), 0), 1)                           AS calories_kcal,
                    COALESCE(SUM(CASE WHEN is_intensity = 1 THEN COALESCE(duration_minutes, 1) ELSE 0 END), 0)
                                                                                        AS active_minutes,
-                   COALESCE(SUM(CASE WHEN is_stand = 1 THEN COALESCE(duration_minutes, 1) ELSE 0 END), 0)
-                                                                                       AS stand_minutes,
+                   COALESCE(SUM(CASE WHEN sport_type = 13 THEN 1 ELSE 0 END), 0)       AS stand_events,
                    MIN(start_time)                                                     AS first_minute,
                    MAX(end_time)                                                       AS last_minute,
                    COUNT(*)                                                            AS minute_rows
-            FROM (SELECT CAST(record_day AS TEXT) AS d, start_time, end_time, sport_type, steps,
-                         distance_meters, calories_kcal, duration_minutes, is_intensity, is_stand
-                  FROM activity_minute
-                  WHERE length(CAST(record_day AS TEXT)) = 8)
-            GROUP BY d
-            """;
+            FROM merged
+            GROUP BY record_day
+            """.formatted(ActivityMinuteStore.MERGED_MINUTE_SQL);
 
     /**
      * 一天一行的心率与相关体征。
