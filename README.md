@@ -1,6 +1,6 @@
 # sport-health-mcp-server
 
-基于 Spring AI 的华为运动健康 **TCX** 数据 MCP 服务。把导出的跑步记录与穿戴数据变成 37 个可调用的 MCP 工具，让 Claude Code / Cursor 等客户端可以直接回答：
+基于 Spring AI 的华为运动健康 **TCX** 数据 MCP 服务。把导出的跑步记录与穿戴数据变成 42 个可调用的 MCP 工具，让 Claude Code / Cursor 等客户端可以直接回答：
 
 - 「我最近跑了哪些？」
 - 「这个月一共跑了多少公里？」
@@ -256,8 +256,13 @@ npx @modelcontextprotocol/inspector --cli http://localhost:8080/mcp \
 | `get_blood_oxygen` | `startDate?` `endDate?` | 血氧饱和度（SpO₂）的**记录与覆盖**：按天汇总（样本数、最低/平均/最高、低于 95% 的条数）、明细样本、设备下发的低氧提醒（阈值 90%）。**刻意不给趋势** —— 全库只有 12 天有数据（2026-06-12~17 与 2026-08-03~08），之后设备再没上报；两段之间隔一个半月，拟合出的任何斜率都只是「有没有开连续血氧」。没有记录 ≠ 血氧正常 |
 | `get_heart_rate_series` | `date?` `resolution?` | **单日**自动心率曲线（`health_metric` 的 `DYNAMIC_HEART_RATE`）：`stats`（采样点数、最低/平均/最高、首次与末次采样时刻、跨度、采样间隔中位数与最长空档）、`peak`/`lowest`（心率与时刻，外加 `sustainedMinutes` 连续维持时长）、按 `resolution`（`minute`/`5min`（默认）/`15min`/`hour`）聚合的 `buckets`、当天运动时段 `activities`、口径提示 `notes`。采样密度不是固定的：早期每分钟一条、近期静息 10 分钟一条、运动时加密，看 `medianGapMinutes` 而不是点数多少；单点极值可能只是翻身蹭到传感器（详见「心率曲线口径」） |
 | `get_body_composition` | `startDate?` `endDate?` `gender?` `heightCm?` | 体脂秤数据（体重、BMI、体脂率、脂肪量、肌肉量、蛋白质、体水分、骨盐量、内脏脂肪等级、腰臀比、基础代谢、体年龄、体成分评分、称重心率）。**同一台秤上有多个用户**，所以分两种模式：不给 `gender` + `heightCm` 时只返回 `configs`（每套配置的条数、日期范围、体重区间、带体成分的条数）并要求补参数，**不会给出任何合并后的体重统计**；两个都给才返回 `measurements`（按时间升序，同日多次称重逐条保留）、`trends`（体重/BMI/体脂率/肌肉量/内脏脂肪/评分的首末值与 `change`）、`byMonth`（按月均值，看长期趋势用它）。默认区间是**这套配置自己最后一次称重往前 90 天**；明细上限 240 条（详见「体成分口径」） |
+| `get_medals` | `medalType?` `medalLevel?` `limit?` | 华为勋章列表（含 `take_date` 降序、获得次数与最近获得/修改时间）；列表上限 200，同类型同等级可多次获得，本工具按日期倒序折叠为最新一条一行 |
+| `get_ecg_records` | `limit?` | ECG 元数据（平均心率、心律失常类型、数据长度、detail/extend 采样计数），本库 5 条，不含波形原文 |
+| `get_sample_sequences` | `type?` `startDate?` `endDate?` `limit?` | 华为样本序列元数据（recordId、类型码、开始结束时间、时区、设备），只拿元数据不拉原文；`totalInRange` 给出区间内总数 |
 | `get_weather_impact` | `startDate?` `endDate?` `minDistanceKm?` | 只读已回填的 `run_weather`，按起跑气温、湿度、风速、有无降水分组，返回每组次数、加权平均配速、相对整体基线的快慢秒数，以及气温与配速的 Pearson 相关系数。另带 `weatherCoverage`：区间内跑步总数、拿到天气的条数、缺失条数与原因拆分（`failed`/`unavailable`/`notFetched`）、覆盖率与一句结论。不联网，缺天气时提示调 `sync_weather` |
 | `sync_weather` | `retryFailed?` | 只补天气：为还没有天气的跑步记录联网抓取起跑/结束时刻的天气，**不重导数据、不重建快照**。返回本轮 `ok`/`unavailable`/`failed`/`noLocation`/`deferred` 条数、失败原因 `problems` 与同步后的整体覆盖率 `coverage`。`retryFailed` 默认 `true`，即忽略 `retry-failed-after-days` 冷却、立刻重试上次失败的记录；`sport.weather.enabled=false` 时返回 `DISABLED` |
+| `get_recovery_status` | `startDate?` `endDate?` | 跨域恢复状态：最近一夜睡眠评分/效率/HRV/深睡、区间静息心率/HRV 均值、最近 7 天训练负荷（ACWR、置信度、风险等级、建议）、今天活动量，另带各块的覆盖度 |
+| `get_weekly_health_report` | `startDate?` `endDate?` | 周健康报告：步数（含走跑分流）、睡眠均值（评分/效率/深睡）、体征均值（静息心率/HRV）、训练记录与一句总结 |
 | `reload_data` | `weather?` | 增量同步：按 `(文件名, size, mtime, sha256)` 只解析变化的 TCX 与华为导出文件（JSON / xls / xlsx），无需重启。`weather` 默认 `true`，写完顺带补一轮天气；传 `false` 时整段同步不发起任何网络请求，天气留给 `sync_weather` |
 
 ### 睡眠口径
